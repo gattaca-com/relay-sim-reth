@@ -6322,12 +6322,18 @@ name = "relay-sim-reth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "dashmap 6.1.0",
  "ethers",
  "eyre",
+ "futures",
  "jsonrpsee",
+ "parking_lot",
  "rand 0.9.1",
+ "reth-chain-state",
  "reth-ethereum",
+ "reth-node-builder",
  "revm",
  "revm-primitives",
  "serde",

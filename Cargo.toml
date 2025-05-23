@@ -6,17 +6,20 @@ rust-version = "1.86"
 
 [dependencies]
 anyhow = "1.0.96"
+bytes = "1.10.0"
 clap = { version = "4.5", featires = ["derive"] }
+dashmap = "6.1.0"
 ethers = "2.0.14"
 eyre = "0.6.12"
+futures = "0.3.31"
 jsonrpsee = {  version = "0.25.1", features = ["client", "server", "macros"] }
+parking_lot = "0.12.3"
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3", features = ["full", "cli"] }
-#reth =  { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3" }
-#reth-provider =  { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3" }
-#reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3" }
+reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 serde = "1.0.218"
 tracing = "0.1.41"
-tokio = "1.43.0"
+tokio = {  version = "1.43.0", features = ["full"] }
 rand = "0.9"
 revm = { version = "23.1.0", default-features = false }
 revm-primitives = { version = "19.0.0", default-features = false }

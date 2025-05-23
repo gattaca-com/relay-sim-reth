@@ -14,39 +14,55 @@
 
 #![warn(unused_crate_dependencies)]
 
+mod inclusion;
+
 use clap::Parser;
+use inclusion::inclusion_producer;
 use jsonrpsee::{
+    PendingSubscriptionSink, SubscriptionMessage,
     core::{RpcResult, SubscriptionResult},
     proc_macros::rpc,
-    PendingSubscriptionSink, SubscriptionMessage,
 };
+use reth_chain_state::ForkChoiceSubscriptions;
 use reth_ethereum::{
     cli::{chainspec::EthereumChainSpecParser, interface::Cli},
-    node::EthereumNode,
-    pool::TransactionPool,
+    node::{EthereumNode, node::EthereumAddOns},
+    rpc::eth::error::RpcPoolError,
 };
-use std::time::Duration;
-use tokio::time::sleep;
+use revm_primitives::Bytes;
+use tokio::sync::watch::Receiver;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     Cli::<EthereumChainSpecParser, InclusionListsExt>::parse()
         .run(|builder, args| async move {
             let handle = builder
-                .node(EthereumNode::default())
+                .with_types::<EthereumNode>()
+                .with_components(EthereumNode::components().map_pool(|pool| {
+                    // TODO set cutom order on the pool?
+                    pool
+                }))
+                .with_add_ons(EthereumAddOns::default())
                 .extend_rpc_modules(move |ctx| {
                     if !args.enable_ext {
-                        return Ok(())
+                        return Ok(());
                     }
 
-                    // here we get the configured pool.
+                    // Handle to the transaction pool.
                     let pool = ctx.pool().clone();
 
-                    let ext = InclusionExt { pool };
+                    // Fork choice update stream.
+                    let notifications = ctx.provider().subscribe_safe_block();
+
+                    // List publisher
+                    let (publisher, published) = tokio::sync::watch::channel(None::<Vec<Bytes>>);
+
+                    tokio::spawn(inclusion_producer(pool, notifications, publisher));
+
+                    let ext = InclusionExt { published };
 
                     // now we merge our extension namespace into all configured transports
                     ctx.modules.merge_configured(ext.into_rpc())?;
-
-                    println!("txpool extension enabled");
 
                     Ok(())
                 })
@@ -72,39 +88,33 @@ struct InclusionListsExt {
 #[cfg_attr(not(test), rpc(server, namespace = "inclusionExt"))]
 #[cfg_attr(test, rpc(server, client, namespace = "inclusionExt"))]
 pub trait InclusionExtApi {
-    /// Returns the number of transactions in the pool.
-    #[method(name = "transactionCount")]
-    fn transaction_count(&self) -> RpcResult<usize>;
+    /// Returns the current inclusion list.
+    #[method(name = "inclusionList")]
+    fn inclusion_list(&self) -> RpcResult<Vec<Bytes>>;
 
-    /// Creates a subscription that returns the number of transactions in the pool every 10s.
-    #[subscription(name = "subscribeTransactionCount", item = usize)]
-    fn subscribe_transaction_count(
-        &self,
-        #[argument(rename = "delay")] delay: Option<u64>,
-    ) -> SubscriptionResult;
+    /// Creates a subscription that returns the inclusion list when it is published.
+    #[subscription(name = "subscribeInclusionList", item = usize)]
+    fn subscribe_inclusion_list(&self) -> SubscriptionResult;
 }
 
 /// The type that implements the `inclusion` rpc namespace trait
-pub struct InclusionExt<Pool> {
-    pool: Pool,
+pub struct InclusionExt {
+    published: Receiver<Option<Vec<Bytes>>>,
 }
 
-#[cfg(not(test))]
-impl<Pool> InclusionExtApiServer for InclusionExt<Pool>
-where
-    Pool: TransactionPool + Clone + 'static,
-{
-    fn transaction_count(&self) -> RpcResult<usize> {
-        Ok(self.pool.pool_size().total)
+impl InclusionExtApiServer for InclusionExt {
+    fn inclusion_list(&self) -> RpcResult<Vec<Bytes>> {
+        match self.published.borrow().clone() {
+            Some(list) => RpcResult::Ok(list),
+            None => RpcResult::Err(RpcPoolError::Other("list not ready".into()).into()),
+        }
     }
 
-    fn subscribe_transaction_count(
+    fn subscribe_inclusion_list(
         &self,
         pending_subscription_sink: PendingSubscriptionSink,
-        delay: Option<u64>,
     ) -> SubscriptionResult {
-        let pool = self.pool.clone();
-        let delay = delay.unwrap_or(10);
+        let mut published = self.published.clone();
         tokio::spawn(async move {
             let sink = match pending_subscription_sink.accept().await {
                 Ok(sink) => sink,
@@ -115,104 +125,33 @@ where
             };
 
             loop {
-                sleep(Duration::from_secs(delay)).await;
-
-                let msg = SubscriptionMessage::from(
-                    serde_json::value::to_raw_value(&pool.pool_size().total).expect("serialize"),
-                );
-                let _ = sink.send(msg).await;
+                match published.changed().await {
+                    Ok(_) => {
+                        let msg = published.borrow_and_update().clone().and_then(|list| {
+                            match SubscriptionMessage::new(
+                                sink.method_name(),
+                                sink.subscription_id(),
+                                &list,
+                            ) {
+                                Ok(msg) => Some(msg),
+                                Err(e) => {
+                                    tracing::error!(error=?e, "could not serialize inclusion list");
+                                    None
+                                }
+                            }
+                        });
+                        if let Some(msg) = msg {
+                            let _ = sink.send(msg).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error=?e, "list publisher closed - exiting");
+                        break;
+                    }
+                }
             }
         });
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use jsonrpsee::{
-        http_client::HttpClientBuilder, server::ServerBuilder, ws_client::WsClientBuilder,
-    };
-    use reth_ethereum::pool::noop::NoopTransactionPool;
-
-    #[cfg(test)]
-    impl<Pool> InclusionExtApiServer for InclusionExt<Pool>
-    where
-        Pool: TransactionPool + Clone + 'static,
-    {
-        fn transaction_count(&self) -> RpcResult<usize> {
-            Ok(self.pool.pool_size().total)
-        }
-
-        fn subscribe_transaction_count(
-            &self,
-            pending: PendingSubscriptionSink,
-            delay: Option<u64>,
-        ) -> SubscriptionResult {
-            let delay = delay.unwrap_or(10);
-            let pool = self.pool.clone();
-            tokio::spawn(async move {
-                // Accept the subscription
-                let sink = match pending.accept().await {
-                    Ok(sink) => sink,
-                    Err(err) => {
-                        eprintln!("failed to accept subscription: {err}");
-                        return;
-                    }
-                };
-
-                // Send pool size repeatedly, with a 10-second delay
-                loop {
-                    sleep(Duration::from_millis(delay)).await;
-                    let message = SubscriptionMessage::from(
-                        serde_json::value::to_raw_value(&pool.pool_size().total)
-                            .expect("serialize usize"),
-                    );
-
-                    // Just ignore errors if a client has dropped
-                    let _ = sink.send(message).await;
-                }
-            });
-            Ok(())
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_call_transaction_count_http() {
-        let server_addr = start_server().await;
-        let uri = format!("http://{server_addr}");
-        let client = HttpClientBuilder::default().build(&uri).unwrap();
-        let count = InclusionExtApiClient::transaction_count(&client).await.unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_subscribe_transaction_count_ws() {
-        let server_addr = start_server().await;
-        let ws_url = format!("ws://{server_addr}");
-        let client = WsClientBuilder::default().build(&ws_url).await.unwrap();
-
-        let mut sub = InclusionExtApiClient::subscribe_transaction_count(&client, None)
-            .await
-            .expect("failed to subscribe");
-
-        let first = sub.next().await.unwrap().unwrap();
-        assert_eq!(first, 0, "expected initial count to be 0");
-
-        let second = sub.next().await.unwrap().unwrap();
-        assert_eq!(second, 0, "still expected 0 from our NoopTransactionPool");
-    }
-
-    async fn start_server() -> std::net::SocketAddr {
-        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let pool = NoopTransactionPool::default();
-        let api = InclusionExt { pool };
-        let server_handle = server.start(api.into_rpc());
-
-        tokio::spawn(server_handle.stopped());
-
-        addr
     }
 }
