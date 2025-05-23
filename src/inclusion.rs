@@ -5,9 +5,9 @@ use std::{
 
 use futures::StreamExt;
 use reth_chain_state::ForkChoiceNotifications;
-use reth_ethereum::pool::{
+use reth_ethereum::{pool::{
     FullTransactionEvent, PoolTransaction, TransactionPool, ValidPoolTransaction,
-};
+}, rpc::eth::primitives::TransactionTrait};
 use revm_primitives::{Bytes, alloy_primitives::TxHash};
 use tokio::sync::watch::Sender;
 
@@ -62,10 +62,12 @@ fn handle_tx_event<P: TransactionPool>(
         FullTransactionEvent::Pending(tx_hash) => {
             // Add to valid set
             if let Some(pending_tx) = pool.get(&tx_hash) {
-                let tx_hash = *pending_tx.hash();
-                let score = score_tx(&pending_tx);
-                ordered_tx.insert(OrderedTx { score, tx_hash });
-                pending_txs.insert(tx_hash, pending_tx);
+                if matches!(pending_tx.transaction.blob_count(), Some(0) | None)  {
+                    let tx_hash = *pending_tx.hash();
+                    let score = score_tx(&pending_tx);
+                    ordered_tx.insert(OrderedTx { score, tx_hash });
+                    pending_txs.insert(tx_hash, pending_tx);
+                }
             }
         }
         FullTransactionEvent::Queued(tx_hash)
