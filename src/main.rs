@@ -18,7 +18,8 @@ use reth_ethereum::{
 use revm_primitives::Bytes;
 use tokio::sync::watch::Receiver;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     Cli::<EthereumChainSpecParser, InclusionListsExt>::parse()
         .run(|builder, args| async move {
             let handle = builder
