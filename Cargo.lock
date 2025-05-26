@@ -6348,6 +6348,7 @@ dependencies = [
  "metrics-util",
  "parking_lot",
  "rand 0.9.1",
+ "reqwest 0.11.27",
  "reth-chain-state",
  "reth-ethereum",
  "reth-metrics",

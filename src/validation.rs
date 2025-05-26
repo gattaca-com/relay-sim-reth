@@ -11,6 +11,7 @@ use alloy_rpc_types_engine::{
     PraguePayloadFields,
 };
 use async_trait::async_trait;
+use dashmap::DashSet;
 use reth_ethereum::{chainspec::EthereumHardforks, consensus::{ConsensusError, FullConsensus}, evm::{primitives::{block::BlockExecutionError, execute::Executor}, revm::{cached::CachedReads, database::StateProviderDatabase}}, node::core::rpc::result::{internal_rpc_err, invalid_params_rpc_err}, primitives::{constants::GAS_LIMIT_BOUND_DIVISOR, GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor}, provider::{BlockExecutionOutput, ChainSpecProvider, ProviderError}, rpc::api::BlockSubmissionValidationApiServer, storage::{BlockReaderIdExt, StateProviderFactory}};
 use reth_metrics::{metrics::Gauge, Metrics};
 use reth_node_builder::{BlockBody, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator};
@@ -19,8 +20,8 @@ use core::fmt;
 use jsonrpsee::{core:: RpcResult, types::ErrorObject};
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, sync::Arc};
-use tokio::sync::{oneshot, RwLock};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::{spawn, sync::{oneshot, RwLock}, time};
 use tracing::warn;
 
 /// The type that implements the `validation` rpc namespace trait
@@ -48,14 +49,15 @@ where
             >,
         >,
     ) -> Self {
-        let ValidationApiConfig { disallow, validation_window } = config;
+        let ValidationApiConfig { blacklist_endpoint, validation_window } = config;
+        let disallow = Arc::new(DashSet::new());
 
         let inner = Arc::new(ValidationApiInner {
             provider,
             consensus,
             payload_validator,
             evm_config,
-            disallow,
+            disallow: disallow.clone(),
             validation_window,
             cached_state: Default::default(),
             task_spawner,
@@ -63,6 +65,40 @@ where
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
+
+        // spawn background updater task
+        let client = reqwest::Client::new();
+        let ep = blacklist_endpoint.clone();
+        let dash = disallow.clone();
+        let gauge = inner.metrics.disallow_size.clone();
+        spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                match client.get(&ep).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(list) = resp.json::<Vec<String>>().await {
+                            // build new set then swap
+                            dash.clear();
+                            for hex in list {
+                                if let Ok(b) = hex
+                                    .strip_prefix("0x")
+                                    .unwrap_or(&hex)
+                                    .parse::<B256>()
+                                {
+                                    dash.insert(Address::from_slice(b.as_slice()));
+                                }
+                            }
+                            gauge.set(dash.len() as f64);
+                        }
+                    }
+                    Ok(r) => warn!("Blacklist fetch failed: HTTP {}", r.status()),
+                    Err(e) => warn!("Blacklist fetch error: {}", e),
+                }
+            }
+        });
+
+
         Self { inner }
     }
 
@@ -470,7 +506,7 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     /// Block executor factory.
     evm_config: E,
     /// Set of disallowed addresses
-    disallow: HashSet<Address>,
+    disallow: Arc<DashSet<Address>>,
     /// The maximum block distance - parent to latest - allowed for validation
     validation_window: u64,
     /// Cached state reads to avoid redundant disk I/O across multiple validation attempts
@@ -493,8 +529,8 @@ impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
 /// Configuration for validation API.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ValidationApiConfig {
-    /// Disallowed addresses.
-    pub disallow: HashSet<Address>,
+    /// Blacklist endpoint.
+    pub blacklist_endpoint: String,
     /// The maximum block distance - parent to latest - allowed for validation
     pub validation_window: u64,
 }
@@ -506,7 +542,7 @@ impl ValidationApiConfig {
 
 impl Default for ValidationApiConfig {
     fn default() -> Self {
-        Self { disallow: Default::default(), validation_window: Self::DEFAULT_VALIDATION_WINDOW }
+        Self { blacklist_endpoint: Default::default(), validation_window: Self::DEFAULT_VALIDATION_WINDOW }
     }
 }
 
