@@ -1,6 +1,9 @@
 #![warn(unused_crate_dependencies)]
 
 mod inclusion;
+mod validation;
+
+use std::sync::Arc;
 
 use clap::Parser;
 use inclusion::inclusion_producer;
@@ -12,11 +15,13 @@ use jsonrpsee::{
 use reth_chain_state::CanonStateSubscriptions;
 use reth_ethereum::{
     cli::{chainspec::EthereumChainSpecParser, interface::Cli},
-    node::{EthereumNode, node::EthereumAddOns},
-    rpc::eth::error::RpcPoolError,
+    node::{node::EthereumAddOns, EthereumEngineValidator, EthereumNode},
+    rpc::{api::{eth::RpcNodeCore, BlockSubmissionValidationApiServer}, builder::RethRpcModule, eth::error::RpcPoolError},
 };
+use reth_node_builder::FullNodeComponents;
 use revm_primitives::Bytes;
 use tokio::sync::watch::Receiver;
+use validation::{ValidationApi, ValidationApiConfig};
 
 #[tokio::main]
 async fn main() {
@@ -49,6 +54,17 @@ async fn main() {
 
                     // now we merge our extension namespace into all configured transports
                     ctx.modules.merge_configured(ext.into_rpc())?;
+
+                    let validation_api = ValidationApi::new(
+                        ctx.node().provider.clone(),
+                        Arc::new(ctx.node().consensus().clone()),
+                        RpcNodeCore::evm_config(ctx.node()).clone(),
+                        ValidationApiConfig::default(),
+                        Box::new(ctx.node().task_executor.clone()),
+                        Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
+                    );
+
+                    ctx.modules.merge_configured(validation_api.into_rpc())?;
 
                     Ok(())
                 })
