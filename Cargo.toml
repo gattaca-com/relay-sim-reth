@@ -7,6 +7,7 @@ rust-version = "1.86"
 [dependencies]
 alloy-consensus = { version = "1.0.7", default-features = false}
 alloy-eips = { version = "1.0.7", default-features = false }
+alloy-rlp = { version = "0.3.10", default-features = false, features = ["core-net"] }
 alloy-rpc-types-beacon = { version = "1.0.7", default-features = false }
 alloy-rpc-types-engine = { version = "1.0.7", default-features = false }
 anyhow = "1.0.96"
@@ -30,10 +31,12 @@ reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3", features = ["full", "cli"] }
 reth-node-api = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 reth-metrics = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag="v1.4.3"}
 serde = "1.0.218"
+serde_with  = "1.14"
 thiserror = { version = "2.0.0", default-features = false }
 tracing = "0.1.41"
 tokio = {  version = "1.43.0", features = ["full"] }

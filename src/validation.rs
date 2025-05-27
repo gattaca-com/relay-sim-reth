@@ -1,5 +1,5 @@
 use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxEnvelope, TxReceipt
 };
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
@@ -11,11 +11,15 @@ use alloy_rpc_types_engine::{
     PraguePayloadFields,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashSet;
-use reth_ethereum::{chainspec::EthereumHardforks, consensus::{ConsensusError, FullConsensus}, evm::{primitives::{block::BlockExecutionError, execute::Executor}, revm::{cached::CachedReads, database::StateProviderDatabase}}, node::core::rpc::result::{internal_rpc_err, invalid_params_rpc_err}, primitives::{constants::GAS_LIMIT_BOUND_DIVISOR, GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor}, provider::{BlockExecutionOutput, ChainSpecProvider, ProviderError}, rpc::api::BlockSubmissionValidationApiServer, storage::{BlockReaderIdExt, StateProviderFactory}};
+use reth_ethereum::{chainspec::EthereumHardforks, consensus::{ConsensusError, FullConsensus}, evm::{primitives::{block::BlockExecutionError, execute::Executor, Evm, RecoveredTx}, revm::{cached::CachedReads, database::StateProviderDatabase}}, node::core::rpc::result::{internal_rpc_err, invalid_params_rpc_err}, pool::PoolPooledTx, primitives::{constants::GAS_LIMIT_BOUND_DIVISOR, GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor, SignedTransaction}, provider::{BlockExecutionOutput, ChainSpecProvider, ProviderError}, rpc::eth::utils::recover_raw_transaction, storage::{BlockReaderIdExt, StateProviderFactory}};
 use reth_metrics::{metrics::Gauge, Metrics};
 use reth_node_builder::{BlockBody, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator};
+use reth_primitives::Recovered;
 use reth_tasks::TaskSpawner;
+use revm::{database::{CacheDB, State}, Database, DatabaseRef};
+use serde_with::serde_as;
 use core::fmt;
 use jsonrpsee::{core:: RpcResult, types::ErrorObject};
 use revm_primitives::{Address, B256, U256};
@@ -23,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{spawn, sync::{oneshot, RwLock}, time};
 use tracing::warn;
+use jsonrpsee::proc_macros::rpc;
+use alloy_rlp::Decodable;
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -137,13 +143,15 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
+        apply_blacklist: bool,
+        inclusion_list: Option<InclusionList>,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
         self.consensus.validate_header(block.sealed_header())?;
         self.consensus.validate_block_pre_execution(block.sealed_block())?;
 
-        if !self.disallow.is_empty() {
+        if !self.disallow.is_empty() && apply_blacklist {
             if self.disallow.contains(&block.beneficiary()) {
                 return Err(ValidationApiError::Blacklist(block.beneficiary()))
             }
@@ -190,23 +198,35 @@ where
         let mut request_cache = self.cached_reads(parent_header_hash).await;
 
         let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
-        let executor = self.evm_config.batch_executor(cached_db);
+
+        let mut executor = self.evm_config.batch_executor(cached_db);
 
         let mut accessed_blacklisted = None;
-        let output = executor.execute_with_state_closure(&block, |state| {
-            if !self.disallow.is_empty() {
-                // Check whether the submission interacted with any blacklisted account by scanning
-                // the `State`'s cache that records everything read form database during execution.
-                for account in state.cache.accounts.keys() {
-                    if self.disallow.contains(account) {
-                        accessed_blacklisted = Some(*account);
-                    }
+
+        let result = executor.execute_one(&block)
+            .map_err(|e| ValidationApiError::Execution(e.into()))?;
+
+        let state = executor.into_state();
+
+        if !self.disallow.is_empty() && apply_blacklist {
+            // Check whether the submission interacted with any blacklisted account by scanning
+            // the `State`'s cache that records everything read form database during execution.
+            for account in state.cache.accounts.keys() {
+                if self.disallow.contains(account) {
+                    accessed_blacklisted = Some(*account);
                 }
             }
-        })?;
+        }
 
         if let Some(account) = accessed_blacklisted {
             return Err(ValidationApiError::Blacklist(account))
+        }
+
+        let output = BlockExecutionOutput { state: state.bundle_state.clone(), result } ;
+
+        // Validate inclusion list constraint if provided
+        if let Some(inclusion_list) = inclusion_list {
+            self.validate_inclusion_list_constraint(&block, state, &inclusion_list)?;
         }
 
         // update the cached reads
@@ -228,6 +248,65 @@ where
 
         Ok(())
     }
+
+fn validate_inclusion_list_constraint<DB>(
+    &self,
+    block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+    post_state: State<DB>,
+    inclusion_list: &InclusionList,
+) -> Result<(), ValidationApiError>
+where
+    DB: Database,
+    <DB as revm::Database>::Error: Send + Sync + 'static,
+{
+    // nothing to do if no inclusion‐list entries
+    if inclusion_list.txs.is_empty() {
+        return Ok(());
+    }
+
+    // collect which inclusion‐list hashes appeared in the block
+    let mut included_hashes = HashSet::new();
+    for tx in block.body().transactions() {
+        if let Some(req) = inclusion_list.txs.iter().find(|t| t.hash.as_slice() == tx.tx_hash().as_slice()) {
+            included_hashes.insert(req.hash);
+        }
+    }
+
+    // if all requested txs are already in the block, we’re done
+    if included_hashes.len() == inclusion_list.txs.len() {
+        return Ok(());
+    }
+
+    // set up a fresh EVM on top of a cache wrapping the post-block state
+    let mut evm = self.evm_config.evm_for_block(post_state, block.header());
+
+    // simulate each missing inclusion‐list tx
+    for req in &inclusion_list.txs {
+        // skip the ones that actually made it in
+        if included_hashes.contains(&req.hash) {
+            continue;
+        }
+
+        // RLP-decode the raw bytes
+        let mut bytes_slice = req.bytes.as_ref();
+        let transaction = recover_raw_transaction(&mut bytes_slice)
+            .map_err(|_| ValidationApiError::InclusionList)?;
+
+        // execute the tx
+        let outcome = evm.transact(transaction);
+
+        // f it succeeded, then this tx *could* have been included but wasn’t → reject
+        if outcome.is_ok() {
+            return Err(ValidationApiError::InclusionList);
+        }
+        // otherwise it failed as expected; keep going
+    }
+
+    // every missing tx failed in simulation, so constraint is satisfied
+    Ok(())
+}
+
+
 
     /// Ensures that fields of [`BidTrace`] match the fields of the [`SealedHeaderFor`].
     fn validate_message_against_header(
@@ -395,6 +474,8 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            false,
+            None
         )
         .await
     }
@@ -402,18 +483,18 @@ where
     /// Core logic for validating the builder submission v4
     async fn validate_builder_submission_v4(
         &self,
-        request: BuilderBlockValidationRequestV4,
+        request: ExtendedValidationRequestV4,
     ) -> Result<(), ValidationApiError> {
         let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
-            payload: ExecutionPayload::V3(request.request.execution_payload),
+            payload: ExecutionPayload::V3(request.base.request.execution_payload),
             sidecar: ExecutionPayloadSidecar::v4(
                 CancunPayloadFields {
-                    parent_beacon_block_root: request.parent_beacon_block_root,
-                    versioned_hashes: self.validate_blobs_bundle(request.request.blobs_bundle)?,
+                    parent_beacon_block_root: request.base.parent_beacon_block_root,
+                    versioned_hashes: self.validate_blobs_bundle(request.base.request.blobs_bundle)?,
                 },
                 PraguePayloadFields {
                     requests: RequestsOrHash::Requests(
-                        request.request.execution_requests.to_requests(),
+                        request.base.request.execution_requests.to_requests(),
                     ),
                 },
             ),
@@ -421,8 +502,10 @@ where
 
         self.validate_message_against_block(
             block,
-            request.request.message,
-            request.registered_gas_limit,
+            request.base.request.message,
+            request.base.registered_gas_limit,
+            request.apply_blacklist,
+            request.inclusion_list,
         )
         .await
     }
@@ -475,7 +558,7 @@ where
     /// Validates a block submitted to the relay
     async fn validate_builder_submission_v4(
         &self,
-        request: BuilderBlockValidationRequestV4,
+        request: ExtendedValidationRequestV4,
     ) -> RpcResult<()> {
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
@@ -579,6 +662,8 @@ pub enum ValidationApiError {
     Execution(#[from] BlockExecutionError),
     #[error(transparent)]
     Payload(#[from] NewPayloadError),
+    #[error("inclusion list not statisfied")]
+    InclusionList
 }
 
 impl From<ValidationApiError> for ErrorObject<'static> {
@@ -591,6 +676,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::Blacklist(_) |
             ValidationApiError::ProposerPayment |
             ValidationApiError::InvalidBlobsBundle |
+            ValidationApiError::InclusionList |
             ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
             ValidationApiError::MissingLatestBlock |
@@ -618,4 +704,71 @@ impl From<ValidationApiError> for ErrorObject<'static> {
 pub(crate) struct ValidationMetrics {
     /// The number of entries configured in the builder validation disallow list.
     pub(crate) disallow_size: Gauge,
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct InclusionList {
+    pub txs: Vec<InclusionListTx>,
+}
+
+impl InclusionList {
+    pub const fn empty() -> Self {
+        Self { txs: vec![] }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct InclusionListTx {
+    pub hash: B256,
+    pub nonce: u64,
+    pub sender: Address,
+    pub gas_priority_fee: u64,
+    pub bytes: Bytes,
+    pub wait_time: u32,
+}
+
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtendedValidationRequestV4 {
+    
+    #[serde(flatten)]
+    pub base: BuilderBlockValidationRequestV4,
+
+    pub inclusion_list: Option<InclusionList>,
+
+    pub apply_blacklist: bool,
+}
+
+/// Block validation rpc interface.
+#[cfg_attr(not(feature = "client"), rpc(server, namespace = "flashbots"))]
+#[cfg_attr(feature = "client", rpc(server, client, namespace = "flashbots"))]
+pub trait BlockSubmissionValidationApi {
+    /// A Request to validate a block submission.
+    #[method(name = "validateBuilderSubmissionV1")]
+    async fn validate_builder_submission_v1(
+        &self,
+        request: BuilderBlockValidationRequest,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to validate a block submission.
+    #[method(name = "validateBuilderSubmissionV2")]
+    async fn validate_builder_submission_v2(
+        &self,
+        request: BuilderBlockValidationRequestV2,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to validate a block submission.
+    #[method(name = "validateBuilderSubmissionV3")]
+    async fn validate_builder_submission_v3(
+        &self,
+        request: BuilderBlockValidationRequestV3,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to validate a block submission.
+    #[method(name = "validateBuilderSubmissionV4")]
+    async fn validate_builder_submission_v4(
+        &self,
+        request: ExtendedValidationRequestV4,
+    ) -> jsonrpsee::core::RpcResult<()>;
 }
