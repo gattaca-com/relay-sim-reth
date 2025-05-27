@@ -30,12 +30,13 @@ use reth_chain_state::ForkChoiceSubscriptions;
 use reth_ethereum::{
     cli::{chainspec::EthereumChainSpecParser, interface::Cli},
     node::{node::EthereumAddOns, EthereumEngineValidator, EthereumNode},
-    rpc::{api::{eth::RpcNodeCore, BlockSubmissionValidationApiServer}, builder::RethRpcModule, eth::error::RpcPoolError},
+    rpc::{api::{eth::RpcNodeCore}, builder::RethRpcModule, eth::error::RpcPoolError},
 };
 use reth_node_builder::FullNodeComponents;
 use revm_primitives::Bytes;
 use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
+use crate::validation::BlockSubmissionValidationApiServer;
 
 #[tokio::main]
 async fn main() {
