@@ -1,0 +1,34 @@
+name: Rust
+
+on:
+  push:
+    branches: [ stable ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  build:
+
+    runs-on: self-hosted
+
+    steps:
+
+    - uses: actions/checkout@v2
+      with:
+        path: ./repos/relay-sim-reth
+
+    - name: Build and Push relay-sim-reth Docker image
+      env:
+        DOCKER_REG_USR: ${{ secrets.DOCKER_REG_USR }}
+        DOCKER_REG_PW: ${{ secrets.DOCKER_REG_PW }}     
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}           
+      run: |
+        IMAGE_NAME=latest
+        cd ./repos/relay-sim-reth
+        DOCKER_BUILDKIT=1 docker build -t relay-sim-reth:$IMAGE_NAME --build-arg AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID --build-arg AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY -f Dockerfile .
+        DOCKER_BUILDKIT=1 docker tag relay-sim-reth:$IMAGE_NAME cont-reg.techbox.biz/relay-sim-reth:$IMAGE_NAME
+        DOCKER_BUILDKIT=1 docker login https://cont-reg.techbox.biz/ -u "$DOCKER_REG_USR" -p "$DOCKER_REG_PW"
+        DOCKER_BUILDKIT=1 docker push cont-reg.techbox.biz/relay-sim-reth:$IMAGE_NAME
