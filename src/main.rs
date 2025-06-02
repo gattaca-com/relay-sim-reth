@@ -16,7 +16,7 @@ use reth_chain_state::CanonStateSubscriptions;
 use reth_ethereum::{
     cli::{chainspec::EthereumChainSpecParser, interface::Cli},
     node::{node::EthereumAddOns, EthereumEngineValidator, EthereumNode},
-    rpc::{api::{eth::RpcNodeCore}, builder::RethRpcModule, eth::error::RpcPoolError},
+    rpc::{api::{eth::RpcNodeCore}, eth::error::RpcPoolError},
 };
 use reth_node_builder::FullNodeComponents;
 use revm_primitives::Bytes;
