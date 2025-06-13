@@ -86,7 +86,7 @@ struct InclusionListsExt {
     #[arg(long)]
     pub enable_ext: bool,
 
-    #[arg(long, default_value = "http://localhost:3520")]
+    #[arg(long, default_value = "http://localhost:3520/blacklist")]
     pub blacklist_provider: Option<String>,
 }
 
