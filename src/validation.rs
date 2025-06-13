@@ -485,7 +485,7 @@ where
         &self,
         request: ExtendedValidationRequestV4,
     ) -> Result<(), ValidationApiError> {
-        info!(target: "rpc::flashbots", "Validating builder submission v4 test");
+        info!(target: "rpc::relay", "Validating builder submission v4 test");
         let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
             payload: ExecutionPayload::V3(request.base.request.execution_payload),
             sidecar: ExecutionPayloadSidecar::v4(
@@ -526,7 +526,7 @@ where
         &self,
         _request: BuilderBlockValidationRequest,
     ) -> RpcResult<()> {
-        warn!(target: "rpc::flashbots", "Method `flashbots_validateBuilderSubmissionV1` is not supported");
+        warn!(target: "rpc::relay", "Method `relay_validateBuilderSubmissionV1` is not supported");
         Err(internal_rpc_err("unimplemented"))
     }
 
@@ -534,7 +534,7 @@ where
         &self,
         _request: BuilderBlockValidationRequestV2,
     ) -> RpcResult<()> {
-        warn!(target: "rpc::flashbots", "Method `flashbots_validateBuilderSubmissionV2` is not supported");
+        warn!(target: "rpc::relay", "Method `relay_validateBuilderSubmissionV2` is not supported");
         Err(internal_rpc_err("unimplemented"))
     }
 
@@ -742,8 +742,8 @@ pub struct ExtendedValidationRequestV4 {
 }
 
 /// Block validation rpc interface.
-#[cfg_attr(not(feature = "client"), rpc(server, namespace = "flashbots"))]
-#[cfg_attr(feature = "client", rpc(server, client, namespace = "flashbots"))]
+#[cfg_attr(not(feature = "client"), rpc(server, namespace = "relay"))]
+#[cfg_attr(feature = "client", rpc(server, client, namespace = "relay"))]
 pub trait BlockSubmissionValidationApi {
     /// A Request to validate a block submission.
     #[method(name = "validateBuilderSubmissionV1")]

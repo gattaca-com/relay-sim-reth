@@ -24,8 +24,8 @@ use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
 use crate::validation::BlockSubmissionValidationApiServer;
 
-#[tokio::main]
-async fn main() {
+
+fn main() {
     Cli::<EthereumChainSpecParser, InclusionListsExt>::parse()
         .run(|builder, args| async move {
             let handle = builder
