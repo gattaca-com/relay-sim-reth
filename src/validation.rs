@@ -738,6 +738,7 @@ pub struct ExtendedValidationRequestV4 {
 
     pub inclusion_list: Option<InclusionList>,
 
+    #[serde(default)]
     pub apply_blacklist: bool,
 }
 
