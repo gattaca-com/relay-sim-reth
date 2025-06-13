@@ -26,7 +26,7 @@ use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{spawn, sync::{oneshot, RwLock}, time};
-use tracing::warn;
+use tracing::{info, warn};
 use jsonrpsee::proc_macros::rpc;
 use alloy_rlp::Decodable;
 
@@ -485,6 +485,7 @@ where
         &self,
         request: ExtendedValidationRequestV4,
     ) -> Result<(), ValidationApiError> {
+        info!(target: "rpc::flashbots", "Validating builder submission v4 test");
         let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
             payload: ExecutionPayload::V3(request.base.request.execution_payload),
             sidecar: ExecutionPayloadSidecar::v4(
