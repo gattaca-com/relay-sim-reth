@@ -60,7 +60,9 @@ fn main() {
                         ctx.node().provider.clone(),
                         Arc::new(ctx.node().consensus().clone()),
                         RpcNodeCore::evm_config(ctx.node()).clone(),
-                        ValidationApiConfig::default(),
+                        ValidationApiConfig::new(
+                            args.blacklist_provider.clone().unwrap_or_default(),
+                        ),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
@@ -78,11 +80,14 @@ fn main() {
 }
 
 /// Our custom cli args extension that adds one flag to reth default CLI.
-#[derive(Debug, Clone, Copy, Default, clap::Args)]
+#[derive(Debug, Clone, Default, clap::Args)]
 struct InclusionListsExt {
     /// CLI flag to enable the txpool extension namespace
     #[arg(long)]
     pub enable_ext: bool,
+
+    #[arg(long, default_value = "http://localhost:3520")]
+    pub blacklist_provider: Option<String>,
 }
 
 /// trait interface for a custom rpc namespace: `relay`

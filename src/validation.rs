@@ -622,6 +622,10 @@ pub struct ValidationApiConfig {
 impl ValidationApiConfig {
     /// Default validation blocks window of 3 blocks
     pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
+
+    pub fn new(blacklist_endpoint: String) -> Self {
+        Self { blacklist_endpoint, validation_window: Self::DEFAULT_VALIDATION_WINDOW }
+    }
 }
 
 impl Default for ValidationApiConfig {
