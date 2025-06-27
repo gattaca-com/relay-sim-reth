@@ -191,7 +191,6 @@ where
         };
 
         self.consensus.validate_header_against_parent(block.sealed_header(), &parent_header)?;
-        self.validate_gas_limit(registered_gas_limit, &parent_header, block.sealed_header())?;
         let parent_header_hash = parent_header.hash();
         let state_provider = self.provider.state_by_block_hash(parent_header_hash)?;
 
