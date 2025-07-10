@@ -1,6 +1,7 @@
 #![warn(unused_crate_dependencies)]
 
 mod inclusion;
+mod state_recorder;
 mod validation;
 
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use reth_node_builder::FullNodeComponents;
 use revm_primitives::Bytes;
 use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
-use crate::validation::BlockSubmissionValidationApiServer;
+use crate::{state_recorder::run_block_state_recorder, validation::BlockSubmissionValidationApiServer};
 
 
 fn main() {
@@ -36,6 +37,13 @@ fn main() {
                 }))
                 .with_add_ons(EthereumAddOns::default())
                 .extend_rpc_modules(move |ctx| {
+                    if args.record_block_state {
+                        // Start block state recorder
+                        let notifications = ctx.provider().canonical_state_stream();
+                        let block_record_dir = args.record_blocks_dir.clone();
+                        tokio::spawn(run_block_state_recorder(notifications, block_record_dir));
+                    }
+
                     if !args.enable_ext {
                         return Ok(());
                     }
@@ -88,6 +96,12 @@ struct InclusionListsExt {
 
     #[arg(long, default_value = "http://localhost:3520/blacklist")]
     pub blacklist_provider: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    pub record_block_state: bool,
+
+    #[arg(long, default_value = "/root/blocks")]
+    pub record_blocks_dir: String,
 }
 
 /// trait interface for a custom rpc namespace: `relay`
