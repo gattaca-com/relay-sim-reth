@@ -5607,6 +5607,7 @@ dependencies = [
  "revm",
  "revm-primitives",
  "serde",
+ "serde_json",
  "serde_with 1.14.0",
  "thiserror 2.0.12",
  "tokio",
