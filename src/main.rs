@@ -6,6 +6,9 @@ mod validation;
 
 use std::sync::Arc;
 
+use crate::{
+    state_recorder::run_block_state_recorder, validation::BlockSubmissionValidationApiServer,
+};
 use clap::Parser;
 use inclusion::inclusion_producer;
 use jsonrpsee::{
@@ -16,15 +19,13 @@ use jsonrpsee::{
 use reth_chain_state::CanonStateSubscriptions;
 use reth_ethereum::{
     cli::{chainspec::EthereumChainSpecParser, interface::Cli},
-    node::{node::EthereumAddOns, EthereumEngineValidator, EthereumNode},
-    rpc::{api::{eth::RpcNodeCore}, eth::error::RpcPoolError},
+    node::{EthereumEngineValidator, EthereumNode, node::EthereumAddOns},
+    rpc::{api::eth::RpcNodeCore, eth::error::RpcPoolError},
 };
 use reth_node_builder::FullNodeComponents;
 use revm_primitives::Bytes;
 use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
-use crate::{state_recorder::run_block_state_recorder, validation::BlockSubmissionValidationApiServer};
-
 
 fn main() {
     Cli::<EthereumChainSpecParser, InclusionListsExt>::parse()
