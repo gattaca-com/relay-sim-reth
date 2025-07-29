@@ -1,5 +1,6 @@
 use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxEnvelope, TxReceipt,
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Header, Transaction, TxEnvelope,
+    TxReceipt,
 };
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rlp::Decodable;
@@ -17,6 +18,7 @@ use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
+use reth_ethereum::evm::primitives::execute::BlockBuilder;
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
@@ -36,7 +38,8 @@ use reth_ethereum::{
 };
 use reth_metrics::{Metrics, metrics::Gauge};
 use reth_node_builder::{
-    BlockBody, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator,
+    Block, BlockBody, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, NodePrimitives,
+    PayloadValidator,
 };
 use reth_primitives::Recovered;
 use reth_tasks::TaskSpawner;
@@ -64,7 +67,7 @@ pub struct ValidationApi<Provider, E: ConfigureEvm> {
 
 impl<Provider, E> ValidationApi<Provider, E>
 where
-    E: ConfigureEvm,
+    E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
 {
     /// Create a new instance of the [`ValidationApi`]
     pub fn new(
@@ -160,7 +163,7 @@ where
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
         + 'static,
-    E: ConfigureEvm + 'static,
+    E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 {
     /// Validates the given block and a [`BidTrace`] against it.
     pub async fn validate_message_against_block(
@@ -564,6 +567,90 @@ where
         )
         .await
     }
+
+    /// Core logic for appending additional transactions to a block.
+    async fn merge_block_v1(&self, request: MergeBlockRequestV1) -> Result<(), ValidationApiError> {
+        info!(target: "rpc::relay", "Merging block v1");
+        let block: RecoveredBlock<<<E as ConfigureEvm>::Primitives as NodePrimitives>::Block> =
+            self.payload_validator
+                .ensure_well_formed_payload(ExecutionData {
+                    payload: ExecutionPayload::V3(request.base.request.execution_payload),
+                    sidecar: ExecutionPayloadSidecar::v4(
+                        CancunPayloadFields {
+                            parent_beacon_block_root: request.base.parent_beacon_block_root,
+                            versioned_hashes: self
+                                .validate_blobs_bundle(request.base.request.blobs_bundle)?,
+                        },
+                        PraguePayloadFields {
+                            requests: RequestsOrHash::Requests(
+                                request.base.request.execution_requests.to_requests(),
+                            ),
+                        },
+                    ),
+                })?;
+
+        let latest_header = self
+            .provider
+            .latest_header()?
+            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
+
+        let parent_header = if block.parent_hash() == latest_header.hash() {
+            latest_header
+        } else {
+            // parent is not the latest header so we need to fetch it and ensure it's not too old
+            let parent_header = self
+                .provider
+                .sealed_header_by_hash(block.parent_hash())?
+                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
+
+            if latest_header
+                .number()
+                .saturating_sub(parent_header.number())
+                > self.validation_window
+            {
+                return Err(ValidationApiError::BlockTooOld);
+            }
+            parent_header
+        };
+
+        let (sealed_block, _senders) = block.split();
+        let (header, body) = sealed_block.split();
+
+        // TODO: load from configuration
+        let beneficiary = Address::from_slice(b"");
+
+        let new_block_attrs = NextBlockEnvAttributes {
+            timestamp: header.timestamp(),
+            suggested_fee_recipient: beneficiary,
+            prev_randao: header.difficulty().to_be_bytes().into(),
+            gas_limit: header.gas_limit(),
+            parent_beacon_block_root: header.parent_beacon_block_root(),
+            withdrawals: body.withdrawals().cloned(),
+        };
+
+        let parent_hash = header.parent_hash();
+
+        let state_provider = self.provider.state_by_block_hash(parent_hash)?;
+
+        let mut request_cache = self.cached_reads(parent_hash).await;
+
+        let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
+
+        let mut state_db = State::builder().with_database(cached_db).build();
+        // Execute the base block
+        let mut builder = self
+            .evm_config
+            .builder_for_next_block(&mut state_db, &parent_header, new_block_attrs)
+            .unwrap();
+
+        builder.apply_pre_execution_changes().unwrap();
+
+        let outcome = builder.finish(&state_provider)?;
+        // TODO: return block
+        let block = outcome.block;
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -621,6 +708,22 @@ where
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
             let result = Self::validate_builder_submission_v4(&this, request)
+                .await
+                .map_err(ErrorObject::from);
+            let _ = tx.send(result);
+        }));
+
+        rx.await
+            .map_err(|_| internal_rpc_err("Internal blocking task error"))?
+    }
+
+    /// A Request to append mergeable transactions to a block.
+    async fn merge_block_v1(&self, request: MergeBlockRequestV1) -> jsonrpsee::core::RpcResult<()> {
+        let this = self.clone();
+        let (tx, rx) = oneshot::channel();
+
+        self.task_spawner.spawn_blocking(Box::pin(async move {
+            let result = Self::merge_block_v1(&this, request)
                 .await
                 .map_err(ErrorObject::from);
             let _ = tx.send(result);
@@ -806,6 +909,15 @@ pub struct ExtendedValidationRequestV4 {
     pub apply_blacklist: bool,
 }
 
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeBlockRequestV1 {
+    #[serde(flatten)]
+    pub base: BuilderBlockValidationRequestV4,
+    #[serde(default)]
+    pub mergeable_txs: Vec<u64>,
+}
+
 /// Block validation rpc interface.
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "relay"))]
 #[cfg_attr(feature = "client", rpc(server, client, namespace = "relay"))]
@@ -837,4 +949,8 @@ pub trait BlockSubmissionValidationApi {
         &self,
         request: ExtendedValidationRequestV4,
     ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to append mergeable transactions to a block.
+    #[method(name = "mergeBlockV1")]
+    async fn merge_block_v1(&self, request: MergeBlockRequestV1) -> jsonrpsee::core::RpcResult<()>;
 }
