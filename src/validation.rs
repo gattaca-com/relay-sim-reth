@@ -571,23 +571,23 @@ where
     /// Core logic for appending additional transactions to a block.
     async fn merge_block_v1(&self, request: MergeBlockRequestV1) -> Result<(), ValidationApiError> {
         info!(target: "rpc::relay", "Merging block v1");
-        let block: RecoveredBlock<<<E as ConfigureEvm>::Primitives as NodePrimitives>::Block> =
-            self.payload_validator
-                .ensure_well_formed_payload(ExecutionData {
-                    payload: ExecutionPayload::V3(request.base.request.execution_payload),
-                    sidecar: ExecutionPayloadSidecar::v4(
-                        CancunPayloadFields {
-                            parent_beacon_block_root: request.base.parent_beacon_block_root,
-                            versioned_hashes: self
-                                .validate_blobs_bundle(request.base.request.blobs_bundle)?,
-                        },
-                        PraguePayloadFields {
-                            requests: RequestsOrHash::Requests(
-                                request.base.request.execution_requests.to_requests(),
-                            ),
-                        },
-                    ),
-                })?;
+        let block = self
+            .payload_validator
+            .ensure_well_formed_payload(ExecutionData {
+                payload: ExecutionPayload::V3(request.base.request.execution_payload),
+                sidecar: ExecutionPayloadSidecar::v4(
+                    CancunPayloadFields {
+                        parent_beacon_block_root: request.base.parent_beacon_block_root,
+                        versioned_hashes: self
+                            .validate_blobs_bundle(request.base.request.blobs_bundle)?,
+                    },
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Requests(
+                            request.base.request.execution_requests.to_requests(),
+                        ),
+                    },
+                ),
+            })?;
 
         let latest_header = self
             .provider
@@ -613,19 +613,23 @@ where
             parent_header
         };
 
-        let (sealed_block, _senders) = block.split();
+        let (sealed_block, senders) = block.split();
         let (header, body) = sealed_block.split();
+
+        let body = body.into_ethereum_body();
+        let (withdrawals, transactions) = (body.withdrawals, body.transactions);
 
         // TODO: load from configuration
         let beneficiary = Address::from_slice(b"");
 
+        // We'll create a new block with ourselves as the beneficiary/coinbase
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp(),
             suggested_fee_recipient: beneficiary,
             prev_randao: header.difficulty().to_be_bytes().into(),
             gas_limit: header.gas_limit(),
             parent_beacon_block_root: header.parent_beacon_block_root(),
-            withdrawals: body.withdrawals().cloned(),
+            withdrawals,
         };
 
         let parent_hash = header.parent_hash();
@@ -644,6 +648,15 @@ where
             .unwrap();
 
         builder.apply_pre_execution_changes().unwrap();
+
+        // Insert the transactions from the unmerged block
+        for (tx, sender) in transactions.into_iter().zip(senders) {
+            builder
+                .execute_transaction(Recovered::new_unchecked(tx, sender))
+                .unwrap();
+        }
+
+        // Append transactions until
 
         let outcome = builder.finish(&state_provider)?;
         // TODO: return block
