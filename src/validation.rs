@@ -18,6 +18,7 @@ use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
+use reth_ethereum::evm::primitives::block::BlockExecutor;
 use reth_ethereum::evm::primitives::execute::BlockBuilder;
 use reth_ethereum::{
     chainspec::EthereumHardforks,
@@ -651,12 +652,21 @@ where
 
         // Insert the transactions from the unmerged block
         for (tx, sender) in transactions.into_iter().zip(senders) {
+            // NOTE: we use the senders from the block body, which should be correct
             builder
                 .execute_transaction(Recovered::new_unchecked(tx, sender))
                 .unwrap();
         }
 
-        // Append transactions until
+        // Append transactions until we run out of space
+        for (origin, bundle) in request
+            .merging_data
+            .into_iter()
+            .flat_map(|mb| mb.bundles.into_iter().map(move |b| (mb.origin, b)))
+        {
+            for tx in bundle.transactions {}
+            // Execute the transaction
+        }
 
         let outcome = builder.finish(&state_provider)?;
         // TODO: return block
@@ -922,13 +932,32 @@ pub struct ExtendedValidationRequestV4 {
     pub apply_blacklist: bool,
 }
 
+/// Represents one or more transactions to be appended into a block atomically.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MergeableBundle {
+    /// List of transactions that can be merged into the block.
+    pub transactions: Vec<Bytes>,
+    /// Txs that may revert.
+    pub reverting_txs: Vec<usize>,
+    /// Txs that are allowed to be omitted, but not revert.
+    pub dropping_txs: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MergeableBundles {
+    /// Address of the builder that submitted these bundles.
+    pub origin: Address,
+    /// List of mergeable bundles.
+    pub bundles: Vec<MergeableBundle>,
+}
+
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeBlockRequestV1 {
     #[serde(flatten)]
     pub base: BuilderBlockValidationRequestV4,
     #[serde(default)]
-    pub mergeable_txs: Vec<u64>,
+    pub merging_data: Vec<MergeableBundles>,
 }
 
 /// Block validation rpc interface.
