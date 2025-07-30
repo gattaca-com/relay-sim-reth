@@ -2,6 +2,7 @@ use alloy_consensus::{
     BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Header, Transaction, TxEnvelope,
     TxReceipt,
 };
+use alloy_eips::Decodable2718;
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rlp::Decodable;
 use alloy_rpc_types_beacon::relay::{
@@ -18,8 +19,10 @@ use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
+use reth_ethereum::Transaction;
 use reth_ethereum::evm::primitives::block::BlockExecutor;
-use reth_ethereum::evm::primitives::execute::BlockBuilder;
+use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
+use reth_ethereum::evm::primitives::{EvmError, InvalidTxError};
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
@@ -664,8 +667,66 @@ where
             .into_iter()
             .flat_map(|mb| mb.bundles.into_iter().map(move |b| (mb.origin, b)))
         {
-            for tx in bundle.transactions {}
+            // TODO: check we have enough gas for the whole bundle
+            // TODO: verify changes don't leak to other transactions
+            // TODO: track balance to be distributed to each builder
+            let evm = builder.evm_mut();
+
+            let Ok(txs): Result<Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>, _> = bundle.transactions.into_iter().map(|b|{
+                let mut buf = b.as_ref();
+                let tx = <<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx as Decodable2718>::decode_2718(&mut buf)?;
+                if !buf.is_empty() {
+                    return Err(alloy_rlp::Error::UnexpectedLength);
+                }
+                let recovered = tx.try_into_recovered().unwrap();
+                Ok(recovered)
+            }).collect() else {
+                // The mergeable transactions should come from already validated payloads
+                // TODO: should we handle this differently?
+                continue;
+            };
+
+            let mut bundle_is_valid = true;
+            let mut should_be_included = vec![true; txs.len()];
+
+            // Check the bundle can be included in the block
+            for (i, tx) in txs.iter().enumerate() {
+                match evm.transact(tx) {
+                    Ok(result) => {
+                        // If tx reverted and is not allowed to
+                        if !result.result.is_success() && !bundle.reverting_txs.contains(&i) {
+                            // We check if we can drop it instead, else we discard this bundle
+                            if bundle.dropping_txs.contains(&i) {
+                                // Tx should be dropped
+                                should_be_included[i] = false;
+                            } else {
+                                bundle_is_valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
+                            // The transaction might have been invalidated by another one, so we drop it
+                            should_be_included[i] = false;
+                        } else {
+                            // TODO: what should we do in these cases?
+                            bundle_is_valid = false;
+                            break;
+                        }
+                    }
+                };
+            }
+            if !bundle_is_valid {
+                continue;
+            }
             // Execute the transaction
+            for (i, tx) in txs.into_iter().enumerate() {
+                if !should_be_included[i] {
+                    continue;
+                }
+                builder.execute_transaction(tx).unwrap();
+            }
         }
 
         let outcome = builder.finish(&state_provider)?;
