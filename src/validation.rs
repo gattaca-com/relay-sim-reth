@@ -572,23 +572,10 @@ where
         request: MergeBlockRequestV1,
     ) -> Result<MergeBlockResponseV1, ValidationApiError> {
         info!(target: "rpc::relay", "Merging block v1");
-        let block = self
-            .payload_validator
-            .ensure_well_formed_payload(ExecutionData {
-                payload: ExecutionPayload::V3(request.execution_payload),
-                sidecar: ExecutionPayloadSidecar::v4(
-                    CancunPayloadFields {
-                        parent_beacon_block_root: request.parent_beacon_block_root,
-                        versioned_hashes: self
-                            .validate_blobs_bundle(request.blobs_bundle.clone())?,
-                    },
-                    PraguePayloadFields {
-                        requests: RequestsOrHash::Requests(
-                            request.execution_requests.to_requests(),
-                        ),
-                    },
-                ),
-            })?;
+
+        let block: alloy_consensus::Block<
+            <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx,
+        > = request.execution_payload.try_into_block().unwrap();
 
         let latest_header = self
             .provider
@@ -614,10 +601,8 @@ where
             parent_header
         };
 
-        let (sealed_block, senders) = block.split();
-        let (header, body) = sealed_block.split();
+        let (header, body) = block.split();
 
-        let body = body.into_ethereum_body();
         let (withdrawals, transactions) = (body.withdrawals, body.transactions);
 
         // TODO: load from configuration
@@ -651,11 +636,9 @@ where
         builder.apply_pre_execution_changes().unwrap();
 
         // Insert the transactions from the unmerged block
-        for (tx, sender) in transactions.into_iter().zip(senders) {
-            // NOTE: we use the senders from the block body, which should be correct
-            builder
-                .execute_transaction(Recovered::new_unchecked(tx, sender))
-                .unwrap();
+        for tx in transactions.into_iter() {
+            let tx = tx.try_into_recovered().unwrap();
+            builder.execute_transaction(tx).unwrap();
         }
 
         // Append transactions until we run out of space
@@ -1040,10 +1023,8 @@ pub struct MergeableBundles {
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeBlockRequestV1 {
-    pub parent_beacon_block_root: B256,
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
-    pub execution_requests: ExecutionRequestsV4,
     pub blobs_bundle: BlobsBundleV1,
     pub merging_data: Vec<MergeableBundles>,
 }
