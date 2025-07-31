@@ -8,11 +8,11 @@ use alloy_rpc_types_beacon::relay::{
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
 };
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
-use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_rpc_types_engine::{
     BlobsBundleV1, CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
     PraguePayloadFields,
 };
+use alloy_rpc_types_engine::{ExecutionPayloadV2, ExecutionPayloadV3};
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::fmt;
@@ -168,7 +168,7 @@ where
         &self,
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
-        registered_gas_limit: u64,
+        _registered_gas_limit: u64,
         apply_blacklist: bool,
         inclusion_list: Option<InclusionList>,
     ) -> Result<(), ValidationApiError> {
@@ -567,7 +567,10 @@ where
     }
 
     /// Core logic for appending additional transactions to a block.
-    async fn merge_block_v1(&self, request: MergeBlockRequestV1) -> Result<(), ValidationApiError> {
+    async fn merge_block_v1(
+        &self,
+        request: MergeBlockRequestV1,
+    ) -> Result<MergeBlockResponseV1, ValidationApiError> {
         info!(target: "rpc::relay", "Merging block v1");
         let block = self
             .payload_validator
@@ -576,7 +579,8 @@ where
                 sidecar: ExecutionPayloadSidecar::v4(
                     CancunPayloadFields {
                         parent_beacon_block_root: request.parent_beacon_block_root,
-                        versioned_hashes: self.validate_blobs_bundle(request.blobs_bundle)?,
+                        versioned_hashes: self
+                            .validate_blobs_bundle(request.blobs_bundle.clone())?,
                     },
                     PraguePayloadFields {
                         requests: RequestsOrHash::Requests(
@@ -684,6 +688,11 @@ where
 
             // Check the bundle can be included in the block
             for (i, tx) in txs.iter().enumerate() {
+                // TODO: handle blob transactions
+                if tx.blob_count().unwrap_or(0) != 0 {
+                    bundle_is_valid = false;
+                    break;
+                }
                 match evm.transact(tx) {
                     Ok(result) => {
                         // If tx reverted and is not allowed to
@@ -723,10 +732,30 @@ where
         }
 
         let outcome = builder.finish(&state_provider)?;
-        // TODO: return block
-        let block = outcome.block;
+        let block_hash = outcome.block.hash();
+        let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
+        let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
+        let block = outcome.block.into_block().into_ethereum_block();
 
-        Ok(())
+        let payload_inner = ExecutionPayloadV2::from_block_unchecked(block_hash, &block);
+        let execution_payload = ExecutionPayloadV3 {
+            payload_inner,
+            blob_gas_used,
+            excess_blob_gas,
+        };
+        let execution_requests = outcome.execution_result.requests.try_into().unwrap();
+        // We assume that no new blobs were added to the block
+        // TODO: support blob transactions?
+        let blobs_bundle = request.blobs_bundle;
+
+        let response = MergeBlockResponseV1 {
+            execution_payload,
+            execution_requests,
+            blobs_bundle,
+            value: U256::ZERO, // TODO: calculate the value
+        };
+
+        Ok(response)
     }
 }
 
@@ -795,7 +824,10 @@ where
     }
 
     /// A Request to append mergeable transactions to a block.
-    async fn merge_block_v1(&self, request: MergeBlockRequestV1) -> jsonrpsee::core::RpcResult<()> {
+    async fn merge_block_v1(
+        &self,
+        request: MergeBlockRequestV1,
+    ) -> jsonrpsee::core::RpcResult<MergeBlockResponseV1> {
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
 
@@ -1016,6 +1048,17 @@ pub struct MergeBlockRequestV1 {
     pub merging_data: Vec<MergeableBundles>,
 }
 
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeBlockResponseV1 {
+    #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
+    pub execution_payload: ExecutionPayloadV3,
+    pub execution_requests: ExecutionRequestsV4,
+    pub blobs_bundle: BlobsBundleV1,
+    /// Total value for the proposer
+    pub value: U256,
+}
+
 /// Block validation rpc interface.
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "relay"))]
 #[cfg_attr(feature = "client", rpc(server, client, namespace = "relay"))]
@@ -1050,5 +1093,8 @@ pub trait BlockSubmissionValidationApi {
 
     /// A Request to append mergeable transactions to a block.
     #[method(name = "mergeBlockV1")]
-    async fn merge_block_v1(&self, request: MergeBlockRequestV1) -> jsonrpsee::core::RpcResult<()>;
+    async fn merge_block_v1(
+        &self,
+        request: MergeBlockRequestV1,
+    ) -> jsonrpsee::core::RpcResult<MergeBlockResponseV1>;
 }
