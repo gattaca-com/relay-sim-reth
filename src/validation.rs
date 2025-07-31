@@ -735,7 +735,7 @@ where
             execution_payload,
             execution_requests,
             blobs_bundle,
-            value: U256::ZERO, // TODO: calculate the value
+            value: request.value + U256::from(1), // TODO: calculate the value
         };
 
         Ok(response)
@@ -1023,6 +1023,8 @@ pub struct MergeableBundles {
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeBlockRequestV1 {
+    /// The original payload value
+    pub value: U256,
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     pub blobs_bundle: BlobsBundleV1,
