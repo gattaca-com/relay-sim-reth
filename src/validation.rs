@@ -1,14 +1,14 @@
 use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Header, Transaction, TxEnvelope,
-    TxReceipt,
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
 };
 use alloy_eips::Decodable2718;
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
-use alloy_rlp::Decodable;
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
 };
+use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
+use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_rpc_types_engine::{
     BlobsBundleV1, CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
     PraguePayloadFields,
@@ -19,19 +19,16 @@ use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
-use reth_ethereum::Transaction;
-use reth_ethereum::evm::primitives::block::BlockExecutor;
-use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
-use reth_ethereum::evm::primitives::{EvmError, InvalidTxError};
+use reth_ethereum::evm::primitives::EvmError;
+use reth_ethereum::evm::primitives::execute::BlockBuilder;
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
     evm::{
-        primitives::{Evm, RecoveredTx, block::BlockExecutionError, execute::Executor},
+        primitives::{Evm, block::BlockExecutionError, execute::Executor},
         revm::{cached::CachedReads, database::StateProviderDatabase},
     },
     node::core::rpc::result::{internal_rpc_err, invalid_params_rpc_err},
-    pool::PoolPooledTx,
     primitives::{
         GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor, SignedTransaction,
         constants::GAS_LIMIT_BOUND_DIVISOR,
@@ -47,10 +44,7 @@ use reth_node_builder::{
 };
 use reth_primitives::Recovered;
 use reth_tasks::TaskSpawner;
-use revm::{
-    Database, DatabaseRef,
-    database::{CacheDB, State},
-};
+use revm::{Database, database::State};
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -578,16 +572,15 @@ where
         let block = self
             .payload_validator
             .ensure_well_formed_payload(ExecutionData {
-                payload: ExecutionPayload::V3(request.base.request.execution_payload),
+                payload: ExecutionPayload::V3(request.execution_payload),
                 sidecar: ExecutionPayloadSidecar::v4(
                     CancunPayloadFields {
-                        parent_beacon_block_root: request.base.parent_beacon_block_root,
-                        versioned_hashes: self
-                            .validate_blobs_bundle(request.base.request.blobs_bundle)?,
+                        parent_beacon_block_root: request.parent_beacon_block_root,
+                        versioned_hashes: self.validate_blobs_bundle(request.blobs_bundle)?,
                     },
                     PraguePayloadFields {
                         requests: RequestsOrHash::Requests(
-                            request.base.request.execution_requests.to_requests(),
+                            request.execution_requests.to_requests(),
                         ),
                     },
                 ),
@@ -1015,9 +1008,11 @@ pub struct MergeableBundles {
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeBlockRequestV1 {
-    #[serde(flatten)]
-    pub base: BuilderBlockValidationRequestV4,
-    #[serde(default)]
+    pub parent_beacon_block_root: B256,
+    #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
+    pub execution_payload: ExecutionPayloadV3,
+    pub execution_requests: ExecutionRequestsV4,
+    pub blobs_bundle: BlobsBundleV1,
     pub merging_data: Vec<MergeableBundles>,
 }
 
