@@ -84,6 +84,7 @@ where
         let ValidationApiConfig {
             blacklist_endpoint,
             validation_window,
+            merged_block_beneficiary,
         } = config;
         let disallow = Arc::new(DashSet::new());
 
@@ -97,6 +98,7 @@ where
             cached_state: Default::default(),
             task_spawner,
             metrics: Default::default(),
+            merged_block_beneficiary,
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -607,8 +609,7 @@ where
 
         let (withdrawals, transactions) = (body.withdrawals, body.transactions);
 
-        // TODO: load from configuration
-        let beneficiary = Address::from_slice(b"");
+        let beneficiary = self.merged_block_beneficiary;
 
         // We'll create a new block with ourselves as the beneficiary/coinbase
         let new_block_attrs = NextBlockEnvAttributes {
@@ -859,6 +860,8 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     task_spawner: Box<dyn TaskSpawner>,
     /// Validation metrics
     metrics: ValidationMetrics,
+    /// The beneficiary address for merged blocks.
+    merged_block_beneficiary: Address,
 }
 
 impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
@@ -874,16 +877,19 @@ pub struct ValidationApiConfig {
     pub blacklist_endpoint: String,
     /// The maximum block distance - parent to latest - allowed for validation
     pub validation_window: u64,
+    /// The beneficiary address for merged blocks.
+    pub merged_block_beneficiary: Address,
 }
 
 impl ValidationApiConfig {
     /// Default validation blocks window of 3 blocks
     pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
 
-    pub fn new(blacklist_endpoint: String) -> Self {
+    pub fn new(blacklist_endpoint: String, merged_block_beneficiary: Address) -> Self {
         Self {
             blacklist_endpoint,
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
+            merged_block_beneficiary,
         }
     }
 }
@@ -893,6 +899,7 @@ impl Default for ValidationApiConfig {
         Self {
             blacklist_endpoint: Default::default(),
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
+            merged_block_beneficiary: Address::ZERO,
         }
     }
 }
