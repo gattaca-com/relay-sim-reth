@@ -20,6 +20,7 @@ use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use reth_ethereum::evm::primitives::EvmError;
+use reth_ethereum::evm::primitives::block::{BlockExecutor, StateChangeSource};
 use reth_ethereum::evm::primitives::execute::BlockBuilder;
 use reth_ethereum::{
     chainspec::EthereumHardforks,
@@ -44,10 +45,13 @@ use reth_node_builder::{
 };
 use reth_primitives::Recovered;
 use reth_tasks::TaskSpawner;
+use revm::state::EvmState;
 use revm::{Database, database::State};
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{
     spawn,
@@ -579,7 +583,8 @@ where
             <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx,
         > = request.execution_payload.try_into_block().unwrap();
 
-        let gas_limit = block.gas_limit();
+        // TODO: leave some gas for the final revenue distribution call
+        let gas_limit = block.gas_limit() - 100000;
 
         let latest_header = self
             .provider
@@ -610,6 +615,7 @@ where
         let (withdrawals, transactions) = (body.withdrawals, body.transactions);
 
         let beneficiary = self.merged_block_beneficiary;
+        let original_beneficiary = header.beneficiary();
 
         // We'll create a new block with ourselves as the beneficiary/coinbase
         let new_block_attrs = NextBlockEnvAttributes {
@@ -640,12 +646,35 @@ where
 
         let mut gas_used = 0;
 
+        // We need to use a mutex because of the 'static lifetime requirement of the state hook
+        // (last_balance, current_balance)
+        let balance_tracker = Arc::new(Mutex::new((U256::ZERO, U256::ZERO)));
+
+        let tracker_clone = Arc::clone(&balance_tracker);
+
+        // Set a state hook to track the beneficiary balance across each tx
+        // There might be a better way to do this, but this is the only one I found
+        builder.executor_mut().set_state_hook(Some(Box::new(
+            move |_source: StateChangeSource, state: &EvmState| {
+                let beneficiary_balance = state
+                    .get(&beneficiary)
+                    .map(|v| v.info.balance)
+                    .unwrap_or(U256::ZERO);
+
+                let mut balance = tracker_clone.lock().unwrap();
+                balance.0 = balance.1;
+                balance.1 = beneficiary_balance;
+            },
+        )));
+
         // Insert the transactions from the unmerged block
         for tx in transactions.into_iter() {
             let tx = tx.try_into_recovered().unwrap();
             // TODO: remove unwrap
             gas_used += builder.execute_transaction(tx).unwrap();
         }
+
+        let mut revenues = HashMap::new();
 
         // Append transactions until we run out of space
         for (origin, bundle) in request
@@ -712,13 +741,31 @@ where
             if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
                 continue;
             }
-            // Execute the transaction
+
+            // Execute the transaction bundle
+
+            let mut total_value = U256::ZERO;
+
             for (i, tx) in txs.into_iter().enumerate() {
                 if !should_be_included[i] {
                     continue;
                 }
                 gas_used += builder.execute_transaction(tx).unwrap();
+                // Consider any balance changes on the beneficiary as tx value
+                let (last_balance, current_balance) = *balance_tracker.lock().unwrap();
+                total_value += current_balance.saturating_sub(last_balance);
             }
+            // Update the revenue for the bundle's origin
+            if !total_value.is_zero() {
+                revenues
+                    .entry(origin)
+                    .and_modify(|v| *v += total_value)
+                    .or_insert(total_value);
+            }
+        }
+
+        for (origin, revenue) in revenues {
+            // TODO: encode calldata for distribution call
         }
 
         let outcome = builder.finish(&state_provider)?;
