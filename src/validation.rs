@@ -577,6 +577,8 @@ where
             <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx,
         > = request.execution_payload.try_into_block().unwrap();
 
+        let gas_limit = block.gas_limit();
+
         let latest_header = self
             .provider
             .latest_header()?
@@ -635,10 +637,13 @@ where
 
         builder.apply_pre_execution_changes().unwrap();
 
+        let mut gas_used = 0;
+
         // Insert the transactions from the unmerged block
         for tx in transactions.into_iter() {
             let tx = tx.try_into_recovered().unwrap();
-            builder.execute_transaction(tx).unwrap();
+            // TODO: remove unwrap
+            gas_used += builder.execute_transaction(tx).unwrap();
         }
 
         // Append transactions until we run out of space
@@ -647,7 +652,6 @@ where
             .into_iter()
             .flat_map(|mb| mb.bundles.into_iter().map(move |b| (mb.origin, b)))
         {
-            // TODO: check we have enough gas for the whole bundle
             // TODO: verify changes don't leak to other transactions
             // TODO: track balance to be distributed to each builder
             let evm = builder.evm_mut();
@@ -666,6 +670,7 @@ where
                 continue;
             };
 
+            let mut gas_used_in_bundle = 0;
             let mut bundle_is_valid = true;
             let mut should_be_included = vec![true; txs.len()];
 
@@ -689,6 +694,7 @@ where
                                 break;
                             }
                         }
+                        gas_used_in_bundle += result.result.gas_used();
                     }
                     Err(e) => {
                         if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
@@ -702,7 +708,7 @@ where
                     }
                 };
             }
-            if !bundle_is_valid {
+            if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
                 continue;
             }
             // Execute the transaction
@@ -710,7 +716,7 @@ where
                 if !should_be_included[i] {
                     continue;
                 }
-                builder.execute_transaction(tx).unwrap();
+                gas_used += builder.execute_transaction(tx).unwrap();
             }
         }
 
