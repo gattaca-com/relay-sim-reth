@@ -299,7 +299,7 @@ where
         inclusion_list: &InclusionList,
     ) -> Result<(), ValidationApiError>
     where
-        DB: Database,
+        DB: Database + core::fmt::Debug,
         <DB as revm::Database>::Error: Send + Sync + 'static,
     {
         // nothing to do if no inclusion‐list entries
@@ -850,9 +850,9 @@ where
         txs: &[Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>],
     ) -> (bool, u64, Vec<bool>)
     where
-        DB: Database + 'a,
+        DB: Database + core::fmt::Debug + 'a,
         DB::Error: Send + Sync + 'static,
-        DBRef: DatabaseRef,
+        DBRef: DatabaseRef + core::fmt::Debug,
         DBRef::Error: Send + Sync + 'static,
     {
         // Clone current state to avoid mutating it
