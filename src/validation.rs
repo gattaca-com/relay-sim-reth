@@ -20,8 +20,8 @@ use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use reth_ethereum::evm::primitives::EvmError;
-use reth_ethereum::evm::primitives::block::{BlockExecutor, StateChangeSource};
-use reth_ethereum::evm::primitives::execute::BlockBuilder;
+use reth_ethereum::evm::primitives::block::BlockExecutor;
+use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
@@ -45,13 +45,13 @@ use reth_node_builder::{
 };
 use reth_primitives::Recovered;
 use reth_tasks::TaskSpawner;
-use revm::state::EvmState;
+use revm::DatabaseCommit;
+use revm::database::states::bundle_state::BundleRetention;
 use revm::{Database, database::State};
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{
     spawn,
@@ -614,8 +614,8 @@ where
 
         let (withdrawals, transactions) = (body.withdrawals, body.transactions);
 
-        let beneficiary = self.merged_block_beneficiary;
         let original_beneficiary = header.beneficiary();
+        let beneficiary = self.merged_block_beneficiary;
 
         // We'll create a new block with ourselves as the beneficiary/coinbase
         let new_block_attrs = NextBlockEnvAttributes {
@@ -633,48 +633,49 @@ where
 
         let mut request_cache = self.cached_reads(parent_hash).await;
 
-        let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
+        let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
 
-        let mut state_db = State::builder().with_database(cached_db).build();
+        let mut state_db = State::builder().with_database_ref(&cached_db).build();
         // Execute the base block
-        let mut builder = self
+        let evm_env = self
             .evm_config
-            .builder_for_next_block(&mut state_db, &parent_header, new_block_attrs)
+            .next_evm_env(&parent_header, &new_block_attrs)
             .unwrap();
 
-        builder.apply_pre_execution_changes().unwrap();
+        let evm = self.evm_config.evm_with_env(&mut state_db, evm_env.clone());
+        let ctx = self
+            .evm_config
+            .context_for_next_block(&parent_header, new_block_attrs.clone());
+        let mut block_executor = self.evm_config.create_executor(evm, ctx);
+
+        block_executor.apply_pre_execution_changes().unwrap();
 
         let mut gas_used = 0;
 
-        // We need to use a mutex because of the 'static lifetime requirement of the state hook
-        // (last_balance, current_balance)
-        let balance_tracker = Arc::new(Mutex::new((U256::ZERO, U256::ZERO)));
-
-        let tracker_clone = Arc::clone(&balance_tracker);
-
-        // Set a state hook to track the beneficiary balance across each tx
-        // There might be a better way to do this, but this is the only one I found
-        builder.executor_mut().set_state_hook(Some(Box::new(
-            move |_source: StateChangeSource, state: &EvmState| {
-                let beneficiary_balance = state
-                    .get(&beneficiary)
-                    .map(|v| v.info.balance)
-                    .unwrap_or(U256::ZERO);
-
-                let mut balance = tracker_clone.lock().unwrap();
-                balance.0 = balance.1;
-                balance.1 = beneficiary_balance;
-            },
-        )));
+        let mut all_transactions: Vec<
+            Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
+        > = Vec::with_capacity(transactions.len());
 
         // Insert the transactions from the unmerged block
-        for tx in transactions.into_iter() {
+        for tx in transactions {
             let tx = tx.try_into_recovered().unwrap();
             // TODO: remove unwrap
-            gas_used += builder.execute_transaction(tx).unwrap();
+            gas_used += block_executor
+                .execute_transaction(tx.as_executable())
+                .unwrap();
+
+            all_transactions.push(tx.clone());
         }
 
+        let initial_balance = block_executor
+            .evm_mut()
+            .db_mut()
+            .basic(beneficiary)?
+            .map_or(U256::ZERO, |info| info.balance);
+
         let mut revenues = HashMap::new();
+
+        let mut current_balance = initial_balance;
 
         // Append transactions until we run out of space
         for (origin, bundle) in request
@@ -682,9 +683,21 @@ where
             .into_iter()
             .flat_map(|mb| mb.bundles.into_iter().map(move |b| (mb.origin, b)))
         {
-            // TODO: verify changes don't leak to other transactions
-            // TODO: track balance to be distributed to each builder
-            let evm = builder.evm_mut();
+            // Clone current state to avoid mutating it
+            // TODO: there should be a way to remove this clone
+            let mut db_clone = {
+                let db = block_executor.evm_mut().db_mut();
+                db.merge_transitions(BundleRetention::Reverts);
+
+                let pre_state = db.bundle_state.clone();
+
+                State::builder()
+                    .with_database_ref(&cached_db)
+                    .with_bundle_prestate(pre_state)
+                    .build()
+            };
+            // Create a new EVM with the cloned pre-state
+            let mut evm_clone = self.evm_config.evm_with_env(&mut db_clone, evm_env.clone());
 
             let Ok(txs): Result<Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>, _> = bundle.transactions.into_iter().map(|b|{
                 let mut buf = b.as_ref();
@@ -711,7 +724,7 @@ where
                     bundle_is_valid = false;
                     break;
                 }
-                match evm.transact(tx) {
+                match evm_clone.transact(tx) {
                     Ok(result) => {
                         // If tx reverted and is not allowed to
                         if !result.result.is_success() && !bundle.reverting_txs.contains(&i) {
@@ -725,6 +738,9 @@ where
                             }
                         }
                         gas_used_in_bundle += result.result.gas_used();
+                        // Apply the state changes to the cloned state
+                        // Note that this only commits to the State object, not the database
+                        evm_clone.db_mut().commit(result.state);
                     }
                     Err(e) => {
                         if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
@@ -750,11 +766,22 @@ where
                 if !should_be_included[i] {
                     continue;
                 }
-                gas_used += builder.execute_transaction(tx).unwrap();
-                // Consider any balance changes on the beneficiary as tx value
-                let (last_balance, current_balance) = *balance_tracker.lock().unwrap();
-                total_value += current_balance.saturating_sub(last_balance);
+                gas_used += block_executor
+                    .execute_transaction(tx.as_executable())
+                    .unwrap();
+
+                all_transactions.push(tx.clone());
             }
+            // Consider any balance changes on the beneficiary as tx value
+            let new_balance = block_executor
+                .evm_mut()
+                .db_mut()
+                .basic(beneficiary)?
+                .map_or(U256::ZERO, |info| info.balance);
+
+            total_value += new_balance.saturating_sub(current_balance);
+            current_balance = new_balance;
+
             // Update the revenue for the bundle's origin
             if !total_value.is_zero() {
                 revenues
@@ -768,7 +795,28 @@ where
             // TODO: encode calldata for distribution call
         }
 
-        let outcome = builder.finish(&state_provider)?;
+        // TODO: add tx distributing rewards
+        // transactions.push(distribution_tx);
+
+        drop(block_executor);
+
+        let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
+
+        let mut state_db = State::builder().with_database(cached_db).build();
+        let mut builder = self
+            .evm_config
+            .builder_for_next_block(&mut state_db, &parent_header, new_block_attrs)
+            .unwrap();
+
+        // We re-execute all transactions due to limitations on the BlockBuilder API
+        // TODO: check if we can avoid this
+        for tx in all_transactions {
+            // TODO: remove unwrap
+            builder.execute_transaction(tx).unwrap();
+        }
+
+        let outcome = builder.finish(&state_provider).unwrap();
+
         let block_hash = outcome.block.hash();
         let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
         let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
