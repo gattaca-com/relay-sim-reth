@@ -23,7 +23,7 @@ use reth_ethereum::{
     rpc::{api::eth::RpcNodeCore, eth::error::RpcPoolError},
 };
 use reth_node_builder::FullNodeComponents;
-use revm_primitives::{Address, Bytes};
+use revm_primitives::Bytes;
 use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
 
