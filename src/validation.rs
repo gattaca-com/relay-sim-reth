@@ -791,9 +791,34 @@ where
             }
         }
 
+        let mut updated_revenues = HashMap::with_capacity(revenues.len());
         for (origin, revenue) in revenues {
-            // TODO: encode calldata for distribution call
+            // TODO: get the winning builder and proposer addresses
+            // let winning_builder_revenue = revenue / U256::from(4);
+            // updated_revenues
+            //     .entry(winning_builder)
+            //     .and_modify(|v| *v += winning_builder_revenue)
+            //     .or_insert(winning_builder_revenue);
+
+            // let proposer_revenue = revenue / U256::from(4);
+            // updated_revenues
+            //     .entry(proposer)
+            //     .and_modify(|v| *v += proposer_revenue)
+            //     .or_insert(proposer_revenue);
+
+            let builder_revenue = revenue / U256::from(4);
+
+            updated_revenues
+                .entry(origin)
+                .and_modify(|v| *v += builder_revenue)
+                .or_insert(builder_revenue);
         }
+
+        // Just in case, we remove the beneficiary address from the distribution
+        updated_revenues.remove(&beneficiary);
+        let updated_revenues: Vec<_> = updated_revenues.into_iter().collect();
+
+        let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
         // TODO: add tx distributing rewards
         // transactions.push(distribution_tx);
@@ -1188,4 +1213,75 @@ pub trait BlockSubmissionValidationApi {
         &self,
         request: MergeBlockRequestV1,
     ) -> jsonrpsee::core::RpcResult<MergeBlockResponseV1>;
+}
+
+/// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
+fn encode_disperse_eth_calldata(input: &[(Address, U256)]) -> Vec<u8> {
+    let mut calldata = Vec::with_capacity(4 + 64 + input.len() * 32 * 2);
+    // selector for "disperseEther(address[],uint256[])"
+    calldata.extend_from_slice(&[0xe6, 0x3d, 0x38, 0xed]);
+    // Offset for recipients from start of calldata (without counting selector)
+    // 32 bytes for each offset = 64
+    let recipients_offset: [u8; 32] = U256::from(64).to_be_bytes();
+    calldata.extend_from_slice(&recipients_offset);
+    // Offset for values from start of calldata (without counting selector)
+    // 32 bytes for each offset + 32 bytes for recipients length + 32 bytes for each recipient
+    let values_offset: [u8; 32] = (U256::from(64 + 32 + input.len() * 32)).to_be_bytes();
+    calldata.extend_from_slice(&values_offset);
+
+    let revenues_length: [u8; 32] = U256::from(input.len()).to_be_bytes();
+    calldata.extend_from_slice(&revenues_length);
+
+    calldata.extend(input.iter().flat_map(|(recipient, _)| {
+        let mut arr = [0_u8; 32];
+        arr[12..].copy_from_slice(recipient.as_slice());
+        arr
+    }));
+
+    calldata.extend_from_slice(&revenues_length);
+
+    calldata.extend(
+        input
+            .iter()
+            .flat_map(|(_, value)| value.to_be_bytes::<32>()),
+    );
+    calldata
+}
+
+#[cfg(test)]
+mod tests {
+    use revm_primitives::hex;
+
+    use super::*;
+
+    #[test]
+    fn test_disperse_calldata_encoding() {
+        let expected = hex!(
+            // Selector
+            "e63d38ed"
+            // Recipients offset
+            "0000000000000000000000000000000000000000000000000000000000000040"
+            // Values offset
+            "00000000000000000000000000000000000000000000000000000000000000c0"
+            // Recipients length
+            "0000000000000000000000000000000000000000000000000000000000000003"
+            // Recipients (padded to 32 bytes)
+            "0000000000000000000000000000000000000000000000000000000000000001"
+            "0000000000000000000000000000000000000000000000000000000000000002"
+            "0000000000000000000000000000000000000000000000000000000000000003"
+            // Values length
+            "0000000000000000000000000000000000000000000000000000000000000003"
+            // Values
+            "0000000000000000000000000000000000000000000000000000000000000005"
+            "0000000000000000000000000000000000000000000000000000000000000006"
+            "0000000000000000000000000000000000000000000000000000000000000007"
+        );
+        let input = [
+            (Address::left_padding_from(&[1]), U256::from(5)),
+            (Address::left_padding_from(&[2]), U256::from(6)),
+            (Address::left_padding_from(&[3]), U256::from(7)),
+        ];
+        let actual = encode_disperse_eth_calldata(&input);
+        assert_eq!(actual, expected);
+    }
 }
