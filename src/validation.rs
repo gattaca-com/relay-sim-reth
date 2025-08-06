@@ -619,7 +619,9 @@ where
 
         let block_base_fee_per_gas = header.base_fee_per_gas().unwrap_or_default();
 
-        let original_beneficiary = header.beneficiary();
+        // TODO: which is which?
+        let proposer = header.beneficiary();
+        let winning_builder = header.beneficiary();
         let beneficiary = self.merged_block_beneficiary;
 
         // We'll create a new block with ourselves as the beneficiary/coinbase
@@ -799,19 +801,20 @@ where
         let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
         let mut total_revenue = U256::ZERO;
+        // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
+        // We assume the relay controls the beneficiary address, and so it will receive any undistributed revenue.
         for (origin, revenue) in revenues {
-            // TODO: get the winning builder and proposer addresses
-            // let winning_builder_revenue = revenue / U256::from(4);
-            // updated_revenues
-            //     .entry(winning_builder)
-            //     .and_modify(|v| *v += winning_builder_revenue)
-            //     .or_insert(winning_builder_revenue);
+            let winning_builder_revenue = revenue / U256::from(4);
+            updated_revenues
+                .entry(winning_builder)
+                .and_modify(|v| *v += winning_builder_revenue)
+                .or_insert(winning_builder_revenue);
 
-            // let proposer_revenue = revenue / U256::from(4);
-            // updated_revenues
-            //     .entry(proposer)
-            //     .and_modify(|v| *v += proposer_revenue)
-            //     .or_insert(proposer_revenue);
+            let proposer_revenue = revenue / U256::from(4);
+            updated_revenues
+                .entry(proposer)
+                .and_modify(|v| *v += proposer_revenue)
+                .or_insert(proposer_revenue);
 
             let builder_revenue = revenue / U256::from(4);
 
@@ -825,6 +828,7 @@ where
 
         // Just in case, we remove the beneficiary address from the distribution
         updated_revenues.remove(&beneficiary);
+
         let updated_revenues: Vec<_> = updated_revenues.into_iter().collect();
 
         let calldata = encode_disperse_eth_calldata(&updated_revenues);
