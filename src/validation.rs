@@ -623,8 +623,7 @@ where
 
         let block_base_fee_per_gas = header.base_fee_per_gas().unwrap_or_default();
 
-        // TODO: which is which?
-        let proposer = header.beneficiary();
+        let proposer = request.proposer_fee_recipient;
         let winning_builder = header.beneficiary();
         let beneficiary = self.merger_signer.address();
 
@@ -1223,6 +1222,8 @@ pub struct MergeableBundles {
 pub struct MergeBlockRequestV1 {
     /// The original payload value
     pub value: U256,
+    /// The address to send the proposer payment to.
+    pub proposer_fee_recipient: Address,
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     pub blobs_bundle: BlobsBundleV1,
