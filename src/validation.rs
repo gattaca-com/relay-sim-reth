@@ -1,5 +1,6 @@
 use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, EthereumTxEnvelope,
+    SignableTransaction, Signed, Transaction, TxEip1559, TxEnvelope, TxReceipt,
 };
 use alloy_eips::Decodable2718;
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
@@ -13,6 +14,8 @@ use alloy_rpc_types_engine::{
     PraguePayloadFields,
 };
 use alloy_rpc_types_engine::{ExecutionPayloadV2, ExecutionPayloadV3};
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::fmt;
@@ -48,7 +51,7 @@ use reth_tasks::TaskSpawner;
 use revm::DatabaseCommit;
 use revm::database::states::bundle_state::BundleRetention;
 use revm::{Database, database::State};
-use revm_primitives::{Address, B256, U256};
+use revm_primitives::{Address, B256, U256, address};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::HashMap;
@@ -167,6 +170,7 @@ where
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
         + 'static,
+    <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx: From<Signed<TxEip1559>>,
     E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 {
     /// Validates the given block and a [`BidTrace`] against it.
@@ -614,6 +618,8 @@ where
 
         let (withdrawals, transactions) = (body.withdrawals, body.transactions);
 
+        let block_base_fee_per_gas = header.base_fee_per_gas().unwrap_or_default();
+
         let original_beneficiary = header.beneficiary();
         let beneficiary = self.merged_block_beneficiary;
 
@@ -792,6 +798,8 @@ where
         }
 
         let mut updated_revenues = HashMap::with_capacity(revenues.len());
+
+        let mut total_revenue = U256::ZERO;
         for (origin, revenue) in revenues {
             // TODO: get the winning builder and proposer addresses
             // let winning_builder_revenue = revenue / U256::from(4);
@@ -812,6 +820,8 @@ where
                 .entry(origin)
                 .and_modify(|v| *v += builder_revenue)
                 .or_insert(builder_revenue);
+
+            total_revenue += builder_revenue;
         }
 
         // Just in case, we remove the beneficiary address from the distribution
@@ -820,8 +830,48 @@ where
 
         let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
+        let signer = PrivateKeySigner::random();
+
+        // Get the chain ID from any transaction in the block, defaulting to 1 (mainnet) if none was found
+        // TODO: check if this is OK
+        let chain_id = all_transactions
+            .iter()
+            .find_map(|tx| tx.chain_id())
+            .unwrap_or(1);
+
+        let nonce = block_executor
+            .evm_mut()
+            .db_mut()
+            .basic(beneficiary)?
+            .map_or(0, |info| info.nonce)
+            + 1;
+
+        let disperse_tx = TxEip1559 {
+            chain_id,
+            nonce,
+            // TODO: compute proper gas limit
+            gas_limit: 100_000,
+            max_fee_per_gas: block_base_fee_per_gas.into(),
+            max_priority_fee_per_gas: 0,
+            // Address of `Disperse.app` contract
+            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
+            to: address!("0xD152f549545093347A162Dce210e7293f1452150").into(),
+            value: total_revenue,
+            access_list: Default::default(),
+            input: calldata.into(),
+        };
+
+        let signature = signer
+            .sign_hash_sync(&disperse_tx.signature_hash())
+            .unwrap();
+        let signed_disperse_tx = disperse_tx.into_signed(signature);
+        let recovered_signed_disperse_tx = Recovered::new_unchecked(
+            <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::from(signed_disperse_tx),
+            signer.address(),
+        );
+
         // TODO: add tx distributing rewards
-        // transactions.push(distribution_tx);
+        all_transactions.push(recovered_signed_disperse_tx);
 
         drop(block_executor);
 
