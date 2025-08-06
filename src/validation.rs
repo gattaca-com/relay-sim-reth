@@ -623,8 +623,8 @@ where
 
         let block_base_fee_per_gas = header.base_fee_per_gas().unwrap_or_default();
 
-        let proposer = request.proposer_fee_recipient;
-        let winning_builder = header.beneficiary();
+        let proposer_fee_recipient = request.proposer_fee_recipient;
+        let winner_fee_recipient = header.beneficiary();
         let beneficiary = self.merger_signer.address();
 
         // We'll create a new block with ourselves as the beneficiary/coinbase
@@ -803,19 +803,21 @@ where
 
         let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
-        let mut total_revenue = U256::ZERO;
+        let mut distributed_value = U256::ZERO;
+        let mut proposer_value = request.value;
+
         // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
         // We assume the relay controls the beneficiary address, and so it will receive any undistributed revenue.
         for (origin, revenue) in revenues {
-            let winning_builder_revenue = revenue / U256::from(4);
+            let winner_revenue = revenue / U256::from(4);
             updated_revenues
-                .entry(winning_builder)
-                .and_modify(|v| *v += winning_builder_revenue)
-                .or_insert(winning_builder_revenue);
+                .entry(winner_fee_recipient)
+                .and_modify(|v| *v += winner_revenue)
+                .or_insert(winner_revenue);
 
             let proposer_revenue = revenue / U256::from(4);
             updated_revenues
-                .entry(proposer)
+                .entry(proposer_fee_recipient)
                 .and_modify(|v| *v += proposer_revenue)
                 .or_insert(proposer_revenue);
 
@@ -826,7 +828,8 @@ where
                 .and_modify(|v| *v += builder_revenue)
                 .or_insert(builder_revenue);
 
-            total_revenue += builder_revenue;
+            distributed_value += builder_revenue + winner_revenue + proposer_revenue;
+            proposer_value += proposer_revenue;
         }
 
         // Just in case, we remove the beneficiary address from the distribution
@@ -860,7 +863,7 @@ where
             // Address of `Disperse.app` contract
             // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
             to: address!("0xD152f549545093347A162Dce210e7293f1452150").into(),
-            value: total_revenue,
+            value: distributed_value,
             access_list: Default::default(),
             input: calldata.into(),
         };
@@ -922,7 +925,7 @@ where
             execution_payload,
             execution_requests,
             blobs_bundle,
-            value: request.value + U256::from(1), // TODO: calculate the value
+            value: proposer_value,
         };
 
         Ok(response)
