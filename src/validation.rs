@@ -1,8 +1,8 @@
 use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, EthereumTxEnvelope,
-    SignableTransaction, Signed, Transaction, TxEip1559, TxEnvelope, TxReceipt,
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, SignableTransaction, Transaction,
+    TxEip1559, TxReceipt,
 };
-use alloy_eips::Decodable2718;
+use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
@@ -170,7 +170,6 @@ where
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
         + 'static,
-    <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx: From<Signed<TxEip1559>>,
     E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 {
     /// Validates the given block and a [`BidTrace`] against it.
@@ -865,10 +864,13 @@ where
             .sign_hash_sync(&disperse_tx.signature_hash())
             .unwrap();
         let signed_disperse_tx = disperse_tx.into_signed(signature);
-        let recovered_signed_disperse_tx = Recovered::new_unchecked(
-            <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::from(signed_disperse_tx),
-            signer.address(),
-        );
+        let mut buf = vec![];
+        signed_disperse_tx.encode_2718(&mut buf);
+        let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
+            &mut buf.as_slice(),
+        )
+        .unwrap();
+        let recovered_signed_disperse_tx = Recovered::new_unchecked(signed_tx, signer.address());
 
         // TODO: add tx distributing rewards
         all_transactions.push(recovered_signed_disperse_tx);
