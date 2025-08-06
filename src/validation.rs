@@ -91,9 +91,13 @@ where
         let ValidationApiConfig {
             blacklist_endpoint,
             validation_window,
-            merged_block_beneficiary,
+            merger_private_key,
         } = config;
         let disallow = Arc::new(DashSet::new());
+
+        let merger_signer = merger_private_key
+            .parse()
+            .expect("Failed to parse merger private key");
 
         let inner = Arc::new(ValidationApiInner {
             provider,
@@ -105,7 +109,7 @@ where
             cached_state: Default::default(),
             task_spawner,
             metrics: Default::default(),
-            merged_block_beneficiary,
+            merger_signer,
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -622,7 +626,7 @@ where
         // TODO: which is which?
         let proposer = header.beneficiary();
         let winning_builder = header.beneficiary();
-        let beneficiary = self.merged_block_beneficiary;
+        let beneficiary = self.merger_signer.address();
 
         // We'll create a new block with ourselves as the beneficiary/coinbase
         let new_block_attrs = NextBlockEnvAttributes {
@@ -833,8 +837,6 @@ where
 
         let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
-        let signer = PrivateKeySigner::random();
-
         // Get the chain ID from any transaction in the block, defaulting to 1 (mainnet) if none was found
         // TODO: check if this is OK
         let chain_id = all_transactions
@@ -865,7 +867,8 @@ where
         };
 
         // Sign the transaction
-        let signature = signer
+        let signature = self
+            .merger_signer
             .sign_hash_sync(&disperse_tx.signature_hash())
             .unwrap();
         let signed_disperse_tx = disperse_tx.into_signed(signature);
@@ -877,7 +880,8 @@ where
             &mut buf.as_slice(),
         )
         .unwrap();
-        let recovered_signed_disperse_tx = Recovered::new_unchecked(signed_tx, signer.address());
+        let recovered_signed_disperse_tx =
+            Recovered::new_unchecked(signed_tx, self.merger_signer.address());
 
         all_transactions.push(recovered_signed_disperse_tx);
 
@@ -1038,8 +1042,10 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     task_spawner: Box<dyn TaskSpawner>,
     /// Validation metrics
     metrics: ValidationMetrics,
-    /// The beneficiary address for merged blocks.
-    merged_block_beneficiary: Address,
+    /// The signer to use for merging blocks.
+    /// Its address will be used as the beneficiary for merged blocks,
+    /// and it will be used for signing the revenue distribution transaction.
+    merger_signer: PrivateKeySigner,
 }
 
 impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
@@ -1055,19 +1061,21 @@ pub struct ValidationApiConfig {
     pub blacklist_endpoint: String,
     /// The maximum block distance - parent to latest - allowed for validation
     pub validation_window: u64,
-    /// The beneficiary address for merged blocks.
-    pub merged_block_beneficiary: Address,
+    /// Private key to use for merging blocks.
+    /// The address of this key will be used as the beneficiary for merged blocks,
+    /// and it will be used for signing the revenue distribution transaction.
+    pub merger_private_key: String,
 }
 
 impl ValidationApiConfig {
     /// Default validation blocks window of 3 blocks
     pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
 
-    pub fn new(blacklist_endpoint: String, merged_block_beneficiary: Address) -> Self {
+    pub fn new(blacklist_endpoint: String, merger_private_key: String) -> Self {
         Self {
             blacklist_endpoint,
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
-            merged_block_beneficiary,
+            merger_private_key,
         }
     }
 }
@@ -1077,7 +1085,7 @@ impl Default for ValidationApiConfig {
         Self {
             blacklist_endpoint: Default::default(),
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
-            merged_block_beneficiary: Address::ZERO,
+            merger_private_key: String::from("0x00"),
         }
     }
 }

@@ -71,7 +71,7 @@ fn main() {
                         RpcNodeCore::evm_config(ctx.node()).clone(),
                         ValidationApiConfig::new(
                             args.blacklist_provider.clone().unwrap_or_default(),
-                            args.merged_block_beneficiary,
+                            args.merger_private_key,
                         ),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
@@ -107,7 +107,7 @@ struct CliExt {
 
     // TODO: should we add a default value here?
     #[arg(long)]
-    pub merged_block_beneficiary: Address,
+    pub merger_private_key: String,
 }
 
 /// trait interface for a custom rpc namespace: `relay`
