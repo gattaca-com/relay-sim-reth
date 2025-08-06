@@ -904,12 +904,11 @@ where
 
         let outcome = builder.finish(&state_provider).unwrap();
 
-        let block_hash = outcome.block.hash();
         let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
         let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
         let block = outcome.block.into_block().into_ethereum_block();
 
-        let payload_inner = ExecutionPayloadV2::from_block_unchecked(block_hash, &block);
+        let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
         let execution_payload = ExecutionPayloadV3 {
             payload_inner,
             blob_gas_used,
