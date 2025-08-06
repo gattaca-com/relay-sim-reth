@@ -860,10 +860,13 @@ where
             input: calldata.into(),
         };
 
+        // Sign the transaction
         let signature = signer
             .sign_hash_sync(&disperse_tx.signature_hash())
             .unwrap();
         let signed_disperse_tx = disperse_tx.into_signed(signature);
+
+        // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
         let mut buf = vec![];
         signed_disperse_tx.encode_2718(&mut buf);
         let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
@@ -872,7 +875,6 @@ where
         .unwrap();
         let recovered_signed_disperse_tx = Recovered::new_unchecked(signed_tx, signer.address());
 
-        // TODO: add tx distributing rewards
         all_transactions.push(recovered_signed_disperse_tx);
 
         drop(block_executor);
