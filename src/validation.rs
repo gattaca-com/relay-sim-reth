@@ -719,7 +719,7 @@ where
                 Ok(recovered)
             }).collect() else {
                 // The mergeable transactions should come from already validated payloads
-                // TODO: should we handle this differently?
+                // But in case decoding fails, we just skip the bundle
                 continue;
             };
 
@@ -757,7 +757,7 @@ where
                             // The transaction might have been invalidated by another one, so we drop it
                             should_be_included[i] = false;
                         } else {
-                            // TODO: what should we do in these cases?
+                            // The error isn't transaction-related, so we just try to skip this bundle
                             bundle_is_valid = false;
                             break;
                         }
@@ -898,7 +898,6 @@ where
         // We re-execute all transactions due to limitations on the BlockBuilder API
         // TODO: check if we can avoid this
         for tx in all_transactions {
-            // TODO: remove unwrap
             builder.execute_transaction(tx)?;
         }
 

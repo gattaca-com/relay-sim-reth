@@ -105,7 +105,6 @@ struct CliExt {
     #[arg(long, default_value = "/root/blocks")]
     pub record_blocks_dir: String,
 
-    // TODO: should we add a default value here?
     #[arg(long)]
     pub merger_private_key: String,
 }
