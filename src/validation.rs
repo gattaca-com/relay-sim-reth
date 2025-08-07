@@ -588,7 +588,10 @@ where
 
         let block: alloy_consensus::Block<
             <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx,
-        > = request.execution_payload.try_into_block().unwrap();
+        > = request
+            .execution_payload
+            .try_into_block()
+            .map_err(|e| NewPayloadError::Eth(e))?;
 
         // TODO: leave some gas for the final revenue distribution call
         let gas_limit = block.gas_limit() - 100000;
@@ -650,7 +653,7 @@ where
         let evm_env = self
             .evm_config
             .next_evm_env(&parent_header, &new_block_attrs)
-            .unwrap();
+            .or(Err(ValidationApiError::NextEvmEnvFail))?;
 
         let evm = self.evm_config.evm_with_env(&mut state_db, evm_env.clone());
         let ctx = self
@@ -658,7 +661,7 @@ where
             .context_for_next_block(&parent_header, new_block_attrs.clone());
         let mut block_executor = self.evm_config.create_executor(evm, ctx);
 
-        block_executor.apply_pre_execution_changes().unwrap();
+        block_executor.apply_pre_execution_changes()?;
 
         let mut gas_used = 0;
 
@@ -668,11 +671,8 @@ where
 
         // Insert the transactions from the unmerged block
         for tx in transactions {
-            let tx = tx.try_into_recovered().unwrap();
-            // TODO: remove unwrap
-            gas_used += block_executor
-                .execute_transaction(tx.as_executable())
-                .unwrap();
+            let tx = tx.try_into_recovered().expect("signature is valid");
+            gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
             all_transactions.push(tx.clone());
         }
@@ -715,7 +715,7 @@ where
                 if !buf.is_empty() {
                     return Err(alloy_rlp::Error::UnexpectedLength);
                 }
-                let recovered = tx.try_into_recovered().unwrap();
+                let recovered = tx.try_into_recovered().or(Err(alloy_rlp::Error::Custom("invalid signature")))?;
                 Ok(recovered)
             }).collect() else {
                 // The mergeable transactions should come from already validated payloads
@@ -776,9 +776,7 @@ where
                 if !should_be_included[i] {
                     continue;
                 }
-                gas_used += block_executor
-                    .execute_transaction(tx.as_executable())
-                    .unwrap();
+                gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
                 all_transactions.push(tx.clone());
             }
@@ -872,7 +870,7 @@ where
         let signature = self
             .merger_signer
             .sign_hash_sync(&disperse_tx.signature_hash())
-            .unwrap();
+            .expect("signer is local and private key is valid");
         let signed_disperse_tx = disperse_tx.into_signed(signature);
 
         // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
@@ -881,7 +879,7 @@ where
         let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
             &mut buf.as_slice(),
         )
-        .unwrap();
+        .expect("we just encoded it with encode_2718");
         let recovered_signed_disperse_tx =
             Recovered::new_unchecked(signed_tx, self.merger_signer.address());
 
@@ -895,16 +893,16 @@ where
         let mut builder = self
             .evm_config
             .builder_for_next_block(&mut state_db, &parent_header, new_block_attrs)
-            .unwrap();
+            .or(Err(ValidationApiError::NextBuilderFail))?;
 
         // We re-execute all transactions due to limitations on the BlockBuilder API
         // TODO: check if we can avoid this
         for tx in all_transactions {
             // TODO: remove unwrap
-            builder.execute_transaction(tx).unwrap();
+            builder.execute_transaction(tx)?;
         }
 
-        let outcome = builder.finish(&state_provider).unwrap();
+        let outcome = builder.finish(&state_provider)?;
 
         let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
         let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
@@ -916,7 +914,11 @@ where
             blob_gas_used,
             excess_blob_gas,
         };
-        let execution_requests = outcome.execution_result.requests.try_into().unwrap();
+        let execution_requests = outcome
+            .execution_result
+            .requests
+            .try_into()
+            .or(Err(ValidationApiError::ExecutionRequests))?;
         // We assume that no new blobs were added to the block
         // TODO: support blob transactions?
         let blobs_bundle = request.blobs_bundle;
@@ -1126,6 +1128,12 @@ pub enum ValidationApiError {
     Payload(#[from] NewPayloadError),
     #[error("inclusion list not statisfied")]
     InclusionList,
+    #[error("failed to create EvmEnv for next block")]
+    NextEvmEnvFail,
+    #[error("failed to create builder for next block")]
+    NextBuilderFail,
+    #[error("failed to decode execution requests")]
+    ExecutionRequests,
 }
 
 impl From<ValidationApiError> for ErrorObject<'static> {
@@ -1139,11 +1147,14 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::ProposerPayment
             | ValidationApiError::InvalidBlobsBundle
             | ValidationApiError::InclusionList
+            | ValidationApiError::ExecutionRequests
             | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
             ValidationApiError::MissingLatestBlock
             | ValidationApiError::MissingParentBlock
             | ValidationApiError::BlockTooOld
+            | ValidationApiError::NextEvmEnvFail
+            | ValidationApiError::NextBuilderFail
             | ValidationApiError::Consensus(_)
             | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
