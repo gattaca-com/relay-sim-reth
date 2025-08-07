@@ -6,6 +6,9 @@ mod validation;
 
 use std::sync::Arc;
 
+use crate::{
+    state_recorder::run_block_state_recorder, validation::BlockSubmissionValidationApiServer,
+};
 use clap::Parser;
 use inclusion::inclusion_producer;
 use jsonrpsee::{
@@ -16,18 +19,16 @@ use jsonrpsee::{
 use reth_chain_state::CanonStateSubscriptions;
 use reth_ethereum::{
     cli::{chainspec::EthereumChainSpecParser, interface::Cli},
-    node::{node::EthereumAddOns, EthereumEngineValidator, EthereumNode},
-    rpc::{api::{eth::RpcNodeCore}, eth::error::RpcPoolError},
+    node::{EthereumEngineValidator, EthereumNode, node::EthereumAddOns},
+    rpc::{api::eth::RpcNodeCore, eth::error::RpcPoolError},
 };
 use reth_node_builder::FullNodeComponents;
 use revm_primitives::Bytes;
 use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
-use crate::{state_recorder::run_block_state_recorder, validation::BlockSubmissionValidationApiServer};
-
 
 fn main() {
-    Cli::<EthereumChainSpecParser, InclusionListsExt>::parse()
+    Cli::<EthereumChainSpecParser, CliExt>::parse()
         .run(|builder, args| async move {
             let handle = builder
                 .with_types::<EthereumNode>()
@@ -70,6 +71,7 @@ fn main() {
                         RpcNodeCore::evm_config(ctx.node()).clone(),
                         ValidationApiConfig::new(
                             args.blacklist_provider.clone().unwrap_or_default(),
+                            args.merger_private_key,
                         ),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
@@ -89,7 +91,7 @@ fn main() {
 
 /// Our custom cli args extension that adds one flag to reth default CLI.
 #[derive(Debug, Clone, Default, clap::Args)]
-struct InclusionListsExt {
+struct CliExt {
     /// CLI flag to enable the txpool extension namespace
     #[arg(long)]
     pub enable_ext: bool,
@@ -102,6 +104,9 @@ struct InclusionListsExt {
 
     #[arg(long, default_value = "/root/blocks")]
     pub record_blocks_dir: String,
+
+    #[arg(long)]
+    pub merger_private_key: String,
 }
 
 /// trait interface for a custom rpc namespace: `relay`

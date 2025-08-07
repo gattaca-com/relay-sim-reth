@@ -5,11 +5,13 @@ edition = "2024"
 rust-version = "1.86"
 
 [dependencies]
-alloy-consensus = { version = "1.0.7", default-features = false}
+alloy-consensus = { version = "1.0.7", default-features = false }
 alloy-eips = { version = "1.0.7", default-features = false }
 alloy-rlp = { version = "0.3.10", default-features = false, features = ["core-net"] }
 alloy-rpc-types-beacon = { version = "1.0.7", default-features = false }
 alloy-rpc-types-engine = { version = "1.0.7", default-features = false }
+alloy-signer  = { version = "1.0.7" }
+alloy-signer-local  = { version = "1.0.7" }
 async-trait = "0.1.68"
 bytes = "1.10.0"
 clap = { version = "4.5", features = ["derive"] }
