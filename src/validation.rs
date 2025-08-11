@@ -622,7 +622,7 @@ where
 
         let (header, body) = block.split();
 
-        let (withdrawals, transactions) = (body.withdrawals, body.transactions);
+        let (withdrawals, mut transactions) = (body.withdrawals, body.transactions);
 
         let block_base_fee_per_gas = header.base_fee_per_gas().unwrap_or_default();
 
@@ -668,6 +668,17 @@ where
         let mut all_transactions: Vec<
             Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
         > = Vec::with_capacity(transactions.len());
+
+        // Check that block has proposer payment, otherwise reject it
+        let Some(tx) = transactions.last() else {
+            return Err(ValidationApiError::ProposerPayment);
+        };
+        if tx.value() != request.value || tx.to() != Some(proposer_fee_recipient) {
+            // TODO: check what to do here
+            return Err(ValidationApiError::ProposerPayment);
+        }
+        // Remove proposer payment, we'll later add our own payment
+        transactions.pop();
 
         // Insert the transactions from the unmerged block
         for tx in transactions {
@@ -802,7 +813,6 @@ where
         let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
         let mut distributed_value = U256::ZERO;
-        let mut proposer_value = request.value;
 
         // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
         // We assume the relay controls the beneficiary address, and so it will receive any undistributed revenue.
@@ -827,11 +837,16 @@ where
                 .or_insert(builder_revenue);
 
             distributed_value += builder_revenue + winner_revenue + proposer_revenue;
-            proposer_value += proposer_revenue;
         }
 
         // Just in case, we remove the beneficiary address from the distribution
         updated_revenues.remove(&beneficiary);
+
+        // We also remove the proposer revenue, to pay it in a direct transaction
+        let proposer_added_value = updated_revenues
+            .remove(&proposer_fee_recipient)
+            .unwrap_or(U256::ZERO);
+        let proposer_value = request.value + proposer_added_value;
 
         let updated_revenues: Vec<_> = updated_revenues.into_iter().collect();
 
@@ -886,6 +901,39 @@ where
         all_transactions.push(recovered_signed_disperse_tx);
 
         drop(block_executor);
+
+        // Add proposer payment tx
+        let proposer_payment_tx = TxEip1559 {
+            chain_id,
+            nonce: nonce + 1,
+            // TODO: compute proper gas limit
+            gas_limit: 100_000,
+            max_fee_per_gas: block_base_fee_per_gas.into(),
+            max_priority_fee_per_gas: 0,
+            to: proposer_fee_recipient.into(),
+            value: proposer_value,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+
+        // Sign the transaction
+        let signature = self
+            .merger_signer
+            .sign_hash_sync(&proposer_payment_tx.signature_hash())
+            .expect("signer is local and private key is valid");
+        let signed_proposer_payment_tx = proposer_payment_tx.into_signed(signature);
+
+        // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
+        let mut buf = vec![];
+        signed_proposer_payment_tx.encode_2718(&mut buf);
+        let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
+            &mut buf.as_slice(),
+        )
+        .expect("we just encoded it with encode_2718");
+        let recovered_signed_proposer_payment_tx =
+            Recovered::new_unchecked(signed_tx, self.merger_signer.address());
+
+        all_transactions.push(recovered_signed_proposer_payment_tx);
 
         let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
 
