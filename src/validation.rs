@@ -116,6 +116,9 @@ where
             metrics: Default::default(),
             merger_signer,
             relay_fee_recipient,
+            // Address of `Disperse.app` contract
+            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
+            distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -599,8 +602,15 @@ where
             .try_into_block()
             .map_err(|e| NewPayloadError::Eth(e))?;
 
-        // TODO: leave some gas for the final revenue distribution call
-        let gas_limit = block.gas_limit() - 100000;
+        // Leave some gas for the final revenue distribution call
+        // and the proposer payment.
+        // The gas cost should be 10k per target, but could jump
+        // to 35k if the targets are new accounts.
+        // This number leaves us space for ~9 non-empty targets, or ~2 new accounts.
+        // TODO: compute dynamically by keeping track of gas cost
+        let max_distribution_gas = 100000;
+        // We also leave some gas for the final proposer payment
+        let gas_limit = block.gas_limit() - max_distribution_gas - 21000;
 
         let latest_header = self
             .provider
@@ -874,12 +884,10 @@ where
             chain_id,
             nonce,
             // TODO: compute proper gas limit
-            gas_limit: 100_000,
+            gas_limit: max_distribution_gas,
             max_fee_per_gas: block_base_fee_per_gas.into(),
             max_priority_fee_per_gas: 0,
-            // Address of `Disperse.app` contract
-            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
-            to: address!("0xD152f549545093347A162Dce210e7293f1452150").into(),
+            to: self.distribution_contract.into(),
             value: distributed_value,
             access_list: Default::default(),
             input: calldata.into(),
@@ -910,8 +918,8 @@ where
         let proposer_payment_tx = TxEip1559 {
             chain_id,
             nonce: nonce + 1,
-            // TODO: compute proper gas limit
-            gas_limit: 100_000,
+            // Note that this will revert on any smart contract target
+            gas_limit: 21000,
             max_fee_per_gas: block_base_fee_per_gas.into(),
             max_priority_fee_per_gas: 0,
             to: proposer_fee_recipient.into(),
@@ -1101,6 +1109,9 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     /// The signer to use for merging blocks. It will be used for signing the
     /// revenue distribution and proposer payment transactions.
     merger_signer: PrivateKeySigner,
+    /// The address of the contract used to distribute rewards.
+    /// It must have a `disperseEther(address[],uint256[])` function.
+    distribution_contract: Address,
 }
 
 impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
