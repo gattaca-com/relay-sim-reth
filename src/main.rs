@@ -72,6 +72,7 @@ fn main() {
                         ValidationApiConfig::new(
                             args.blacklist_provider.clone().unwrap_or_default(),
                             args.merger_private_key,
+                            args.relay_fee_recipient,
                         ),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
@@ -107,6 +108,9 @@ struct CliExt {
 
     #[arg(long)]
     pub merger_private_key: String,
+
+    #[arg(long)]
+    pub relay_fee_recipient: String,
 }
 
 /// trait interface for a custom rpc namespace: `relay`

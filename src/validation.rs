@@ -92,12 +92,17 @@ where
             blacklist_endpoint,
             validation_window,
             merger_private_key,
+            relay_fee_recipient,
         } = config;
         let disallow = Arc::new(DashSet::new());
 
         let merger_signer = merger_private_key
             .parse()
             .expect("Failed to parse merger private key");
+
+        let relay_fee_recipient = relay_fee_recipient
+            .parse()
+            .expect("Failed to parse relay fee recipient");
 
         let inner = Arc::new(ValidationApiInner {
             provider,
@@ -110,6 +115,7 @@ where
             task_spawner,
             metrics: Default::default(),
             merger_signer,
+            relay_fee_recipient,
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -627,10 +633,9 @@ where
         let block_base_fee_per_gas = header.base_fee_per_gas().unwrap_or_default();
 
         let proposer_fee_recipient = request.proposer_fee_recipient;
-        let winner_fee_recipient = header.beneficiary();
-        let beneficiary = self.merger_signer.address();
+        let relay_fee_recipient = self.relay_fee_recipient;
+        let beneficiary = header.beneficiary();
 
-        // We'll create a new block with ourselves as the beneficiary/coinbase
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp(),
             suggested_fee_recipient: beneficiary,
@@ -815,13 +820,13 @@ where
         let mut distributed_value = U256::ZERO;
 
         // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
-        // We assume the relay controls the beneficiary address, and so it will receive any undistributed revenue.
+        // We assume the winning builder controls the beneficiary address, and so it will receive any undistributed revenue.
         for (origin, revenue) in revenues {
-            let winner_revenue = revenue / U256::from(4);
+            let relay_revenue = revenue / U256::from(4);
             updated_revenues
-                .entry(winner_fee_recipient)
-                .and_modify(|v| *v += winner_revenue)
-                .or_insert(winner_revenue);
+                .entry(relay_fee_recipient)
+                .and_modify(|v| *v += relay_revenue)
+                .or_insert(relay_revenue);
 
             let proposer_revenue = revenue / U256::from(4);
             updated_revenues
@@ -830,13 +835,12 @@ where
                 .or_insert(proposer_revenue);
 
             let builder_revenue = revenue / U256::from(4);
-
             updated_revenues
                 .entry(origin)
                 .and_modify(|v| *v += builder_revenue)
                 .or_insert(builder_revenue);
 
-            distributed_value += builder_revenue + winner_revenue + proposer_revenue;
+            distributed_value += builder_revenue + relay_revenue + proposer_revenue;
         }
 
         // Just in case, we remove the beneficiary address from the distribution
@@ -1092,9 +1096,10 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     task_spawner: Box<dyn TaskSpawner>,
     /// Validation metrics
     metrics: ValidationMetrics,
-    /// The signer to use for merging blocks.
-    /// Its address will be used as the beneficiary for merged blocks,
-    /// and it will be used for signing the revenue distribution transaction.
+    /// The address to send relay revenue to.
+    relay_fee_recipient: Address,
+    /// The signer to use for merging blocks. It will be used for signing the
+    /// revenue distribution and proposer payment transactions.
     merger_signer: PrivateKeySigner,
 }
 
@@ -1115,17 +1120,24 @@ pub struct ValidationApiConfig {
     /// The address of this key will be used as the beneficiary for merged blocks,
     /// and it will be used for signing the revenue distribution transaction.
     pub merger_private_key: String,
+    /// The address to send relay revenue to.
+    pub relay_fee_recipient: String,
 }
 
 impl ValidationApiConfig {
     /// Default validation blocks window of 3 blocks
     pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
 
-    pub fn new(blacklist_endpoint: String, merger_private_key: String) -> Self {
+    pub fn new(
+        blacklist_endpoint: String,
+        merger_private_key: String,
+        relay_fee_recipient: String,
+    ) -> Self {
         Self {
             blacklist_endpoint,
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
             merger_private_key,
+            relay_fee_recipient,
         }
     }
 }
@@ -1136,6 +1148,7 @@ impl Default for ValidationApiConfig {
             blacklist_endpoint: Default::default(),
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
             merger_private_key: String::from("0x00"),
+            relay_fee_recipient: String::from("0x00"),
         }
     }
 }
