@@ -718,7 +718,7 @@ where
         for (origin, order) in request
             .merging_data
             .into_iter()
-            .flat_map(|mb| mb.orders.into_iter().map(move |b| (mb.origin, b)))
+            .map(|mb| (mb.origin, mb.order))
         {
             let bundle = match order {
                 MergeableOrder::Tx(tx) => {
@@ -1331,11 +1331,11 @@ pub struct MergeableBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct MergeableOrders {
-    /// Address of the builder that submitted these orders.
+pub struct MergeableOrderWithOrigin {
+    /// Address of the builder that submitted this order.
     pub origin: Address,
-    /// List of mergeable orders.
-    pub orders: Vec<MergeableOrder>,
+    /// Mergeable order.
+    pub order: MergeableOrder,
 }
 
 #[serde_as]
@@ -1348,7 +1348,7 @@ pub struct MergeBlockRequestV1 {
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     pub blobs_bundle: BlobsBundleV1,
-    pub merging_data: Vec<MergeableOrders>,
+    pub merging_data: Vec<MergeableOrderWithOrigin>,
 }
 
 #[serde_as]
