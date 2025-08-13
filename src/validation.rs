@@ -22,6 +22,7 @@ use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
+use reth_ethereum::chainspec::EthChainSpec;
 use reth_ethereum::evm::primitives::EvmError;
 use reth_ethereum::evm::primitives::block::BlockExecutor;
 use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
@@ -866,12 +867,8 @@ where
 
         let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
-        // Get the chain ID from any transaction in the block, defaulting to 1 (mainnet) if none was found
-        // TODO: check if this is OK
-        let chain_id = all_transactions
-            .iter()
-            .find_map(|tx| tx.chain_id())
-            .unwrap_or(1);
+        // Get the chain ID from the configured provider
+        let chain_id = self.provider.chain_spec().chain_id();
 
         let nonce = block_executor
             .evm_mut()
