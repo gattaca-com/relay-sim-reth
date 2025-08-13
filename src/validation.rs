@@ -715,11 +715,22 @@ where
         let mut current_balance = initial_balance;
 
         // Append transactions until we run out of space
-        for (origin, bundle) in request
+        for (origin, order) in request
             .merging_data
             .into_iter()
-            .flat_map(|mb| mb.bundles.into_iter().map(move |b| (mb.origin, b)))
+            .flat_map(|mb| mb.orders.into_iter().map(move |b| (mb.origin, b)))
         {
+            let bundle = match order {
+                MergeableOrder::Tx(tx) => {
+                    let reverting_txs = if tx.can_revert { vec![0] } else { vec![] };
+                    MergeableBundle {
+                        transactions: vec![tx.transaction],
+                        reverting_txs,
+                        dropping_txs: vec![],
+                    }
+                }
+                MergeableOrder::Bundle(bundle) => bundle,
+            };
             // Clone current state to avoid mutating it
             // TODO: there should be a way to remove this clone
             let mut db_clone = {
@@ -1282,6 +1293,34 @@ pub struct ExtendedValidationRequestV4 {
 
 /// Represents one or more transactions to be appended into a block atomically.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum MergeableOrder {
+    Tx(MergeableTransaction),
+    Bundle(MergeableBundle),
+}
+
+impl From<MergeableTransaction> for MergeableOrder {
+    fn from(tx: MergeableTransaction) -> Self {
+        MergeableOrder::Tx(tx)
+    }
+}
+
+impl From<MergeableBundle> for MergeableOrder {
+    fn from(bundle: MergeableBundle) -> Self {
+        MergeableOrder::Bundle(bundle)
+    }
+}
+
+/// Represents a single transaction to be appended into a block atomically.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MergeableTransaction {
+    /// Transaction that can be merged into the block.
+    pub transaction: Bytes,
+    /// Txs that may revert.
+    pub can_revert: bool,
+}
+
+/// Represents a bundle of transactions to be appended into a block atomically.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MergeableBundle {
     /// List of transactions that can be merged into the block.
     pub transactions: Vec<Bytes>,
@@ -1292,11 +1331,11 @@ pub struct MergeableBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct MergeableBundles {
-    /// Address of the builder that submitted these bundles.
+pub struct MergeableOrders {
+    /// Address of the builder that submitted these orders.
     pub origin: Address,
-    /// List of mergeable bundles.
-    pub bundles: Vec<MergeableBundle>,
+    /// List of mergeable orders.
+    pub orders: Vec<MergeableOrder>,
 }
 
 #[serde_as]
@@ -1309,7 +1348,7 @@ pub struct MergeBlockRequestV1 {
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     pub blobs_bundle: BlobsBundleV1,
-    pub merging_data: Vec<MergeableBundles>,
+    pub merging_data: Vec<MergeableOrders>,
 }
 
 #[serde_as]
