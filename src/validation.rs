@@ -678,18 +678,7 @@ where
             .into_iter()
             .map(|mb| (mb.origin, mb.order))
         {
-            let bundle = match order {
-                MergeableOrder::Tx(tx) => {
-                    let reverting_txs = if tx.can_revert { vec![0] } else { vec![] };
-                    MergeableBundle {
-                        transactions: vec![tx.transaction],
-                        reverting_txs,
-                        dropping_txs: vec![],
-                        blobs_bundle: tx.blobs_bundle,
-                    }
-                }
-                MergeableOrder::Bundle(bundle) => bundle,
-            };
+            let bundle = order.into_bundle();
             // Clone current state to avoid mutating it
             // TODO: there should be a way to remove this clone
             let mut db_clone = {
@@ -1286,6 +1275,23 @@ pub struct ExtendedValidationRequestV4 {
 pub enum MergeableOrder {
     Tx(MergeableTransaction),
     Bundle(MergeableBundle),
+}
+
+impl MergeableOrder {
+    fn into_bundle(self) -> MergeableBundle {
+        match self {
+            MergeableOrder::Tx(tx) => {
+                let reverting_txs = if tx.can_revert { vec![0] } else { vec![] };
+                MergeableBundle {
+                    transactions: vec![tx.transaction],
+                    reverting_txs,
+                    dropping_txs: vec![],
+                    blobs_bundle: tx.blobs_bundle,
+                }
+            }
+            MergeableOrder::Bundle(bundle) => bundle,
+        }
+    }
 }
 
 impl From<MergeableTransaction> for MergeableOrder {
