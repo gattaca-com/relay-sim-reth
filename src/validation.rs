@@ -685,12 +685,13 @@ where
             Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
         > = Vec::with_capacity(transactions.len());
 
+        let mut blobs_bundle = request.blobs_bundle;
+
         // Check that block has proposer payment, otherwise reject it
         let Some(tx) = transactions.last() else {
             return Err(ValidationApiError::ProposerPayment);
         };
         if tx.value() != request.value || tx.to() != Some(proposer_fee_recipient) {
-            // TODO: check what to do here
             return Err(ValidationApiError::ProposerPayment);
         }
         // Remove proposer payment, we'll later add our own payment
@@ -727,6 +728,7 @@ where
                         transactions: vec![tx.transaction],
                         reverting_txs,
                         dropping_txs: vec![],
+                        blobs_bundle: tx.blobs_bundle,
                     }
                 }
                 MergeableOrder::Bundle(bundle) => bundle,
@@ -767,11 +769,6 @@ where
 
             // Check the bundle can be included in the block
             for (i, tx) in txs.iter().enumerate() {
-                // TODO: handle blob transactions
-                if tx.blob_count().unwrap_or(0) != 0 {
-                    bundle_is_valid = false;
-                    break;
-                }
                 match evm_clone.transact(tx) {
                     Ok(result) => {
                         // If tx reverted and is not allowed to
@@ -817,6 +814,12 @@ where
                 gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
                 all_transactions.push(tx.clone());
+            }
+            // Add the bundle blobs to the block
+            if let Some(bundle) = bundle.blobs_bundle {
+                blobs_bundle.commitments.extend(bundle.commitments);
+                blobs_bundle.proofs.extend(bundle.proofs);
+                blobs_bundle.blobs.extend(bundle.blobs);
             }
             // Consider any balance changes on the beneficiary as tx value
             let new_balance = block_executor
@@ -986,9 +989,6 @@ where
             .requests
             .try_into()
             .or(Err(ValidationApiError::ExecutionRequests))?;
-        // We assume that no new blobs were added to the block
-        // TODO: support blob transactions?
-        let blobs_bundle = request.blobs_bundle;
 
         let response = MergeBlockResponseV1 {
             execution_payload,
@@ -1311,16 +1311,18 @@ impl From<MergeableBundle> for MergeableOrder {
 }
 
 /// Represents a single transaction to be appended into a block atomically.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MergeableTransaction {
     /// Transaction that can be merged into the block.
     pub transaction: Bytes,
     /// Txs that may revert.
     pub can_revert: bool,
+    /// Blobs used by the transaction
+    pub blobs_bundle: Option<BlobsBundleV1>,
 }
 
 /// Represents a bundle of transactions to be appended into a block atomically.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MergeableBundle {
     /// List of transactions that can be merged into the block.
     pub transactions: Vec<Bytes>,
@@ -1328,6 +1330,8 @@ pub struct MergeableBundle {
     pub reverting_txs: Vec<usize>,
     /// Txs that are allowed to be omitted, but not revert.
     pub dropping_txs: Vec<usize>,
+    /// Blobs used by the bundle
+    pub blobs_bundle: Option<BlobsBundleV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
