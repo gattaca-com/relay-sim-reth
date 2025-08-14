@@ -744,33 +744,8 @@ where
             }
         }
 
-        let mut updated_revenues = HashMap::with_capacity(revenues.len());
-
-        let mut distributed_value = U256::ZERO;
-
-        // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
-        // We assume the winning builder controls the beneficiary address, and so it will receive any undistributed revenue.
-        for (origin, revenue) in revenues {
-            let relay_revenue = revenue / U256::from(4);
-            updated_revenues
-                .entry(relay_fee_recipient)
-                .and_modify(|v| *v += relay_revenue)
-                .or_insert(relay_revenue);
-
-            let proposer_revenue = revenue / U256::from(4);
-            updated_revenues
-                .entry(proposer_fee_recipient)
-                .and_modify(|v| *v += proposer_revenue)
-                .or_insert(proposer_revenue);
-
-            let builder_revenue = revenue / U256::from(4);
-            updated_revenues
-                .entry(origin)
-                .and_modify(|v| *v += builder_revenue)
-                .or_insert(builder_revenue);
-
-            distributed_value += builder_revenue + relay_revenue + proposer_revenue;
-        }
+        let (distributed_value, mut updated_revenues) =
+            split_revenue(revenues, relay_fee_recipient, proposer_fee_recipient);
 
         // Just in case, we remove the beneficiary address from the distribution
         updated_revenues.remove(&beneficiary);
@@ -1454,6 +1429,42 @@ fn encode_disperse_eth_calldata(input: &[(Address, U256)]) -> Vec<u8> {
             .flat_map(|(_, value)| value.to_be_bytes::<32>()),
     );
     calldata
+}
+
+fn split_revenue(
+    revenues: HashMap<Address, U256>,
+    relay_fee_recipient: Address,
+    proposer_fee_recipient: Address,
+) -> (U256, HashMap<Address, U256>) {
+    let mut updated_revenues = HashMap::with_capacity(revenues.len());
+
+    let mut distributed_value = U256::ZERO;
+
+    // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
+    // We assume the winning builder controls the beneficiary address, and so it will receive any undistributed revenue.
+    for (origin, revenue) in revenues {
+        let relay_revenue = revenue / U256::from(4);
+        updated_revenues
+            .entry(relay_fee_recipient)
+            .and_modify(|v| *v += relay_revenue)
+            .or_insert(relay_revenue);
+
+        let proposer_revenue = revenue / U256::from(4);
+        updated_revenues
+            .entry(proposer_fee_recipient)
+            .and_modify(|v| *v += proposer_revenue)
+            .or_insert(proposer_revenue);
+
+        let builder_revenue = revenue / U256::from(4);
+        updated_revenues
+            .entry(origin)
+            .and_modify(|v| *v += builder_revenue)
+            .or_insert(builder_revenue);
+
+        distributed_value += builder_revenue + relay_revenue + proposer_revenue;
+    }
+
+    (distributed_value, updated_revenues)
 }
 
 #[cfg(test)]
