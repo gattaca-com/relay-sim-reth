@@ -47,7 +47,7 @@ use reth_node_builder::{
     Block, BlockBody, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, NodePrimitives,
     PayloadValidator,
 };
-use reth_primitives::Recovered;
+use reth_primitives::{Recovered, SealedHeader};
 use reth_tasks::TaskSpawner;
 use revm::DatabaseCommit;
 use revm::database::states::bundle_state::BundleRetention;
@@ -222,29 +222,7 @@ where
             }
         }
 
-        let latest_header = self
-            .provider
-            .latest_header()?
-            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
-
-        let parent_header = if block.parent_hash() == latest_header.hash() {
-            latest_header
-        } else {
-            // parent is not the latest header so we need to fetch it and ensure it's not too old
-            let parent_header = self
-                .provider
-                .sealed_header_by_hash(block.parent_hash())?
-                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
-
-            if latest_header
-                .number()
-                .saturating_sub(parent_header.number())
-                > self.validation_window
-            {
-                return Err(ValidationApiError::BlockTooOld);
-            }
-            parent_header
-        };
+        let parent_header = self.get_parent_header(block.parent_hash())?;
 
         self.consensus
             .validate_header_against_parent(block.sealed_header(), &parent_header)?;
@@ -613,29 +591,7 @@ where
         // We also leave some gas for the final proposer payment
         let gas_limit = block.gas_limit() - max_distribution_gas - 21000;
 
-        let latest_header = self
-            .provider
-            .latest_header()?
-            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
-
-        let parent_header = if block.parent_hash() == latest_header.hash() {
-            latest_header
-        } else {
-            // parent is not the latest header so we need to fetch it and ensure it's not too old
-            let parent_header = self
-                .provider
-                .sealed_header_by_hash(block.parent_hash())?
-                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
-
-            if latest_header
-                .number()
-                .saturating_sub(parent_header.number())
-                > self.validation_window
-            {
-                return Err(ValidationApiError::BlockTooOld);
-            }
-            parent_header
-        };
+        let parent_header = self.get_parent_header(block.parent_hash())?;
 
         let (header, body) = block.split();
 
@@ -999,6 +955,39 @@ where
         };
 
         Ok(response)
+    }
+
+    fn get_parent_header(
+        &self,
+        parent_hash: B256,
+    ) -> Result<
+        SealedHeader<<<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader>,
+        ValidationApiError,
+    > {
+        let latest_header = self
+            .provider
+            .latest_header()?
+            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
+
+        let parent_header = if parent_hash == latest_header.hash() {
+            latest_header
+        } else {
+            // parent is not the latest header so we need to fetch it and ensure it's not too old
+            let parent_header = self
+                .provider
+                .sealed_header_by_hash(parent_hash)?
+                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
+
+            if latest_header
+                .number()
+                .saturating_sub(parent_header.number())
+                > self.validation_window
+            {
+                return Err(ValidationApiError::BlockTooOld);
+            }
+            parent_header
+        };
+        Ok(parent_header)
     }
 }
 
