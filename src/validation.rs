@@ -25,9 +25,7 @@ use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use reth_ethereum::chainspec::EthChainSpec;
 use reth_ethereum::evm::primitives::block::{BlockExecutor, BlockExecutorFor};
 use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
-use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError, EvmFor};
-use reth_ethereum::evm::revm::cached::CachedReadsDBRef;
-use reth_ethereum::storage::StateProvider;
+use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
@@ -97,6 +95,7 @@ where
             merger_private_key,
             relay_fee_recipient,
             distribution_config,
+            distribution_contract,
         } = config;
         let disallow = Arc::new(DashSet::new());
 
@@ -121,10 +120,7 @@ where
             merger_signer,
             relay_fee_recipient,
             distribution_config,
-            // TODO: fetch this from config
-            // Address of `Disperse.app` contract
-            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
-            distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
+            distribution_contract,
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -1126,6 +1122,9 @@ pub struct ValidationApiConfig {
     pub relay_fee_recipient: String,
     /// Configuration for revenue distribution.
     pub distribution_config: DistributionConfig,
+    /// The address of the contract used to distribute rewards.
+    /// It must have a `disperseEther(address[],uint256[])` function.
+    pub distribution_contract: Address,
 }
 
 impl ValidationApiConfig {
@@ -1139,10 +1138,9 @@ impl ValidationApiConfig {
     ) -> Self {
         Self {
             blacklist_endpoint,
-            validation_window: Self::DEFAULT_VALIDATION_WINDOW,
             merger_private_key,
             relay_fee_recipient,
-            distribution_config: DistributionConfig::default(),
+            ..Default::default()
         }
     }
 }
@@ -1155,6 +1153,9 @@ impl Default for ValidationApiConfig {
             merger_private_key: String::from("0x00"),
             relay_fee_recipient: String::from("0x00"),
             distribution_config: DistributionConfig::default(),
+            // Address of `Disperse.app` contract
+            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
+            distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
         }
     }
 }
