@@ -51,7 +51,6 @@ use reth_node_builder::{
 };
 use reth_primitives::{Recovered, SealedHeader};
 use reth_tasks::TaskSpawner;
-use revm::database::WrapDatabaseRef;
 use revm::database::states::bundle_state::BundleRetention;
 use revm::{Database, database::State};
 use revm::{DatabaseCommit, DatabaseRef};
@@ -97,6 +96,7 @@ where
             validation_window,
             merger_private_key,
             relay_fee_recipient,
+            distribution_config,
         } = config;
         let disallow = Arc::new(DashSet::new());
 
@@ -120,6 +120,8 @@ where
             metrics: Default::default(),
             merger_signer,
             relay_fee_recipient,
+            distribution_config,
+            // TODO: fetch this from config
             // Address of `Disperse.app` contract
             // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
             distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
@@ -744,8 +746,12 @@ where
             }
         }
 
-        let (distributed_value, mut updated_revenues) =
-            split_revenue(revenues, relay_fee_recipient, proposer_fee_recipient);
+        let (distributed_value, mut updated_revenues) = split_revenue(
+            &self.distribution_config,
+            revenues,
+            relay_fee_recipient,
+            proposer_fee_recipient,
+        );
 
         // Just in case, we remove the beneficiary address from the distribution
         updated_revenues.remove(&beneficiary);
@@ -1095,6 +1101,8 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     /// The address of the contract used to distribute rewards.
     /// It must have a `disperseEther(address[],uint256[])` function.
     distribution_contract: Address,
+    /// Configuration for revenue distribution.
+    distribution_config: DistributionConfig,
 }
 
 impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
@@ -1116,6 +1124,8 @@ pub struct ValidationApiConfig {
     pub merger_private_key: String,
     /// The address to send relay revenue to.
     pub relay_fee_recipient: String,
+    /// Configuration for revenue distribution.
+    pub distribution_config: DistributionConfig,
 }
 
 impl ValidationApiConfig {
@@ -1132,6 +1142,7 @@ impl ValidationApiConfig {
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
             merger_private_key,
             relay_fee_recipient,
+            distribution_config: DistributionConfig::default(),
         }
     }
 }
@@ -1143,6 +1154,7 @@ impl Default for ValidationApiConfig {
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
             merger_private_key: String::from("0x00"),
             relay_fee_recipient: String::from("0x00"),
+            distribution_config: DistributionConfig::default(),
         }
     }
 }
@@ -1431,7 +1443,60 @@ fn encode_disperse_eth_calldata(input: &[(Address, U256)]) -> Vec<u8> {
     calldata
 }
 
+/// Configuration for revenue distribution among different parties.
+#[derive(Debug, Serialize, Eq, PartialEq, Deserialize, Clone)]
+pub struct DistributionConfig {
+    /// Total number of base points to distribute.
+    /// Each participant will be paid `revenue * x / total_bips`.
+    total_bips: u64,
+    /// Base points allocated to the relay.
+    relay_bips: u64,
+    /// Base points allocated to the proposer.
+    proposer_bips: u64,
+    /// Base points allocated to the builder.
+    builder_bips: u64,
+    /// Base points allocated to the winning builder.
+    winning_builder_bips: u64,
+}
+
+impl Default for DistributionConfig {
+    fn default() -> Self {
+        let total_bips = 10000;
+        let relay_bips = total_bips / 4;
+        let proposer_bips = total_bips / 4;
+        let builder_bips = total_bips / 4;
+        let winning_builder_bips = total_bips / 4;
+
+        Self {
+            total_bips,
+            relay_bips,
+            proposer_bips,
+            builder_bips,
+            winning_builder_bips,
+        }
+    }
+}
+
+impl DistributionConfig {
+    fn split(&self, bips: u64, revenue: U256) -> U256 {
+        (U256::from(bips) * revenue) / U256::from(self.total_bips)
+    }
+
+    fn relay_split(&self, revenue: U256) -> U256 {
+        self.split(self.relay_bips, revenue)
+    }
+
+    fn proposer_split(&self, revenue: U256) -> U256 {
+        self.split(self.proposer_bips, revenue)
+    }
+
+    fn builder_split(&self, revenue: U256) -> U256 {
+        self.split(self.builder_bips, revenue)
+    }
+}
+
 fn split_revenue(
+    distribution_config: &DistributionConfig,
     revenues: HashMap<Address, U256>,
     relay_fee_recipient: Address,
     proposer_fee_recipient: Address,
@@ -1443,19 +1508,19 @@ fn split_revenue(
     // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
     // We assume the winning builder controls the beneficiary address, and so it will receive any undistributed revenue.
     for (origin, revenue) in revenues {
-        let relay_revenue = revenue / U256::from(4);
+        let relay_revenue = distribution_config.relay_split(revenue);
         updated_revenues
             .entry(relay_fee_recipient)
             .and_modify(|v| *v += relay_revenue)
             .or_insert(relay_revenue);
 
-        let proposer_revenue = revenue / U256::from(4);
+        let proposer_revenue = distribution_config.proposer_split(revenue);
         updated_revenues
             .entry(proposer_fee_recipient)
             .and_modify(|v| *v += proposer_revenue)
             .or_insert(proposer_revenue);
 
-        let builder_revenue = revenue / U256::from(4);
+        let builder_revenue = distribution_config.builder_split(revenue);
         updated_revenues
             .entry(origin)
             .and_modify(|v| *v += builder_revenue)
