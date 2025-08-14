@@ -25,7 +25,7 @@ use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use reth_ethereum::chainspec::EthChainSpec;
 use reth_ethereum::evm::primitives::block::{BlockExecutor, BlockExecutorFor};
 use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
-use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
+use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError, EvmFor};
 use reth_ethereum::evm::revm::cached::CachedReadsDBRef;
 use reth_ethereum::storage::StateProvider;
 use reth_ethereum::{
@@ -808,24 +808,9 @@ where
             input: calldata.into(),
         };
 
-        // Sign the transaction
-        let signature = self
-            .merger_signer
-            .sign_hash_sync(&disperse_tx.signature_hash())
-            .expect("signer is local and private key is valid");
-        let signed_disperse_tx = disperse_tx.into_signed(signature);
+        let signed_disperse_tx = self.sign_transaction(disperse_tx)?;
 
-        // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
-        let mut buf = vec![];
-        signed_disperse_tx.encode_2718(&mut buf);
-        let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
-            &mut buf.as_slice(),
-        )
-        .expect("we just encoded it with encode_2718");
-        let recovered_signed_disperse_tx =
-            Recovered::new_unchecked(signed_tx, self.merger_signer.address());
-
-        all_transactions.push(recovered_signed_disperse_tx);
+        all_transactions.push(signed_disperse_tx);
 
         drop(block_executor);
 
@@ -843,24 +828,9 @@ where
             input: Default::default(),
         };
 
-        // Sign the transaction
-        let signature = self
-            .merger_signer
-            .sign_hash_sync(&proposer_payment_tx.signature_hash())
-            .expect("signer is local and private key is valid");
-        let signed_proposer_payment_tx = proposer_payment_tx.into_signed(signature);
+        let signed_proposer_payment_tx = self.sign_transaction(proposer_payment_tx)?;
 
-        // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
-        let mut buf = vec![];
-        signed_proposer_payment_tx.encode_2718(&mut buf);
-        let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
-            &mut buf.as_slice(),
-        )
-        .expect("we just encoded it with encode_2718");
-        let recovered_signed_proposer_payment_tx =
-            Recovered::new_unchecked(signed_tx, self.merger_signer.address());
-
-        all_transactions.push(recovered_signed_proposer_payment_tx);
+        all_transactions.push(signed_proposer_payment_tx);
 
         let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
 
@@ -971,6 +941,30 @@ where
             };
         }
         (bundle_is_valid, gas_used_in_bundle, included_txs)
+    }
+
+    fn sign_transaction(
+        &self,
+        tx: TxEip1559,
+    ) -> Result<
+        Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
+        ValidationApiError,
+    > {
+        let signature = self
+            .merger_signer
+            .sign_hash_sync(&tx.signature_hash())
+            .expect("signer is local and private key is valid");
+        let signed_tx = tx.into_signed(signature);
+
+        // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
+        let mut buf = vec![];
+        signed_tx.encode_2718(&mut buf);
+        let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
+            &mut buf.as_slice(),
+        )
+        .expect("we just encoded it with encode_2718");
+        let recovered_signed_tx = Recovered::new_unchecked(signed_tx, self.merger_signer.address());
+        Ok(recovered_signed_tx)
     }
 
     fn get_parent_header(
