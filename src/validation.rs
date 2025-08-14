@@ -23,9 +23,11 @@ use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use reth_ethereum::chainspec::EthChainSpec;
-use reth_ethereum::evm::primitives::EvmError;
-use reth_ethereum::evm::primitives::block::BlockExecutor;
+use reth_ethereum::evm::primitives::block::{BlockExecutor, BlockExecutorFor};
 use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
+use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
+use reth_ethereum::evm::revm::cached::CachedReadsDBRef;
+use reth_ethereum::storage::StateProvider;
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
@@ -49,9 +51,10 @@ use reth_node_builder::{
 };
 use reth_primitives::{Recovered, SealedHeader};
 use reth_tasks::TaskSpawner;
-use revm::DatabaseCommit;
+use revm::database::WrapDatabaseRef;
 use revm::database::states::bundle_state::BundleRetention;
 use revm::{Database, database::State};
+use revm::{DatabaseCommit, DatabaseRef};
 use revm_primitives::{Address, B256, U256, address};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -679,23 +682,7 @@ where
             .map(|mb| (mb.origin, mb.order))
         {
             let bundle = order.into_bundle();
-            // Clone current state to avoid mutating it
-            // TODO: there should be a way to remove this clone
-            let mut db_clone = {
-                let db = block_executor.evm_mut().db_mut();
-                db.merge_transitions(BundleRetention::Reverts);
-
-                let pre_state = db.bundle_state.clone();
-
-                State::builder()
-                    .with_database_ref(&cached_db)
-                    .with_bundle_prestate(pre_state)
-                    .build()
-            };
-            // Create a new EVM with the cloned pre-state
-            let mut evm_clone = self.evm_config.evm_with_env(&mut db_clone, evm_env.clone());
-
-            let Ok(txs): Result<Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>, _> = bundle.transactions.into_iter().map(|b|{
+            let Ok(txs): Result<Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>, _> = bundle.transactions.iter().map(|b|{
                 let mut buf = b.as_ref();
                 let tx = <<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx as Decodable2718>::decode_2718(&mut buf)?;
                 if !buf.is_empty() {
@@ -708,43 +695,14 @@ where
                 // But in case decoding fails, we just skip the bundle
                 continue;
             };
+            let (bundle_is_valid, gas_used_in_bundle, should_be_included) = self.simulate_bundle(
+                &mut block_executor,
+                evm_env.clone(),
+                &cached_db,
+                &bundle,
+                &txs,
+            );
 
-            let mut gas_used_in_bundle = 0;
-            let mut bundle_is_valid = true;
-            let mut should_be_included = vec![true; txs.len()];
-
-            // Check the bundle can be included in the block
-            for (i, tx) in txs.iter().enumerate() {
-                match evm_clone.transact(tx) {
-                    Ok(result) => {
-                        // If tx reverted and is not allowed to
-                        if !result.result.is_success() && !bundle.reverting_txs.contains(&i) {
-                            // We check if we can drop it instead, else we discard this bundle
-                            if bundle.dropping_txs.contains(&i) {
-                                // Tx should be dropped
-                                should_be_included[i] = false;
-                            } else {
-                                bundle_is_valid = false;
-                                break;
-                            }
-                        }
-                        gas_used_in_bundle += result.result.gas_used();
-                        // Apply the state changes to the cloned state
-                        // Note that this only commits to the State object, not the database
-                        evm_clone.db_mut().commit(result.state);
-                    }
-                    Err(e) => {
-                        if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
-                            // The transaction might have been invalidated by another one, so we drop it
-                            should_be_included[i] = false;
-                        } else {
-                            // The error isn't transaction-related, so we just try to skip this bundle
-                            bundle_is_valid = false;
-                            break;
-                        }
-                    }
-                };
-            }
             if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
                 continue;
             }
@@ -944,6 +902,75 @@ where
         };
 
         Ok(response)
+    }
+
+    fn simulate_bundle<'a, 'b, DBRef, DB>(
+        &self,
+        block_executor: &mut impl BlockExecutorFor<'a, <E as ConfigureEvm>::BlockExecutorFactory, DB>,
+        evm_env: EvmEnvFor<E>,
+        cached_db: DBRef,
+        bundle: &MergeableBundle,
+        txs: &[Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>],
+    ) -> (bool, u64, Vec<bool>)
+    where
+        DB: Database + 'a,
+        DB::Error: Send + Sync + 'static,
+        DBRef: DatabaseRef,
+        DBRef::Error: Send + Sync + 'static,
+    {
+        // Clone current state to avoid mutating it
+        // TODO: there should be a way to remove this clone
+        let mut db_clone = {
+            let db = block_executor.evm_mut().db_mut();
+            db.merge_transitions(BundleRetention::Reverts);
+
+            let pre_state = db.bundle_state.clone();
+
+            State::builder()
+                .with_database_ref(cached_db)
+                .with_bundle_prestate(pre_state)
+                .build()
+        };
+        // Create a new EVM with the cloned pre-state
+        let mut evm_clone = self.evm_config.evm_with_env(&mut db_clone, evm_env.clone());
+
+        let mut gas_used_in_bundle = 0;
+        let mut bundle_is_valid = true;
+        let mut included_txs = vec![true; txs.len()];
+
+        // Check the bundle can be included in the block
+        for (i, tx) in txs.iter().enumerate() {
+            match evm_clone.transact(tx) {
+                Ok(result) => {
+                    // If tx reverted and is not allowed to
+                    if !result.result.is_success() && !bundle.reverting_txs.contains(&i) {
+                        // We check if we can drop it instead, else we discard this bundle
+                        if bundle.dropping_txs.contains(&i) {
+                            // Tx should be dropped
+                            included_txs[i] = false;
+                        } else {
+                            bundle_is_valid = false;
+                            break;
+                        }
+                    }
+                    gas_used_in_bundle += result.result.gas_used();
+                    // Apply the state changes to the cloned state
+                    // Note that this only commits to the State object, not the database
+                    evm_clone.db_mut().commit(result.state);
+                }
+                Err(e) => {
+                    if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
+                        // The transaction might have been invalidated by another one, so we drop it
+                        included_txs[i] = false;
+                    } else {
+                        // The error isn't transaction-related, so we just try to skip this bundle
+                        bundle_is_valid = false;
+                        break;
+                    }
+                }
+            };
+        }
+        (bundle_is_valid, gas_used_in_bundle, included_txs)
     }
 
     fn get_parent_header(
