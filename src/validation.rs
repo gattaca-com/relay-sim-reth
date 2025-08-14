@@ -1293,7 +1293,7 @@ pub struct ExtendedValidationRequestV4 {
 }
 
 /// Represents one or more transactions to be appended into a block atomically.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum MergeableOrder {
     Tx(MergeableTransaction),
     Bundle(MergeableBundle),
@@ -1335,7 +1335,7 @@ pub struct MergeableBundle {
     pub blobs_bundle: Option<BlobsBundleV1>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MergeableOrderWithOrigin {
     /// Address of the builder that submitted this order.
     pub origin: Address,
@@ -1344,7 +1344,7 @@ pub struct MergeableOrderWithOrigin {
 }
 
 #[serde_as]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeBlockRequestV1 {
     /// The original payload value
     pub value: U256,
