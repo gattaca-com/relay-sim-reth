@@ -692,6 +692,7 @@ where
             return Err(ValidationApiError::ProposerPayment);
         };
         if tx.value() != request.value || tx.to() != Some(proposer_fee_recipient) {
+            // TODO: support payments through beneficiary?
             return Err(ValidationApiError::ProposerPayment);
         }
         // Remove proposer payment, we'll later add our own payment
