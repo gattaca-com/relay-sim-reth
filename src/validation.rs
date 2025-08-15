@@ -375,10 +375,10 @@ where
                 expected: header.gas_limit(),
             }))
         } else if header.gas_used() != message.gas_used {
-            return Err(ValidationApiError::GasUsedMismatch(GotExpected {
+            Err(ValidationApiError::GasUsedMismatch(GotExpected {
                 got: message.gas_used,
                 expected: header.gas_used(),
-            }));
+            }))
         } else {
             Ok(())
         }
@@ -578,7 +578,7 @@ where
         > = request
             .execution_payload
             .try_into_block()
-            .map_err(|e| NewPayloadError::Eth(e))?;
+            .map_err(NewPayloadError::Eth)?;
 
         // Leave some gas for the final revenue distribution call
         // and the proposer payment.
@@ -1011,9 +1011,7 @@ where
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v3(&this, request)
-                .await
-                .map_err(ErrorObject::from);
+            let result = Self::validate_builder_submission_v3(&this, request).await;
             let _ = tx.send(result);
         }));
 
@@ -1030,9 +1028,7 @@ where
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v4(&this, request)
-                .await
-                .map_err(ErrorObject::from);
+            let result = Self::validate_builder_submission_v4(&this, request).await;
             let _ = tx.send(result);
         }));
 
@@ -1049,9 +1045,7 @@ where
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::merge_block_v1(&this, request)
-                .await
-                .map_err(ErrorObject::from);
+            let result = Self::merge_block_v1(&this, request).await;
             let _ = tx.send(result);
         }));
 
