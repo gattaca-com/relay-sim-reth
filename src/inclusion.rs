@@ -5,9 +5,10 @@ use std::{
 
 use futures::StreamExt;
 use reth_chain_state::{CanonStateNotification, CanonStateNotificationStream};
-use reth_ethereum::{pool::{
-    FullTransactionEvent, PoolTransaction, TransactionPool, ValidPoolTransaction,
-}, rpc::eth::primitives::TransactionTrait};
+use reth_ethereum::{
+    pool::{FullTransactionEvent, PoolTransaction, TransactionPool, ValidPoolTransaction},
+    rpc::eth::primitives::TransactionTrait,
+};
 use revm_primitives::{Bytes, alloy_primitives::TxHash};
 use tokio::sync::watch::Sender;
 
@@ -64,7 +65,7 @@ fn handle_tx_event<P: TransactionPool>(
         FullTransactionEvent::Pending(tx_hash) => {
             // Add to valid set
             if let Some(pending_tx) = pool.get(&tx_hash) {
-                if matches!(pending_tx.transaction.blob_count(), Some(0) | None)  {
+                if matches!(pending_tx.transaction.blob_count(), Some(0) | None) {
                     let tx_hash = *pending_tx.hash();
                     let score = score_tx(&pending_tx);
                     ordered_tx.insert(OrderedTx { score, tx_hash });
@@ -133,7 +134,7 @@ impl Eq for OrderedTx {}
 
 impl PartialOrd for OrderedTx {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 

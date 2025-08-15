@@ -1,5 +1,5 @@
 use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxEnvelope, TxReceipt
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
 };
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
@@ -12,23 +12,42 @@ use alloy_rpc_types_engine::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use dashmap::DashSet;
-use reth_ethereum::{chainspec::EthereumHardforks, consensus::{ConsensusError, FullConsensus}, evm::{primitives::{block::BlockExecutionError, execute::Executor, Evm, RecoveredTx}, revm::{cached::CachedReads, database::StateProviderDatabase}}, node::core::rpc::result::{internal_rpc_err, invalid_params_rpc_err}, pool::PoolPooledTx, primitives::{constants::GAS_LIMIT_BOUND_DIVISOR, GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor, SignedTransaction}, provider::{BlockExecutionOutput, ChainSpecProvider, ProviderError}, rpc::eth::utils::recover_raw_transaction, storage::{BlockReaderIdExt, StateProviderFactory}};
-use reth_metrics::{metrics::Gauge, Metrics};
-use reth_node_builder::{BlockBody, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator};
-use reth_primitives::Recovered;
-use reth_tasks::TaskSpawner;
-use revm::{database::{CacheDB, State}, Database, DatabaseRef};
-use serde_with::serde_as;
 use core::fmt;
-use jsonrpsee::{core:: RpcResult, types::ErrorObject};
+use dashmap::DashSet;
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{core::RpcResult, types::ErrorObject};
+use reth_ethereum::{
+    chainspec::EthereumHardforks,
+    consensus::{ConsensusError, FullConsensus},
+    evm::{
+        primitives::{Evm, block::BlockExecutionError, execute::Executor},
+        revm::{cached::CachedReads, database::StateProviderDatabase},
+    },
+    node::core::rpc::result::{internal_rpc_err, invalid_params_rpc_err},
+    primitives::{
+        GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor, SignedTransaction,
+        constants::GAS_LIMIT_BOUND_DIVISOR,
+    },
+    provider::{BlockExecutionOutput, ChainSpecProvider, ProviderError},
+    rpc::eth::utils::recover_raw_transaction,
+    storage::{BlockReaderIdExt, StateProviderFactory},
+};
+use reth_metrics::{Metrics, metrics::Gauge};
+use reth_node_builder::{
+    BlockBody, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator,
+};
+use reth_tasks::TaskSpawner;
+use revm::{Database, database::State};
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use std::{collections::HashSet, sync::Arc, time::Duration};
-use tokio::{spawn, sync::{oneshot, RwLock}, time};
+use tokio::{
+    spawn,
+    sync::{RwLock, oneshot},
+    time,
+};
 use tracing::{info, warn};
-use jsonrpsee::proc_macros::rpc;
-use alloy_rlp::Decodable;
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -50,12 +69,15 @@ where
         task_spawner: Box<dyn TaskSpawner>,
         payload_validator: Arc<
             dyn PayloadValidator<
-                Block = <E::Primitives as NodePrimitives>::Block,
-                ExecutionData = ExecutionData,
-            >,
+                    Block = <E::Primitives as NodePrimitives>::Block,
+                    ExecutionData = ExecutionData,
+                >,
         >,
     ) -> Self {
-        let ValidationApiConfig { blacklist_endpoint, validation_window } = config;
+        let ValidationApiConfig {
+            blacklist_endpoint,
+            validation_window,
+        } = config;
         let disallow = Arc::new(DashSet::new());
 
         let inner = Arc::new(ValidationApiInner {
@@ -87,10 +109,8 @@ where
                             // build new set then swap
                             dash.clear();
                             for hex in list {
-                                if let Ok(b) = hex
-                                    .strip_prefix("0x")
-                                    .unwrap_or(&hex)
-                                    .parse::<B256>()
+                                if let Ok(b) =
+                                    hex.strip_prefix("0x").unwrap_or(&hex).parse::<B256>()
                                 {
                                     dash.insert(Address::from_slice(b.as_slice()));
                                 }
@@ -103,7 +123,6 @@ where
                 }
             }
         });
-
 
         Self { inner }
     }
@@ -142,36 +161,41 @@ where
         &self,
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
-        registered_gas_limit: u64,
+        _registered_gas_limit: u64,
         apply_blacklist: bool,
         inclusion_list: Option<InclusionList>,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
         self.consensus.validate_header(block.sealed_header())?;
-        self.consensus.validate_block_pre_execution(block.sealed_block())?;
+        self.consensus
+            .validate_block_pre_execution(block.sealed_block())?;
 
         if !self.disallow.is_empty() && apply_blacklist {
             if self.disallow.contains(&block.beneficiary()) {
-                return Err(ValidationApiError::Blacklist(block.beneficiary()))
+                return Err(ValidationApiError::Blacklist(block.beneficiary()));
             }
             if self.disallow.contains(&message.proposer_fee_recipient) {
-                return Err(ValidationApiError::Blacklist(message.proposer_fee_recipient))
+                return Err(ValidationApiError::Blacklist(
+                    message.proposer_fee_recipient,
+                ));
             }
             for (sender, tx) in block.senders_iter().zip(block.body().transactions()) {
                 if self.disallow.contains(sender) {
-                    return Err(ValidationApiError::Blacklist(*sender))
+                    return Err(ValidationApiError::Blacklist(*sender));
                 }
                 if let Some(to) = tx.to() {
                     if self.disallow.contains(&to) {
-                        return Err(ValidationApiError::Blacklist(to))
+                        return Err(ValidationApiError::Blacklist(to));
                     }
                 }
             }
         }
 
-        let latest_header =
-            self.provider.latest_header()?.ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
+        let latest_header = self
+            .provider
+            .latest_header()?
+            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
 
         let parent_header = if block.parent_hash() == latest_header.hash() {
             latest_header
@@ -182,15 +206,18 @@ where
                 .sealed_header_by_hash(block.parent_hash())?
                 .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
 
-            if latest_header.number().saturating_sub(parent_header.number()) >
-                self.validation_window
+            if latest_header
+                .number()
+                .saturating_sub(parent_header.number())
+                > self.validation_window
             {
-                return Err(ValidationApiError::BlockTooOld)
+                return Err(ValidationApiError::BlockTooOld);
             }
             parent_header
         };
 
-        self.consensus.validate_header_against_parent(block.sealed_header(), &parent_header)?;
+        self.consensus
+            .validate_header_against_parent(block.sealed_header(), &parent_header)?;
         let parent_header_hash = parent_header.hash();
         let state_provider = self.provider.state_by_block_hash(parent_header_hash)?;
 
@@ -202,8 +229,8 @@ where
 
         let mut accessed_blacklisted = None;
 
-        let result = executor.execute_one(&block)
-            .map_err(|e| ValidationApiError::Execution(e.into()))?;
+        let result = executor
+            .execute_one(&block)?;
 
         let state = executor.into_state();
 
@@ -218,10 +245,13 @@ where
         }
 
         if let Some(account) = accessed_blacklisted {
-            return Err(ValidationApiError::Blacklist(account))
+            return Err(ValidationApiError::Blacklist(account));
         }
 
-        let output = BlockExecutionOutput { state: state.bundle_state.clone(), result } ;
+        let output = BlockExecutionOutput {
+            state: state.bundle_state.clone(),
+            result,
+        };
 
         // Validate inclusion list constraint if provided
         if let Some(inclusion_list) = inclusion_list {
@@ -229,9 +259,11 @@ where
         }
 
         // update the cached reads
-        self.update_cached_reads(parent_header_hash, request_cache).await;
+        self.update_cached_reads(parent_header_hash, request_cache)
+            .await;
 
-        self.consensus.validate_block_post_execution(&block, &output)?;
+        self.consensus
+            .validate_block_post_execution(&block, &output)?;
 
         self.ensure_payment(&block, &output, &message)?;
 
@@ -240,72 +272,78 @@ where
 
         if state_root != block.header().state_root() {
             return Err(ConsensusError::BodyStateRootDiff(
-                GotExpected { got: state_root, expected: block.header().state_root() }.into(),
+                GotExpected {
+                    got: state_root,
+                    expected: block.header().state_root(),
+                }
+                .into(),
             )
-            .into())
+            .into());
         }
 
         Ok(())
     }
 
-fn validate_inclusion_list_constraint<DB>(
-    &self,
-    block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
-    post_state: State<DB>,
-    inclusion_list: &InclusionList,
-) -> Result<(), ValidationApiError>
-where
-    DB: Database,
-    <DB as revm::Database>::Error: Send + Sync + 'static,
-{
-    // nothing to do if no inclusion‐list entries
-    if inclusion_list.txs.is_empty() {
-        return Ok(());
-    }
-
-    // collect which inclusion‐list hashes appeared in the block
-    let mut included_hashes = HashSet::new();
-    for tx in block.body().transactions() {
-        if let Some(req) = inclusion_list.txs.iter().find(|t| t.hash.as_slice() == tx.tx_hash().as_slice()) {
-            included_hashes.insert(req.hash);
-        }
-    }
-
-    // if all requested txs are already in the block, we’re done
-    if included_hashes.len() == inclusion_list.txs.len() {
-        return Ok(());
-    }
-
-    // set up a fresh EVM on top of a cache wrapping the post-block state
-    let mut evm = self.evm_config.evm_for_block(post_state, block.header());
-
-    // simulate each missing inclusion‐list tx
-    for req in &inclusion_list.txs {
-        // skip the ones that actually made it in
-        if included_hashes.contains(&req.hash) {
-            continue;
+    fn validate_inclusion_list_constraint<DB>(
+        &self,
+        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        post_state: State<DB>,
+        inclusion_list: &InclusionList,
+    ) -> Result<(), ValidationApiError>
+    where
+        DB: Database,
+        <DB as revm::Database>::Error: Send + Sync + 'static,
+    {
+        // nothing to do if no inclusion‐list entries
+        if inclusion_list.txs.is_empty() {
+            return Ok(());
         }
 
-        // RLP-decode the raw bytes
-        let mut bytes_slice = req.bytes.as_ref();
-        let transaction = recover_raw_transaction(&mut bytes_slice)
-            .map_err(|_| ValidationApiError::InclusionList)?;
-
-        // execute the tx
-        let outcome = evm.transact(transaction);
-
-        // f it succeeded, then this tx *could* have been included but wasn’t → reject
-        if outcome.is_ok() {
-            return Err(ValidationApiError::InclusionList);
+        // collect which inclusion‐list hashes appeared in the block
+        let mut included_hashes = HashSet::new();
+        for tx in block.body().transactions() {
+            if let Some(req) = inclusion_list
+                .txs
+                .iter()
+                .find(|t| t.hash.as_slice() == tx.tx_hash().as_slice())
+            {
+                included_hashes.insert(req.hash);
+            }
         }
-        // otherwise it failed as expected; keep going
+
+        // if all requested txs are already in the block, we’re done
+        if included_hashes.len() == inclusion_list.txs.len() {
+            return Ok(());
+        }
+
+        // set up a fresh EVM on top of a cache wrapping the post-block state
+        let mut evm = self.evm_config.evm_for_block(post_state, block.header());
+
+        // simulate each missing inclusion‐list tx
+        for req in &inclusion_list.txs {
+            // skip the ones that actually made it in
+            if included_hashes.contains(&req.hash) {
+                continue;
+            }
+
+            // RLP-decode the raw bytes
+            let bytes_slice = req.bytes.as_ref();
+            let transaction = recover_raw_transaction(bytes_slice)
+                .map_err(|_| ValidationApiError::InclusionList)?;
+
+            // execute the tx
+            let outcome = evm.transact(transaction);
+
+            // f it succeeded, then this tx *could* have been included but wasn’t → reject
+            if outcome.is_ok() {
+                return Err(ValidationApiError::InclusionList);
+            }
+            // otherwise it failed as expected; keep going
+        }
+
+        // every missing tx failed in simulation, so constraint is satisfied
+        Ok(())
     }
-
-    // every missing tx failed in simulation, so constraint is satisfied
-    Ok(())
-}
-
-
 
     /// Ensures that fields of [`BidTrace`] match the fields of the [`SealedHeaderFor`].
     fn validate_message_against_header(
@@ -332,7 +370,7 @@ where
             return Err(ValidationApiError::GasUsedMismatch(GotExpected {
                 got: message.gas_used,
                 expected: header.gas_used(),
-            }))
+            }));
         } else {
             Ok(())
         }
@@ -342,7 +380,7 @@ where
     /// registered gas limit.
     ///
     /// Ref: <https://github.com/flashbots/builder/blob/a742641e24df68bc2fc476199b012b0abce40ffe/core/blockchain.go#L2474-L2477>
-    fn validate_gas_limit(
+    fn _validate_gas_limit(
         &self,
         registered_gas_limit: u64,
         parent_header: &SealedHeaderFor<E::Primitives>,
@@ -353,14 +391,16 @@ where
         let min_gas_limit =
             parent_header.gas_limit() - parent_header.gas_limit() / GAS_LIMIT_BOUND_DIVISOR + 1;
 
-        let best_gas_limit =
-            std::cmp::max(min_gas_limit, std::cmp::min(max_gas_limit, registered_gas_limit));
+        let best_gas_limit = std::cmp::max(
+            min_gas_limit,
+            std::cmp::min(max_gas_limit, registered_gas_limit),
+        );
 
         if best_gas_limit != header.gas_limit() {
             return Err(ValidationApiError::GasLimitMismatch(GotExpected {
                 got: header.gas_limit(),
                 expected: best_gas_limit,
-            }))
+            }));
         }
 
         Ok(())
@@ -376,18 +416,21 @@ where
         output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
         message: &BidTrace,
     ) -> Result<(), ValidationApiError> {
-        let (mut balance_before, balance_after) = if let Some(acc) =
-            output.state.state.get(&message.proposer_fee_recipient)
-        {
-            let balance_before = acc.original_info.as_ref().map(|i| i.balance).unwrap_or_default();
-            let balance_after = acc.info.as_ref().map(|i| i.balance).unwrap_or_default();
+        let (mut balance_before, balance_after) =
+            if let Some(acc) = output.state.state.get(&message.proposer_fee_recipient) {
+                let balance_before = acc
+                    .original_info
+                    .as_ref()
+                    .map(|i| i.balance)
+                    .unwrap_or_default();
+                let balance_after = acc.info.as_ref().map(|i| i.balance).unwrap_or_default();
 
-            (balance_before, balance_after)
-        } else {
-            // account might have balance but considering it zero is fine as long as we know
-            // that balance have not changed
-            (U256::ZERO, U256::ZERO)
-        };
+                (balance_before, balance_after)
+            } else {
+                // account might have balance but considering it zero is fine as long as we know
+                // that balance have not changed
+                (U256::ZERO, U256::ZERO)
+            };
 
         if let Some(withdrawals) = block.body().withdrawals() {
             for withdrawal in withdrawals {
@@ -398,7 +441,7 @@ where
         }
 
         if balance_after >= balance_before + message.value {
-            return Ok(())
+            return Ok(());
         }
 
         let (receipt, tx) = output
@@ -408,24 +451,24 @@ where
             .ok_or(ValidationApiError::ProposerPayment)?;
 
         if !receipt.status() {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         if tx.to() != Some(message.proposer_fee_recipient) {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         if tx.value() != message.value {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         if !tx.input().is_empty() {
-            return Err(ValidationApiError::ProposerPayment)
+            return Err(ValidationApiError::ProposerPayment);
         }
 
         if let Some(block_base_fee) = block.header().base_fee_per_gas() {
             if tx.effective_tip_per_gas(block_base_fee).unwrap_or_default() != 0 {
-                return Err(ValidationApiError::ProposerPayment)
+                return Err(ValidationApiError::ProposerPayment);
             }
         }
 
@@ -437,10 +480,10 @@ where
         &self,
         mut blobs_bundle: BlobsBundleV1,
     ) -> Result<Vec<B256>, ValidationApiError> {
-        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len() ||
-            blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
+        if blobs_bundle.commitments.len() != blobs_bundle.proofs.len()
+            || blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
         {
-            return Err(ValidationApiError::InvalidBlobsBundle)
+            return Err(ValidationApiError::InvalidBlobsBundle);
         }
 
         let versioned_hashes = blobs_bundle
@@ -461,20 +504,22 @@ where
         &self,
         request: BuilderBlockValidationRequestV3,
     ) -> Result<(), ValidationApiError> {
-        let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
-            payload: ExecutionPayload::V3(request.request.execution_payload),
-            sidecar: ExecutionPayloadSidecar::v3(CancunPayloadFields {
-                parent_beacon_block_root: request.parent_beacon_block_root,
-                versioned_hashes: self.validate_blobs_bundle(request.request.blobs_bundle)?,
-            }),
-        })?;
+        let block = self
+            .payload_validator
+            .ensure_well_formed_payload(ExecutionData {
+                payload: ExecutionPayload::V3(request.request.execution_payload),
+                sidecar: ExecutionPayloadSidecar::v3(CancunPayloadFields {
+                    parent_beacon_block_root: request.parent_beacon_block_root,
+                    versioned_hashes: self.validate_blobs_bundle(request.request.blobs_bundle)?,
+                }),
+            })?;
 
         self.validate_message_against_block(
             block,
             request.request.message,
             request.registered_gas_limit,
             false,
-            None
+            None,
         )
         .await
     }
@@ -485,20 +530,23 @@ where
         request: ExtendedValidationRequestV4,
     ) -> Result<(), ValidationApiError> {
         info!(target: "rpc::relay", "Validating builder submission v4 test");
-        let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
-            payload: ExecutionPayload::V3(request.base.request.execution_payload),
-            sidecar: ExecutionPayloadSidecar::v4(
-                CancunPayloadFields {
-                    parent_beacon_block_root: request.base.parent_beacon_block_root,
-                    versioned_hashes: self.validate_blobs_bundle(request.base.request.blobs_bundle)?,
-                },
-                PraguePayloadFields {
-                    requests: RequestsOrHash::Requests(
-                        request.base.request.execution_requests.to_requests(),
-                    ),
-                },
-            ),
-        })?;
+        let block = self
+            .payload_validator
+            .ensure_well_formed_payload(ExecutionData {
+                payload: ExecutionPayload::V3(request.base.request.execution_payload),
+                sidecar: ExecutionPayloadSidecar::v4(
+                    CancunPayloadFields {
+                        parent_beacon_block_root: request.base.parent_beacon_block_root,
+                        versioned_hashes: self
+                            .validate_blobs_bundle(request.base.request.blobs_bundle)?,
+                    },
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Requests(
+                            request.base.request.execution_requests.to_requests(),
+                        ),
+                    },
+                ),
+            })?;
 
         self.validate_message_against_block(
             block,
@@ -552,7 +600,8 @@ where
             let _ = tx.send(result);
         }));
 
-        rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
+        rx.await
+            .map_err(|_| internal_rpc_err("Internal blocking task error"))?
     }
 
     /// Validates a block submitted to the relay
@@ -570,7 +619,8 @@ where
             let _ = tx.send(result);
         }));
 
-        rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
+        rx.await
+            .map_err(|_| internal_rpc_err("Internal blocking task error"))?
     }
 }
 
@@ -582,9 +632,9 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     /// Execution payload validator.
     payload_validator: Arc<
         dyn PayloadValidator<
-            Block = <E::Primitives as NodePrimitives>::Block,
-            ExecutionData = ExecutionData,
-        >,
+                Block = <E::Primitives as NodePrimitives>::Block,
+                ExecutionData = ExecutionData,
+            >,
     >,
     /// Block executor factory.
     evm_config: E,
@@ -623,13 +673,19 @@ impl ValidationApiConfig {
     pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
 
     pub fn new(blacklist_endpoint: String) -> Self {
-        Self { blacklist_endpoint, validation_window: Self::DEFAULT_VALIDATION_WINDOW }
+        Self {
+            blacklist_endpoint,
+            validation_window: Self::DEFAULT_VALIDATION_WINDOW,
+        }
     }
 }
 
 impl Default for ValidationApiConfig {
     fn default() -> Self {
-        Self { blacklist_endpoint: Default::default(), validation_window: Self::DEFAULT_VALIDATION_WINDOW }
+        Self {
+            blacklist_endpoint: Default::default(),
+            validation_window: Self::DEFAULT_VALIDATION_WINDOW,
+        }
     }
 }
 
@@ -667,27 +723,27 @@ pub enum ValidationApiError {
     #[error(transparent)]
     Payload(#[from] NewPayloadError),
     #[error("inclusion list not statisfied")]
-    InclusionList
+    InclusionList,
 }
 
 impl From<ValidationApiError> for ErrorObject<'static> {
     fn from(error: ValidationApiError) -> Self {
         match error {
-            ValidationApiError::GasLimitMismatch(_) |
-            ValidationApiError::GasUsedMismatch(_) |
-            ValidationApiError::ParentHashMismatch(_) |
-            ValidationApiError::BlockHashMismatch(_) |
-            ValidationApiError::Blacklist(_) |
-            ValidationApiError::ProposerPayment |
-            ValidationApiError::InvalidBlobsBundle |
-            ValidationApiError::InclusionList |
-            ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
+            ValidationApiError::GasLimitMismatch(_)
+            | ValidationApiError::GasUsedMismatch(_)
+            | ValidationApiError::ParentHashMismatch(_)
+            | ValidationApiError::BlockHashMismatch(_)
+            | ValidationApiError::Blacklist(_)
+            | ValidationApiError::ProposerPayment
+            | ValidationApiError::InvalidBlobsBundle
+            | ValidationApiError::InclusionList
+            | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
-            ValidationApiError::MissingLatestBlock |
-            ValidationApiError::MissingParentBlock |
-            ValidationApiError::BlockTooOld |
-            ValidationApiError::Consensus(_) |
-            ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
+            ValidationApiError::MissingLatestBlock
+            | ValidationApiError::MissingParentBlock
+            | ValidationApiError::BlockTooOld
+            | ValidationApiError::Consensus(_)
+            | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
                 error @ BlockExecutionError::Validation(_) => {
                     invalid_params_rpc_err(error.to_string())
@@ -710,14 +766,13 @@ pub(crate) struct ValidationMetrics {
     pub(crate) disallow_size: Gauge,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InclusionList {
     pub txs: Vec<InclusionListTx>,
 }
 
 impl InclusionList {
-    pub const fn empty() -> Self {
+    pub const fn _empty() -> Self {
         Self { txs: vec![] }
     }
 }
@@ -735,7 +790,6 @@ pub struct InclusionListTx {
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtendedValidationRequestV4 {
-    
     #[serde(flatten)]
     pub base: BuilderBlockValidationRequestV4,
 
@@ -746,8 +800,7 @@ pub struct ExtendedValidationRequestV4 {
 }
 
 /// Block validation rpc interface.
-#[cfg_attr(not(feature = "client"), rpc(server, namespace = "relay"))]
-#[cfg_attr(feature = "client", rpc(server, client, namespace = "relay"))]
+#[rpc(server, namespace = "relay")]
 pub trait BlockSubmissionValidationApi {
     /// A Request to validate a block submission.
     #[method(name = "validateBuilderSubmissionV1")]
