@@ -238,9 +238,7 @@ where
 
         let mut accessed_blacklisted = None;
 
-        let result = executor
-            .execute_one(&block)
-            .map_err(|e| ValidationApiError::Execution(e.into()))?;
+        let result = executor.execute_one(&block)?;
 
         let state = executor.into_state();
 
@@ -337,8 +335,8 @@ where
             }
 
             // RLP-decode the raw bytes
-            let mut bytes_slice = req.bytes.as_ref();
-            let transaction = recover_raw_transaction(&mut bytes_slice)
+            let bytes_slice = req.bytes.as_ref();
+            let transaction = recover_raw_transaction(bytes_slice)
                 .map_err(|_| ValidationApiError::InclusionList)?;
 
             // execute the tx
@@ -390,7 +388,7 @@ where
     /// registered gas limit.
     ///
     /// Ref: <https://github.com/flashbots/builder/blob/a742641e24df68bc2fc476199b012b0abce40ffe/core/blockchain.go#L2474-L2477>
-    fn validate_gas_limit(
+    fn _validate_gas_limit(
         &self,
         registered_gas_limit: u64,
         parent_header: &SealedHeaderFor<E::Primitives>,
@@ -1252,7 +1250,7 @@ pub struct InclusionList {
 }
 
 impl InclusionList {
-    pub const fn empty() -> Self {
+    pub const fn _empty() -> Self {
         Self { txs: vec![] }
     }
 }
@@ -1372,8 +1370,7 @@ pub struct MergeBlockResponseV1 {
 }
 
 /// Block validation rpc interface.
-#[cfg_attr(not(feature = "client"), rpc(server, namespace = "relay"))]
-#[cfg_attr(feature = "client", rpc(server, client, namespace = "relay"))]
+#[rpc(server, namespace = "relay")]
 pub trait BlockSubmissionValidationApi {
     /// A Request to validate a block submission.
     #[method(name = "validateBuilderSubmissionV1")]

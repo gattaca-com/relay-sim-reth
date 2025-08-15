@@ -1,4 +1,4 @@
-#![warn(unused_crate_dependencies)]
+//#![warn(unused_crate_dependencies)]
 
 mod inclusion;
 mod state_recorder;
