@@ -28,7 +28,7 @@ use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
 
 fn main() {
-    Cli::<EthereumChainSpecParser, InclusionListsExt>::parse()
+    Cli::<EthereumChainSpecParser, CliExt>::parse()
         .run(|builder, args| async move {
             let handle = builder
                 .with_types::<EthereumNode>()
@@ -71,6 +71,8 @@ fn main() {
                         RpcNodeCore::evm_config(ctx.node()).clone(),
                         ValidationApiConfig::new(
                             args.blacklist_provider.clone().unwrap_or_default(),
+                            args.merger_private_key,
+                            args.relay_fee_recipient,
                         ),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
@@ -90,7 +92,7 @@ fn main() {
 
 /// Our custom cli args extension that adds one flag to reth default CLI.
 #[derive(Debug, Clone, Default, clap::Args)]
-struct InclusionListsExt {
+struct CliExt {
     /// CLI flag to enable the txpool extension namespace
     #[arg(long)]
     pub enable_ext: bool,
@@ -103,6 +105,12 @@ struct InclusionListsExt {
 
     #[arg(long, default_value = "/root/blocks")]
     pub record_blocks_dir: String,
+
+    #[arg(long)]
+    pub merger_private_key: String,
+
+    #[arg(long)]
+    pub relay_fee_recipient: String,
 }
 
 /// trait interface for a custom rpc namespace: `relay`

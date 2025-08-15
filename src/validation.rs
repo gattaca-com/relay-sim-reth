@@ -1,21 +1,31 @@
 use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
+    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, SignableTransaction, Transaction,
+    TxEip1559, TxReceipt,
 };
+use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
     BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
 };
+use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_engine::{
     BlobsBundleV1, CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
     PraguePayloadFields,
 };
+use alloy_rpc_types_engine::{ExecutionPayloadV2, ExecutionPayloadV3};
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
+use reth_ethereum::chainspec::EthChainSpec;
+use reth_ethereum::evm::primitives::block::{BlockExecutor, BlockExecutorFor};
+use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
+use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
@@ -34,13 +44,18 @@ use reth_ethereum::{
 };
 use reth_metrics::{Metrics, metrics::Gauge};
 use reth_node_builder::{
-    BlockBody, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator,
+    Block, BlockBody, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, NodePrimitives,
+    PayloadValidator,
 };
+use reth_primitives::{Recovered, SealedHeader};
 use reth_tasks::TaskSpawner;
+use revm::database::states::bundle_state::BundleRetention;
 use revm::{Database, database::State};
-use revm_primitives::{Address, B256, U256};
+use revm::{DatabaseCommit, DatabaseRef};
+use revm_primitives::{Address, B256, U256, address};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use std::collections::HashMap;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{
     spawn,
@@ -58,7 +73,7 @@ pub struct ValidationApi<Provider, E: ConfigureEvm> {
 
 impl<Provider, E> ValidationApi<Provider, E>
 where
-    E: ConfigureEvm,
+    E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
 {
     /// Create a new instance of the [`ValidationApi`]
     pub fn new(
@@ -77,8 +92,20 @@ where
         let ValidationApiConfig {
             blacklist_endpoint,
             validation_window,
+            merger_private_key,
+            relay_fee_recipient,
+            distribution_config,
+            distribution_contract,
         } = config;
         let disallow = Arc::new(DashSet::new());
+
+        let merger_signer = merger_private_key
+            .parse()
+            .expect("Failed to parse merger private key");
+
+        let relay_fee_recipient = relay_fee_recipient
+            .parse()
+            .expect("Failed to parse relay fee recipient");
 
         let inner = Arc::new(ValidationApiInner {
             provider,
@@ -90,6 +117,10 @@ where
             cached_state: Default::default(),
             task_spawner,
             metrics: Default::default(),
+            merger_signer,
+            relay_fee_recipient,
+            distribution_config,
+            distribution_contract,
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -154,7 +185,7 @@ where
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
         + 'static,
-    E: ConfigureEvm + 'static,
+    E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 {
     /// Validates the given block and a [`BidTrace`] against it.
     pub async fn validate_message_against_block(
@@ -192,29 +223,7 @@ where
             }
         }
 
-        let latest_header = self
-            .provider
-            .latest_header()?
-            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
-
-        let parent_header = if block.parent_hash() == latest_header.hash() {
-            latest_header
-        } else {
-            // parent is not the latest header so we need to fetch it and ensure it's not too old
-            let parent_header = self
-                .provider
-                .sealed_header_by_hash(block.parent_hash())?
-                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
-
-            if latest_header
-                .number()
-                .saturating_sub(parent_header.number())
-                > self.validation_window
-            {
-                return Err(ValidationApiError::BlockTooOld);
-            }
-            parent_header
-        };
+        let parent_header = self.get_parent_header(block.parent_hash())?;
 
         self.consensus
             .validate_header_against_parent(block.sealed_header(), &parent_header)?;
@@ -229,8 +238,7 @@ where
 
         let mut accessed_blacklisted = None;
 
-        let result = executor
-            .execute_one(&block)?;
+        let result = executor.execute_one(&block)?;
 
         let state = executor.into_state();
 
@@ -367,10 +375,10 @@ where
                 expected: header.gas_limit(),
             }))
         } else if header.gas_used() != message.gas_used {
-            return Err(ValidationApiError::GasUsedMismatch(GotExpected {
+            Err(ValidationApiError::GasUsedMismatch(GotExpected {
                 got: message.gas_used,
                 expected: header.gas_used(),
-            }));
+            }))
         } else {
             Ok(())
         }
@@ -557,6 +565,415 @@ where
         )
         .await
     }
+
+    /// Core logic for appending additional transactions to a block.
+    async fn merge_block_v1(
+        &self,
+        request: MergeBlockRequestV1,
+    ) -> Result<MergeBlockResponseV1, ValidationApiError> {
+        info!(target: "rpc::relay", "Merging block v1");
+
+        let block: alloy_consensus::Block<
+            <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx,
+        > = request
+            .execution_payload
+            .try_into_block()
+            .map_err(NewPayloadError::Eth)?;
+
+        // Leave some gas for the final revenue distribution call
+        // and the proposer payment.
+        // The gas cost should be 10k per target, but could jump
+        // to 35k if the targets are new accounts.
+        // This number leaves us space for ~9 non-empty targets, or ~2 new accounts.
+        // TODO: compute dynamically by keeping track of gas cost
+        let max_distribution_gas = 100000;
+        // We also leave some gas for the final proposer payment
+        let gas_limit = block.gas_limit() - max_distribution_gas - 21000;
+
+        let parent_header = self.get_parent_header(block.parent_hash())?;
+
+        let (header, body) = block.split();
+
+        let (withdrawals, mut transactions) = (body.withdrawals, body.transactions);
+
+        let block_base_fee_per_gas = header.base_fee_per_gas().unwrap_or_default();
+
+        let proposer_fee_recipient = request.proposer_fee_recipient;
+        let relay_fee_recipient = self.relay_fee_recipient;
+        let beneficiary = header.beneficiary();
+
+        let new_block_attrs = NextBlockEnvAttributes {
+            timestamp: header.timestamp(),
+            suggested_fee_recipient: beneficiary,
+            prev_randao: header.difficulty().to_be_bytes().into(),
+            gas_limit: header.gas_limit(),
+            parent_beacon_block_root: header.parent_beacon_block_root(),
+            withdrawals,
+        };
+
+        let parent_hash = header.parent_hash();
+
+        let state_provider = self.provider.state_by_block_hash(parent_hash)?;
+
+        let mut request_cache = self.cached_reads(parent_hash).await;
+
+        let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
+
+        let mut state_db = State::builder().with_database_ref(&cached_db).build();
+        // Execute the base block
+        let evm_env = self
+            .evm_config
+            .next_evm_env(&parent_header, &new_block_attrs)
+            .or(Err(ValidationApiError::NextEvmEnvFail))?;
+
+        let evm = self.evm_config.evm_with_env(&mut state_db, evm_env.clone());
+        let ctx = self
+            .evm_config
+            .context_for_next_block(&parent_header, new_block_attrs.clone());
+        let mut block_executor = self.evm_config.create_executor(evm, ctx);
+
+        block_executor.apply_pre_execution_changes()?;
+
+        let mut gas_used = 0;
+
+        let mut all_transactions: Vec<
+            Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
+        > = Vec::with_capacity(transactions.len());
+
+        let mut blobs_bundle = request.blobs_bundle;
+
+        // Check that block has proposer payment, otherwise reject it
+        let Some(tx) = transactions.last() else {
+            return Err(ValidationApiError::ProposerPayment);
+        };
+        if tx.value() != request.value || tx.to() != Some(proposer_fee_recipient) {
+            // TODO: support payments through beneficiary?
+            return Err(ValidationApiError::ProposerPayment);
+        }
+        // Remove proposer payment, we'll later add our own payment
+        transactions.pop();
+
+        // Insert the transactions from the unmerged block
+        for tx in transactions {
+            let tx = tx.try_into_recovered().expect("signature is valid");
+            gas_used += block_executor.execute_transaction(tx.as_executable())?;
+
+            all_transactions.push(tx.clone());
+        }
+
+        let initial_balance = block_executor
+            .evm_mut()
+            .db_mut()
+            .basic(beneficiary)?
+            .map_or(U256::ZERO, |info| info.balance);
+
+        let mut revenues = HashMap::new();
+
+        let mut current_balance = initial_balance;
+
+        // Append transactions until we run out of space
+        for (origin, order) in request
+            .merging_data
+            .into_iter()
+            .map(|mb| (mb.origin, mb.order))
+        {
+            let bundle = order.into_bundle();
+            let Ok(txs): Result<Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>, _> = bundle.transactions.iter().map(|b|{
+                let mut buf = b.as_ref();
+                let tx = <<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx as Decodable2718>::decode_2718(&mut buf)?;
+                if !buf.is_empty() {
+                    return Err(alloy_rlp::Error::UnexpectedLength);
+                }
+                let recovered = tx.try_into_recovered().or(Err(alloy_rlp::Error::Custom("invalid signature")))?;
+                Ok(recovered)
+            }).collect() else {
+                // The mergeable transactions should come from already validated payloads
+                // But in case decoding fails, we just skip the bundle
+                continue;
+            };
+            let (bundle_is_valid, gas_used_in_bundle, should_be_included) = self.simulate_bundle(
+                &mut block_executor,
+                evm_env.clone(),
+                &cached_db,
+                &bundle,
+                &txs,
+            );
+
+            if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
+                continue;
+            }
+
+            // Execute the transaction bundle
+
+            let mut total_value = U256::ZERO;
+
+            for (i, tx) in txs.into_iter().enumerate() {
+                if !should_be_included[i] {
+                    continue;
+                }
+                gas_used += block_executor.execute_transaction(tx.as_executable())?;
+
+                all_transactions.push(tx.clone());
+            }
+            // Add the bundle blobs to the block
+            if let Some(bundle) = bundle.blobs_bundle {
+                blobs_bundle.commitments.extend(bundle.commitments);
+                blobs_bundle.proofs.extend(bundle.proofs);
+                blobs_bundle.blobs.extend(bundle.blobs);
+            }
+            // Consider any balance changes on the beneficiary as tx value
+            let new_balance = block_executor
+                .evm_mut()
+                .db_mut()
+                .basic(beneficiary)?
+                .map_or(U256::ZERO, |info| info.balance);
+
+            total_value += new_balance.saturating_sub(current_balance);
+            current_balance = new_balance;
+
+            // Update the revenue for the bundle's origin
+            if !total_value.is_zero() {
+                revenues
+                    .entry(origin)
+                    .and_modify(|v| *v += total_value)
+                    .or_insert(total_value);
+            }
+        }
+
+        let (distributed_value, mut updated_revenues) = split_revenue(
+            &self.distribution_config,
+            revenues,
+            relay_fee_recipient,
+            proposer_fee_recipient,
+        );
+
+        // Just in case, we remove the beneficiary address from the distribution
+        updated_revenues.remove(&beneficiary);
+
+        // We also remove the proposer revenue, to pay it in a direct transaction
+        let proposer_added_value = updated_revenues
+            .remove(&proposer_fee_recipient)
+            .unwrap_or(U256::ZERO);
+        let proposer_value = request.value + proposer_added_value;
+
+        let updated_revenues: Vec<_> = updated_revenues.into_iter().collect();
+
+        let calldata = encode_disperse_eth_calldata(&updated_revenues);
+
+        // Get the chain ID from the configured provider
+        let chain_id = self.provider.chain_spec().chain_id();
+
+        let nonce = block_executor
+            .evm_mut()
+            .db_mut()
+            .basic(beneficiary)?
+            .map_or(0, |info| info.nonce)
+            + 1;
+
+        let disperse_tx = TxEip1559 {
+            chain_id,
+            nonce,
+            // TODO: compute proper gas limit
+            gas_limit: max_distribution_gas,
+            max_fee_per_gas: block_base_fee_per_gas.into(),
+            max_priority_fee_per_gas: 0,
+            to: self.distribution_contract.into(),
+            value: distributed_value,
+            access_list: Default::default(),
+            input: calldata.into(),
+        };
+
+        let signed_disperse_tx = self.sign_transaction(disperse_tx)?;
+
+        all_transactions.push(signed_disperse_tx);
+
+        drop(block_executor);
+
+        // Add proposer payment tx
+        let proposer_payment_tx = TxEip1559 {
+            chain_id,
+            nonce: nonce + 1,
+            // Note that this will revert on any smart contract target
+            gas_limit: 21000,
+            max_fee_per_gas: block_base_fee_per_gas.into(),
+            max_priority_fee_per_gas: 0,
+            to: proposer_fee_recipient.into(),
+            value: proposer_value,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+
+        let signed_proposer_payment_tx = self.sign_transaction(proposer_payment_tx)?;
+
+        all_transactions.push(signed_proposer_payment_tx);
+
+        let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
+
+        let mut state_db = State::builder().with_database(cached_db).build();
+        let mut builder = self
+            .evm_config
+            .builder_for_next_block(&mut state_db, &parent_header, new_block_attrs)
+            .or(Err(ValidationApiError::NextBuilderFail))?;
+
+        // We re-execute all transactions due to limitations on the BlockBuilder API
+        // TODO: check if we can avoid this
+        for tx in all_transactions {
+            builder.execute_transaction(tx)?;
+        }
+
+        let outcome = builder.finish(&state_provider)?;
+
+        let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
+        let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
+        let block = outcome.block.into_block().into_ethereum_block();
+
+        let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
+        let execution_payload = ExecutionPayloadV3 {
+            payload_inner,
+            blob_gas_used,
+            excess_blob_gas,
+        };
+        let execution_requests = outcome
+            .execution_result
+            .requests
+            .try_into()
+            .or(Err(ValidationApiError::ExecutionRequests))?;
+
+        let response = MergeBlockResponseV1 {
+            execution_payload,
+            execution_requests,
+            blobs_bundle,
+            value: proposer_value,
+        };
+
+        Ok(response)
+    }
+
+    fn simulate_bundle<'a, 'b, DBRef, DB>(
+        &self,
+        block_executor: &mut impl BlockExecutorFor<'a, <E as ConfigureEvm>::BlockExecutorFactory, DB>,
+        evm_env: EvmEnvFor<E>,
+        cached_db: DBRef,
+        bundle: &MergeableBundle,
+        txs: &[Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>],
+    ) -> (bool, u64, Vec<bool>)
+    where
+        DB: Database + 'a,
+        DB::Error: Send + Sync + 'static,
+        DBRef: DatabaseRef,
+        DBRef::Error: Send + Sync + 'static,
+    {
+        // Clone current state to avoid mutating it
+        // TODO: there should be a way to remove this clone
+        let mut db_clone = {
+            let db = block_executor.evm_mut().db_mut();
+            db.merge_transitions(BundleRetention::Reverts);
+
+            let pre_state = db.bundle_state.clone();
+
+            State::builder()
+                .with_database_ref(cached_db)
+                .with_bundle_prestate(pre_state)
+                .build()
+        };
+        // Create a new EVM with the cloned pre-state
+        let mut evm_clone = self.evm_config.evm_with_env(&mut db_clone, evm_env.clone());
+
+        let mut gas_used_in_bundle = 0;
+        let mut bundle_is_valid = true;
+        let mut included_txs = vec![true; txs.len()];
+
+        // Check the bundle can be included in the block
+        for (i, tx) in txs.iter().enumerate() {
+            match evm_clone.transact(tx) {
+                Ok(result) => {
+                    // If tx reverted and is not allowed to
+                    if !result.result.is_success() && !bundle.reverting_txs.contains(&i) {
+                        // We check if we can drop it instead, else we discard this bundle
+                        if bundle.dropping_txs.contains(&i) {
+                            // Tx should be dropped
+                            included_txs[i] = false;
+                        } else {
+                            bundle_is_valid = false;
+                            break;
+                        }
+                    }
+                    gas_used_in_bundle += result.result.gas_used();
+                    // Apply the state changes to the cloned state
+                    // Note that this only commits to the State object, not the database
+                    evm_clone.db_mut().commit(result.state);
+                }
+                Err(e) => {
+                    if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
+                        // The transaction might have been invalidated by another one, so we drop it
+                        included_txs[i] = false;
+                    } else {
+                        // The error isn't transaction-related, so we just try to skip this bundle
+                        bundle_is_valid = false;
+                        break;
+                    }
+                }
+            };
+        }
+        (bundle_is_valid, gas_used_in_bundle, included_txs)
+    }
+
+    fn sign_transaction(
+        &self,
+        tx: TxEip1559,
+    ) -> Result<
+        Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
+        ValidationApiError,
+    > {
+        let signature = self
+            .merger_signer
+            .sign_hash_sync(&tx.signature_hash())
+            .expect("signer is local and private key is valid");
+        let signed_tx = tx.into_signed(signature);
+
+        // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
+        let mut buf = vec![];
+        signed_tx.encode_2718(&mut buf);
+        let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
+            &mut buf.as_slice(),
+        )
+        .expect("we just encoded it with encode_2718");
+        let recovered_signed_tx = Recovered::new_unchecked(signed_tx, self.merger_signer.address());
+        Ok(recovered_signed_tx)
+    }
+
+    fn get_parent_header(
+        &self,
+        parent_hash: B256,
+    ) -> Result<
+        SealedHeader<<<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader>,
+        ValidationApiError,
+    > {
+        let latest_header = self
+            .provider
+            .latest_header()?
+            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
+
+        let parent_header = if parent_hash == latest_header.hash() {
+            latest_header
+        } else {
+            // parent is not the latest header so we need to fetch it and ensure it's not too old
+            let parent_header = self
+                .provider
+                .sealed_header_by_hash(parent_hash)?
+                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
+
+            if latest_header
+                .number()
+                .saturating_sub(parent_header.number())
+                > self.validation_window
+            {
+                return Err(ValidationApiError::BlockTooOld);
+            }
+            parent_header
+        };
+        Ok(parent_header)
+    }
 }
 
 #[async_trait]
@@ -594,9 +1011,7 @@ where
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v3(&this, request)
-                .await
-                .map_err(ErrorObject::from);
+            let result = Self::validate_builder_submission_v3(&this, request).await;
             let _ = tx.send(result);
         }));
 
@@ -613,9 +1028,24 @@ where
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v4(&this, request)
-                .await
-                .map_err(ErrorObject::from);
+            let result = Self::validate_builder_submission_v4(&this, request).await;
+            let _ = tx.send(result);
+        }));
+
+        rx.await
+            .map_err(|_| internal_rpc_err("Internal blocking task error"))?
+    }
+
+    /// A Request to append mergeable transactions to a block.
+    async fn merge_block_v1(
+        &self,
+        request: MergeBlockRequestV1,
+    ) -> jsonrpsee::core::RpcResult<MergeBlockResponseV1> {
+        let this = self.clone();
+        let (tx, rx) = oneshot::channel();
+
+        self.task_spawner.spawn_blocking(Box::pin(async move {
+            let result = Self::merge_block_v1(&this, request).await;
             let _ = tx.send(result);
         }));
 
@@ -651,6 +1081,16 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     task_spawner: Box<dyn TaskSpawner>,
     /// Validation metrics
     metrics: ValidationMetrics,
+    /// The address to send relay revenue to.
+    relay_fee_recipient: Address,
+    /// The signer to use for merging blocks. It will be used for signing the
+    /// revenue distribution and proposer payment transactions.
+    merger_signer: PrivateKeySigner,
+    /// The address of the contract used to distribute rewards.
+    /// It must have a `disperseEther(address[],uint256[])` function.
+    distribution_contract: Address,
+    /// Configuration for revenue distribution.
+    distribution_config: DistributionConfig,
 }
 
 impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
@@ -666,16 +1106,33 @@ pub struct ValidationApiConfig {
     pub blacklist_endpoint: String,
     /// The maximum block distance - parent to latest - allowed for validation
     pub validation_window: u64,
+    /// Private key to use for merging blocks.
+    /// The address of this key will be used as the beneficiary for merged blocks,
+    /// and it will be used for signing the revenue distribution transaction.
+    pub merger_private_key: String,
+    /// The address to send relay revenue to.
+    pub relay_fee_recipient: String,
+    /// Configuration for revenue distribution.
+    pub distribution_config: DistributionConfig,
+    /// The address of the contract used to distribute rewards.
+    /// It must have a `disperseEther(address[],uint256[])` function.
+    pub distribution_contract: Address,
 }
 
 impl ValidationApiConfig {
     /// Default validation blocks window of 3 blocks
     pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
 
-    pub fn new(blacklist_endpoint: String) -> Self {
+    pub fn new(
+        blacklist_endpoint: String,
+        merger_private_key: String,
+        relay_fee_recipient: String,
+    ) -> Self {
         Self {
             blacklist_endpoint,
-            validation_window: Self::DEFAULT_VALIDATION_WINDOW,
+            merger_private_key,
+            relay_fee_recipient,
+            ..Default::default()
         }
     }
 }
@@ -685,6 +1142,12 @@ impl Default for ValidationApiConfig {
         Self {
             blacklist_endpoint: Default::default(),
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
+            merger_private_key: String::from("0x00"),
+            relay_fee_recipient: String::from("0x00"),
+            distribution_config: DistributionConfig::default(),
+            // Address of `Disperse.app` contract
+            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
+            distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
         }
     }
 }
@@ -724,6 +1187,12 @@ pub enum ValidationApiError {
     Payload(#[from] NewPayloadError),
     #[error("inclusion list not statisfied")]
     InclusionList,
+    #[error("failed to create EvmEnv for next block")]
+    NextEvmEnvFail,
+    #[error("failed to create builder for next block")]
+    NextBuilderFail,
+    #[error("failed to decode execution requests")]
+    ExecutionRequests,
 }
 
 impl From<ValidationApiError> for ErrorObject<'static> {
@@ -737,11 +1206,14 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::ProposerPayment
             | ValidationApiError::InvalidBlobsBundle
             | ValidationApiError::InclusionList
+            | ValidationApiError::ExecutionRequests
             | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
             ValidationApiError::MissingLatestBlock
             | ValidationApiError::MissingParentBlock
             | ValidationApiError::BlockTooOld
+            | ValidationApiError::NextEvmEnvFail
+            | ValidationApiError::NextBuilderFail
             | ValidationApiError::Consensus(_)
             | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
@@ -799,6 +1271,98 @@ pub struct ExtendedValidationRequestV4 {
     pub apply_blacklist: bool,
 }
 
+/// Represents one or more transactions to be appended into a block atomically.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum MergeableOrder {
+    Tx(MergeableTransaction),
+    Bundle(MergeableBundle),
+}
+
+impl MergeableOrder {
+    fn into_bundle(self) -> MergeableBundle {
+        match self {
+            MergeableOrder::Tx(tx) => {
+                let reverting_txs = if tx.can_revert { vec![0] } else { vec![] };
+                MergeableBundle {
+                    transactions: vec![tx.transaction],
+                    reverting_txs,
+                    dropping_txs: vec![],
+                    blobs_bundle: tx.blobs_bundle,
+                }
+            }
+            MergeableOrder::Bundle(bundle) => bundle,
+        }
+    }
+}
+
+impl From<MergeableTransaction> for MergeableOrder {
+    fn from(tx: MergeableTransaction) -> Self {
+        MergeableOrder::Tx(tx)
+    }
+}
+
+impl From<MergeableBundle> for MergeableOrder {
+    fn from(bundle: MergeableBundle) -> Self {
+        MergeableOrder::Bundle(bundle)
+    }
+}
+
+/// Represents a single transaction to be appended into a block atomically.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MergeableTransaction {
+    /// Transaction that can be merged into the block.
+    pub transaction: Bytes,
+    /// Txs that may revert.
+    pub can_revert: bool,
+    /// Blobs used by the transaction
+    pub blobs_bundle: Option<BlobsBundleV1>,
+}
+
+/// Represents a bundle of transactions to be appended into a block atomically.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MergeableBundle {
+    /// List of transactions that can be merged into the block.
+    pub transactions: Vec<Bytes>,
+    /// Txs that may revert.
+    pub reverting_txs: Vec<usize>,
+    /// Txs that are allowed to be omitted, but not revert.
+    pub dropping_txs: Vec<usize>,
+    /// Blobs used by the bundle
+    pub blobs_bundle: Option<BlobsBundleV1>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MergeableOrderWithOrigin {
+    /// Address of the builder that submitted this order.
+    pub origin: Address,
+    /// Mergeable order.
+    pub order: MergeableOrder,
+}
+
+#[serde_as]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MergeBlockRequestV1 {
+    /// The original payload value
+    pub value: U256,
+    /// The address to send the proposer payment to.
+    pub proposer_fee_recipient: Address,
+    #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
+    pub execution_payload: ExecutionPayloadV3,
+    pub blobs_bundle: BlobsBundleV1,
+    pub merging_data: Vec<MergeableOrderWithOrigin>,
+}
+
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeBlockResponseV1 {
+    #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
+    pub execution_payload: ExecutionPayloadV3,
+    pub execution_requests: ExecutionRequestsV4,
+    pub blobs_bundle: BlobsBundleV1,
+    /// Total value for the proposer
+    pub value: U256,
+}
+
 /// Block validation rpc interface.
 #[rpc(server, namespace = "relay")]
 pub trait BlockSubmissionValidationApi {
@@ -829,4 +1393,171 @@ pub trait BlockSubmissionValidationApi {
         &self,
         request: ExtendedValidationRequestV4,
     ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to append mergeable transactions to a block.
+    #[method(name = "mergeBlockV1")]
+    async fn merge_block_v1(
+        &self,
+        request: MergeBlockRequestV1,
+    ) -> jsonrpsee::core::RpcResult<MergeBlockResponseV1>;
+}
+
+/// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
+fn encode_disperse_eth_calldata(input: &[(Address, U256)]) -> Vec<u8> {
+    let mut calldata = Vec::with_capacity(4 + 64 + input.len() * 32 * 2);
+    // selector for "disperseEther(address[],uint256[])"
+    calldata.extend_from_slice(&[0xe6, 0x3d, 0x38, 0xed]);
+    // Offset for recipients from start of calldata (without counting selector)
+    // 32 bytes for each offset = 64
+    let recipients_offset: [u8; 32] = U256::from(64).to_be_bytes();
+    calldata.extend_from_slice(&recipients_offset);
+    // Offset for values from start of calldata (without counting selector)
+    // 32 bytes for each offset + 32 bytes for recipients length + 32 bytes for each recipient
+    let values_offset: [u8; 32] = (U256::from(64 + 32 + input.len() * 32)).to_be_bytes();
+    calldata.extend_from_slice(&values_offset);
+
+    let revenues_length: [u8; 32] = U256::from(input.len()).to_be_bytes();
+    calldata.extend_from_slice(&revenues_length);
+
+    calldata.extend(input.iter().flat_map(|(recipient, _)| {
+        let mut arr = [0_u8; 32];
+        arr[12..].copy_from_slice(recipient.as_slice());
+        arr
+    }));
+
+    calldata.extend_from_slice(&revenues_length);
+
+    calldata.extend(
+        input
+            .iter()
+            .flat_map(|(_, value)| value.to_be_bytes::<32>()),
+    );
+    calldata
+}
+
+/// Configuration for revenue distribution among different parties.
+#[derive(Debug, Serialize, Eq, PartialEq, Deserialize, Clone)]
+pub struct DistributionConfig {
+    /// Total number of base points to distribute.
+    /// Each participant will be paid `revenue * x / total_bips`.
+    total_bips: u64,
+    /// Base points allocated to the relay.
+    relay_bips: u64,
+    /// Base points allocated to the proposer.
+    proposer_bips: u64,
+    /// Base points allocated to the builder.
+    builder_bips: u64,
+    /// Base points allocated to the winning builder.
+    winning_builder_bips: u64,
+}
+
+impl Default for DistributionConfig {
+    fn default() -> Self {
+        let total_bips = 10000;
+        let relay_bips = total_bips / 4;
+        let proposer_bips = total_bips / 4;
+        let builder_bips = total_bips / 4;
+        let winning_builder_bips = total_bips / 4;
+
+        Self {
+            total_bips,
+            relay_bips,
+            proposer_bips,
+            builder_bips,
+            winning_builder_bips,
+        }
+    }
+}
+
+impl DistributionConfig {
+    fn split(&self, bips: u64, revenue: U256) -> U256 {
+        (U256::from(bips) * revenue) / U256::from(self.total_bips)
+    }
+
+    fn relay_split(&self, revenue: U256) -> U256 {
+        self.split(self.relay_bips, revenue)
+    }
+
+    fn proposer_split(&self, revenue: U256) -> U256 {
+        self.split(self.proposer_bips, revenue)
+    }
+
+    fn builder_split(&self, revenue: U256) -> U256 {
+        self.split(self.builder_bips, revenue)
+    }
+}
+
+fn split_revenue(
+    distribution_config: &DistributionConfig,
+    revenues: HashMap<Address, U256>,
+    relay_fee_recipient: Address,
+    proposer_fee_recipient: Address,
+) -> (U256, HashMap<Address, U256>) {
+    let mut updated_revenues = HashMap::with_capacity(revenues.len());
+
+    let mut distributed_value = U256::ZERO;
+
+    // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
+    // We assume the winning builder controls the beneficiary address, and so it will receive any undistributed revenue.
+    for (origin, revenue) in revenues {
+        let relay_revenue = distribution_config.relay_split(revenue);
+        updated_revenues
+            .entry(relay_fee_recipient)
+            .and_modify(|v| *v += relay_revenue)
+            .or_insert(relay_revenue);
+
+        let proposer_revenue = distribution_config.proposer_split(revenue);
+        updated_revenues
+            .entry(proposer_fee_recipient)
+            .and_modify(|v| *v += proposer_revenue)
+            .or_insert(proposer_revenue);
+
+        let builder_revenue = distribution_config.builder_split(revenue);
+        updated_revenues
+            .entry(origin)
+            .and_modify(|v| *v += builder_revenue)
+            .or_insert(builder_revenue);
+
+        distributed_value += builder_revenue + relay_revenue + proposer_revenue;
+    }
+
+    (distributed_value, updated_revenues)
+}
+
+#[cfg(test)]
+mod tests {
+    use revm_primitives::hex;
+
+    use super::*;
+
+    #[test]
+    fn test_disperse_calldata_encoding() {
+        let expected = hex!(
+            // Selector
+            "e63d38ed"
+            // Recipients offset
+            "0000000000000000000000000000000000000000000000000000000000000040"
+            // Values offset
+            "00000000000000000000000000000000000000000000000000000000000000c0"
+            // Recipients length
+            "0000000000000000000000000000000000000000000000000000000000000003"
+            // Recipients (padded to 32 bytes)
+            "0000000000000000000000000000000000000000000000000000000000000001"
+            "0000000000000000000000000000000000000000000000000000000000000002"
+            "0000000000000000000000000000000000000000000000000000000000000003"
+            // Values length
+            "0000000000000000000000000000000000000000000000000000000000000003"
+            // Values
+            "0000000000000000000000000000000000000000000000000000000000000005"
+            "0000000000000000000000000000000000000000000000000000000000000006"
+            "0000000000000000000000000000000000000000000000000000000000000007"
+        );
+        let input = [
+            (Address::left_padding_from(&[1]), U256::from(5)),
+            (Address::left_padding_from(&[2]), U256::from(6)),
+            (Address::left_padding_from(&[3]), U256::from(7)),
+        ];
+        let actual = encode_disperse_eth_calldata(&input);
+        assert_eq!(actual, expected);
+    }
 }
