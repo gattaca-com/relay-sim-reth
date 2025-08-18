@@ -646,7 +646,7 @@ where
         let Some(tx) = transactions.last() else {
             return Err(ValidationApiError::ProposerPayment);
         };
-        if tx.value() != request.value || tx.to() != Some(proposer_fee_recipient) {
+        if tx.value() != request.original_value || tx.to() != Some(proposer_fee_recipient) {
             // TODO: support payments through beneficiary?
             return Err(ValidationApiError::ProposerPayment);
         }
@@ -754,7 +754,7 @@ where
         let proposer_added_value = updated_revenues
             .remove(&proposer_fee_recipient)
             .unwrap_or(U256::ZERO);
-        let proposer_value = request.value + proposer_added_value;
+        let proposer_value = request.original_value + proposer_added_value;
 
         let updated_revenues: Vec<_> = updated_revenues.into_iter().collect();
 
@@ -1343,7 +1343,7 @@ pub struct MergeableOrderWithOrigin {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeBlockRequestV1 {
     /// The original payload value
-    pub value: U256,
+    pub original_value: U256,
     /// The address to send the proposer payment to.
     pub proposer_fee_recipient: Address,
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
