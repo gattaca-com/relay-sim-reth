@@ -843,7 +843,7 @@ where
             execution_payload,
             execution_requests,
             blobs_bundle,
-            value: proposer_value,
+            proposer_value,
         };
 
         Ok(response)
@@ -1360,7 +1360,7 @@ pub struct MergeBlockResponseV1 {
     pub execution_requests: ExecutionRequestsV4,
     pub blobs_bundle: BlobsBundleV1,
     /// Total value for the proposer
-    pub value: U256,
+    pub proposer_value: U256,
 }
 
 /// Block validation rpc interface.
