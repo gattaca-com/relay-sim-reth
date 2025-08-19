@@ -1560,6 +1560,7 @@ mod tests {
             (Address::left_padding_from(&[2]), U256::from(6)),
             (Address::left_padding_from(&[3]), U256::from(7)),
         ];
+        // This map is for turning tuple references into references of tuples
         let actual = encode_disperse_eth_calldata(input.iter().map(|(a, v)| (a, v)));
         assert_eq!(actual, expected);
     }
