@@ -23,7 +23,7 @@ use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use reth_ethereum::chainspec::EthChainSpec;
-use reth_ethereum::evm::primitives::block::{BlockExecutor, BlockExecutorFor};
+use reth_ethereum::evm::primitives::block::BlockExecutor;
 use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
 use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
 use reth_ethereum::{
@@ -49,7 +49,7 @@ use reth_node_builder::{
 };
 use reth_primitives::{Recovered, SealedHeader};
 use reth_tasks::TaskSpawner;
-use revm::database::states::bundle_state::BundleRetention;
+use revm::database::CacheDB;
 use revm::{Database, database::State};
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_primitives::{Address, B256, U256, address};
@@ -685,9 +685,8 @@ where
                 continue;
             };
             let (bundle_is_valid, gas_used_in_bundle, should_be_included) = self.simulate_bundle(
-                &mut block_executor,
+                block_executor.evm_mut().db_mut(),
                 evm_env.clone(),
-                &cached_db,
                 &bundle,
                 &txs,
             );
@@ -841,43 +840,31 @@ where
         Ok(response)
     }
 
-    fn simulate_bundle<'a, 'b, DBRef, DB>(
+    /// Simulates a bundle.
+    /// Returns whether the bundle is valid, the amount of gas used, and a list
+    /// marking whether to include a transaction or not.
+    fn simulate_bundle<DBRef>(
         &self,
-        block_executor: &mut impl BlockExecutorFor<'a, <E as ConfigureEvm>::BlockExecutorFactory, DB>,
+        db_ref: DBRef,
         evm_env: EvmEnvFor<E>,
-        cached_db: DBRef,
         bundle: &MergeableBundle,
         txs: &[Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>],
     ) -> (bool, u64, Vec<bool>)
     where
-        DB: Database + core::fmt::Debug + 'a,
-        DB::Error: Send + Sync + 'static,
         DBRef: DatabaseRef + core::fmt::Debug,
         DBRef::Error: Send + Sync + 'static,
     {
         // Clone current state to avoid mutating it
-        // TODO: there should be a way to remove this clone
-        let mut db_clone = {
-            let db = block_executor.evm_mut().db_mut();
-            db.merge_transitions(BundleRetention::Reverts);
-
-            let pre_state = db.bundle_state.clone();
-
-            State::builder()
-                .with_database_ref(cached_db)
-                .with_bundle_prestate(pre_state)
-                .build()
-        };
+        let cached_db = CacheDB::new(db_ref);
         // Create a new EVM with the cloned pre-state
-        let mut evm_clone = self.evm_config.evm_with_env(&mut db_clone, evm_env.clone());
+        let mut evm = self.evm_config.evm_with_env(cached_db, evm_env.clone());
 
         let mut gas_used_in_bundle = 0;
-        let mut bundle_is_valid = true;
         let mut included_txs = vec![true; txs.len()];
 
         // Check the bundle can be included in the block
         for (i, tx) in txs.iter().enumerate() {
-            match evm_clone.transact(tx) {
+            match evm.transact(tx) {
                 Ok(result) => {
                     // If tx reverted and is not allowed to
                     if !result.result.is_success() && !bundle.reverting_txs.contains(&i) {
@@ -886,28 +873,26 @@ where
                             // Tx should be dropped
                             included_txs[i] = false;
                         } else {
-                            bundle_is_valid = false;
-                            break;
+                            return (false, 0, vec![]);
                         }
                     }
                     gas_used_in_bundle += result.result.gas_used();
                     // Apply the state changes to the cloned state
                     // Note that this only commits to the State object, not the database
-                    evm_clone.db_mut().commit(result.state);
+                    evm.db_mut().commit(result.state);
                 }
                 Err(e) => {
                     if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
                         // The transaction might have been invalidated by another one, so we drop it
                         included_txs[i] = false;
                     } else {
-                        // The error isn't transaction-related, so we just try to skip this bundle
-                        bundle_is_valid = false;
-                        break;
+                        // The error isn't transaction-related, so we just drop this bundle
+                        return (false, 0, vec![]);
                     }
                 }
             };
         }
-        (bundle_is_valid, gas_used_in_bundle, included_txs)
+        (true, gas_used_in_bundle, included_txs)
     }
 
     fn sign_transaction(
