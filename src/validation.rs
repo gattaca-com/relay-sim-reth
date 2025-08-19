@@ -882,7 +882,9 @@ where
                     evm.db_mut().commit(result.state);
                 }
                 Err(e) => {
-                    if e.is_invalid_tx_err() && bundle.dropping_txs.contains(&i) {
+                    if e.is_invalid_tx_err()
+                        && (bundle.dropping_txs.contains(&i) || bundle.reverting_txs.contains(&i))
+                    {
                         // The transaction might have been invalidated by another one, so we drop it
                         included_txs[i] = false;
                     } else {
