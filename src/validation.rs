@@ -590,8 +590,6 @@ where
         // We also leave some gas for the final proposer payment
         let gas_limit = block.gas_limit() - max_distribution_gas - 21000;
 
-        let parent_header = self.get_parent_header(block.parent_hash())?;
-
         let (header, body) = block.split();
 
         let (withdrawals, mut transactions) = (body.withdrawals, body.transactions);
@@ -601,6 +599,15 @@ where
         let proposer_fee_recipient = request.proposer_fee_recipient;
         let relay_fee_recipient = self.relay_fee_recipient;
         let beneficiary = header.beneficiary();
+
+        // Check that block has proposer payment, otherwise reject it
+        let Some(tx) = transactions.last() else {
+            return Err(ValidationApiError::ProposerPayment);
+        };
+        if tx.value() != request.original_value || tx.to() != Some(proposer_fee_recipient) {
+            // TODO: support payments through beneficiary?
+            return Err(ValidationApiError::ProposerPayment);
+        }
 
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp(),
@@ -620,6 +627,9 @@ where
         let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
 
         let mut state_db = State::builder().with_database_ref(&cached_db).build();
+
+        let parent_header = self.get_parent_header(parent_hash)?;
+
         // Execute the base block
         let evm_env = self
             .evm_config
@@ -642,14 +652,6 @@ where
 
         let mut blobs_bundle = request.blobs_bundle;
 
-        // Check that block has proposer payment, otherwise reject it
-        let Some(tx) = transactions.last() else {
-            return Err(ValidationApiError::ProposerPayment);
-        };
-        if tx.value() != request.original_value || tx.to() != Some(proposer_fee_recipient) {
-            // TODO: support payments through beneficiary?
-            return Err(ValidationApiError::ProposerPayment);
-        }
         // Remove proposer payment, we'll later add our own payment
         transactions.pop();
 
