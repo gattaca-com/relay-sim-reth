@@ -748,8 +748,6 @@ where
             .unwrap_or(U256::ZERO);
         let proposer_value = request.original_value + proposer_added_value;
 
-        let updated_revenues: Vec<_> = updated_revenues.into_iter().collect();
-
         let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
         // Get the chain ID from the configured provider
@@ -1406,8 +1404,14 @@ where
 }
 
 /// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
-fn encode_disperse_eth_calldata(input: &[(Address, U256)]) -> Vec<u8> {
-    let mut calldata = Vec::with_capacity(4 + 64 + input.len() * 32 * 2);
+fn encode_disperse_eth_calldata<'a, I, It>(input: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (&'a Address, &'a U256), IntoIter = It>,
+    It: ExactSizeIterator<Item = I::Item> + Clone,
+{
+    let iter = input.into_iter();
+    let len = iter.len();
+    let mut calldata = Vec::with_capacity(4 + 64 + len * 32 * 2);
     // selector for "disperseEther(address[],uint256[])"
     calldata.extend_from_slice(&[0xe6, 0x3d, 0x38, 0xed]);
     // Offset for recipients from start of calldata (without counting selector)
@@ -1416,13 +1420,13 @@ fn encode_disperse_eth_calldata(input: &[(Address, U256)]) -> Vec<u8> {
     calldata.extend_from_slice(&recipients_offset);
     // Offset for values from start of calldata (without counting selector)
     // 32 bytes for each offset + 32 bytes for recipients length + 32 bytes for each recipient
-    let values_offset: [u8; 32] = (U256::from(64 + 32 + input.len() * 32)).to_be_bytes();
+    let values_offset: [u8; 32] = (U256::from(64 + 32 + len * 32)).to_be_bytes();
     calldata.extend_from_slice(&values_offset);
 
-    let revenues_length: [u8; 32] = U256::from(input.len()).to_be_bytes();
+    let revenues_length: [u8; 32] = U256::from(len).to_be_bytes();
     calldata.extend_from_slice(&revenues_length);
 
-    calldata.extend(input.iter().flat_map(|(recipient, _)| {
+    calldata.extend(iter.clone().flat_map(|(recipient, _)| {
         let mut arr = [0_u8; 32];
         arr[12..].copy_from_slice(recipient.as_slice());
         arr
@@ -1430,11 +1434,7 @@ fn encode_disperse_eth_calldata(input: &[(Address, U256)]) -> Vec<u8> {
 
     calldata.extend_from_slice(&revenues_length);
 
-    calldata.extend(
-        input
-            .iter()
-            .flat_map(|(_, value)| value.to_be_bytes::<32>()),
-    );
+    calldata.extend(iter.flat_map(|(_, value)| value.to_be_bytes::<32>()));
     calldata
 }
 
@@ -1560,7 +1560,7 @@ mod tests {
             (Address::left_padding_from(&[2]), U256::from(6)),
             (Address::left_padding_from(&[3]), U256::from(7)),
         ];
-        let actual = encode_disperse_eth_calldata(&input);
+        let actual = encode_disperse_eth_calldata(input.iter().map(|(a, v)| (a, v)));
         assert_eq!(actual, expected);
     }
 }
