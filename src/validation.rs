@@ -679,15 +679,7 @@ where
             .map(|mb| (mb.origin, mb.order))
         {
             let bundle = order.into_bundle();
-            let Ok(txs): Result<Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>, _> = bundle.transactions.iter().map(|b|{
-                let mut buf = b.as_ref();
-                let tx = <<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx as Decodable2718>::decode_2718(&mut buf)?;
-                if !buf.is_empty() {
-                    return Err(alloy_rlp::Error::UnexpectedLength);
-                }
-                let recovered = tx.try_into_recovered().or(Err(alloy_rlp::Error::Custom("invalid signature")))?;
-                Ok(recovered)
-            }).collect() else {
+            let Ok(txs) = recover_transactions::<E>(&bundle) else {
                 // The mergeable transactions should come from already validated payloads
                 // But in case decoding fails, we just skip the bundle
                 continue;
@@ -1403,6 +1395,27 @@ pub trait BlockSubmissionValidationApi {
         &self,
         request: MergeBlockRequestV1,
     ) -> jsonrpsee::core::RpcResult<MergeBlockResponseV1>;
+}
+
+/// Recovers transactions from a bundle
+fn recover_transactions<E>(
+    bundle: &MergeableBundle,
+) -> Result<
+    Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>,
+    alloy_rlp::Error,
+>
+where
+    E: ConfigureEvm,
+{
+    bundle.transactions.iter().map(|b|{
+        let mut buf = b.as_ref();
+        let tx = <<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx as Decodable2718>::decode_2718(&mut buf)?;
+        if !buf.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        let recovered = tx.try_into_recovered().or(Err(alloy_rlp::Error::Custom("invalid signature")))?;
+        Ok(recovered)
+    }).collect()
 }
 
 /// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
