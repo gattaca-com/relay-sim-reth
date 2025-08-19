@@ -55,7 +55,7 @@ use revm::{DatabaseCommit, DatabaseRef};
 use revm_primitives::{Address, B256, U256, address};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{
     spawn,
@@ -662,17 +662,18 @@ where
             all_transactions.push(tx.clone());
         }
 
-        let initial_balance = block_executor
-            .evm_mut()
-            .db_mut()
-            .basic(beneficiary)?
+        // We have to replace the state with something here, so we use a clone of the original DB.
+        let end_of_block_state = &**block_executor.evm_mut().db_mut();
+
+        let initial_balance = end_of_block_state
+            .basic_ref(beneficiary)?
             .map_or(U256::ZERO, |info| info.balance);
 
-        let mut revenues = HashMap::new();
+        // Keep a list of valid transactions and an index by score
+        let mut mergeable_transactions = Vec::with_capacity(request.merging_data.len());
+        let mut txs_by_score = BinaryHeap::with_capacity(mergeable_transactions.len());
 
-        let mut current_balance = initial_balance;
-
-        // Append transactions until we run out of space
+        // Simulate orders, ordering them by expected value, discarding invalid ones
         for (origin, order) in request
             .merging_data
             .into_iter()
@@ -684,12 +685,50 @@ where
                 // But in case decoding fails, we just skip the bundle
                 continue;
             };
-            let (bundle_is_valid, gas_used_in_bundle, should_be_included) = self.simulate_bundle(
-                block_executor.evm_mut().db_mut(),
-                evm_env.clone(),
-                &bundle,
-                &txs,
-            );
+
+            let db = block_executor.evm_mut().db_mut();
+
+            let (bundle_is_valid, gas_used_in_bundle, _, cached_db) =
+                self.simulate_bundle(db, evm_env.clone(), &bundle, &txs);
+
+            if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
+                continue;
+            }
+
+            // Consider any balance changes on the beneficiary as tx value
+            let new_balance = cached_db
+                .basic_ref(beneficiary)?
+                .map_or(U256::ZERO, |info| info.balance);
+
+            let total_value = new_balance.saturating_sub(initial_balance);
+
+            // Keep the bundle for further processing
+            if !total_value.is_zero() {
+                let index = mergeable_transactions.len();
+                // Compute a score by dividing the value by the gas used
+                // We could use other heuristics here
+                // TODO: should we normalize this somehow?
+                // TODO: we can reduce this to a smaller integer to reduce sorting overhead
+                let score = total_value
+                    .checked_div(U256::from(gas_used_in_bundle))
+                    .unwrap_or_default();
+                txs_by_score.push((score, index));
+                mergeable_transactions.push((origin, bundle, txs));
+            }
+        }
+
+        let mut revenues = HashMap::new();
+
+        let mut current_balance = initial_balance;
+
+        // Append transactions by score until we run out of space
+        while let Some((_score, i)) = txs_by_score.pop() {
+            let (origin, bundle, txs) = std::mem::take(&mut mergeable_transactions[i]);
+
+            let db = block_executor.evm_mut().db_mut();
+
+            let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
+                self.simulate_bundle(db, evm_env.clone(), &bundle, &txs);
 
             if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
                 continue;
@@ -731,6 +770,7 @@ where
                     .or_insert(total_value);
             }
         }
+        drop(mergeable_transactions);
 
         let (distributed_value, mut updated_revenues) = split_revenue(
             &self.distribution_config,
@@ -847,7 +887,7 @@ where
         evm_env: EvmEnvFor<E>,
         bundle: &MergeableBundle,
         txs: &[Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>],
-    ) -> (bool, u64, Vec<bool>)
+    ) -> (bool, u64, Vec<bool>, CacheDB<DBRef>)
     where
         DBRef: DatabaseRef + core::fmt::Debug,
         DBRef::Error: Send + Sync + 'static,
@@ -871,7 +911,7 @@ where
                             // Tx should be dropped
                             included_txs[i] = false;
                         } else {
-                            return (false, 0, vec![]);
+                            return (false, 0, vec![], evm.into_db());
                         }
                     }
                     gas_used_in_bundle += result.result.gas_used();
@@ -887,12 +927,12 @@ where
                         included_txs[i] = false;
                     } else {
                         // The error isn't transaction-related, so we just drop this bundle
-                        return (false, 0, vec![]);
+                        return (false, 0, vec![], evm.into_db());
                     }
                 }
             };
         }
-        (true, gas_used_in_bundle, included_txs)
+        (true, gas_used_in_bundle, included_txs, evm.into_db())
     }
 
     fn sign_transaction(
@@ -1299,7 +1339,7 @@ pub struct MergeableTransaction {
 }
 
 /// Represents a bundle of transactions to be appended into a block atomically.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct MergeableBundle {
     /// List of transactions that can be merged into the block.
     pub transactions: Vec<Bytes>,
