@@ -602,10 +602,9 @@ where
 
         // Check that block has proposer payment, otherwise reject it
         let Some(tx) = transactions.last() else {
-            return Err(ValidationApiError::ProposerPayment);
+            return Err(ValidationApiError::MissingProposerPayment);
         };
         if tx.value() != request.original_value || tx.to() != Some(proposer_fee_recipient) {
-            // TODO: support payments through beneficiary?
             return Err(ValidationApiError::ProposerPayment);
         }
 
@@ -1195,6 +1194,8 @@ pub enum ValidationApiError {
     NextBuilderFail,
     #[error("failed to decode execution requests")]
     ExecutionRequests,
+    #[error("could not find a proposer payment tx")]
+    MissingProposerPayment,
 }
 
 impl From<ValidationApiError> for ErrorObject<'static> {
@@ -1209,6 +1210,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::InvalidBlobsBundle
             | ValidationApiError::InclusionList
             | ValidationApiError::ExecutionRequests
+            | ValidationApiError::MissingProposerPayment
             | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
             ValidationApiError::MissingLatestBlock
