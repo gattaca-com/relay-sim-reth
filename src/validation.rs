@@ -580,16 +580,6 @@ where
             .try_into_block()
             .map_err(NewPayloadError::Eth)?;
 
-        // Leave some gas for the final revenue distribution call
-        // and the proposer payment.
-        // The gas cost should be 10k per target, but could jump
-        // to 35k if the targets are new accounts.
-        // This number leaves us space for ~9 non-empty targets, or ~2 new accounts.
-        // TODO: compute dynamically by keeping track of gas cost
-        let max_distribution_gas = 100000;
-        // We also leave some gas for the final proposer payment
-        let gas_limit = block.gas_limit() - max_distribution_gas - 21000;
-
         let (header, body) = block.split();
 
         let (withdrawals, mut transactions) = (body.withdrawals, body.transactions);
@@ -600,13 +590,26 @@ where
         let relay_fee_recipient = self.relay_fee_recipient;
         let beneficiary = header.beneficiary();
 
-        // Check that block has proposer payment, otherwise reject it
-        let Some(tx) = transactions.last() else {
+        // Check that block has proposer payment, otherwise reject it.
+        // Also remove proposer payment, we'll later add our own
+        let Some(payment_tx) = transactions.pop() else {
             return Err(ValidationApiError::MissingProposerPayment);
         };
-        if tx.value() != request.original_value || tx.to() != Some(proposer_fee_recipient) {
+        if payment_tx.value() != request.original_value
+            || payment_tx.to() != Some(proposer_fee_recipient)
+        {
             return Err(ValidationApiError::ProposerPayment);
         }
+
+        // Leave some gas for the final revenue distribution call
+        // and the proposer payment.
+        // The gas cost should be 10k per target, but could jump
+        // to 35k if the targets are new accounts.
+        // This number leaves us space for ~9 non-empty targets, or ~2 new accounts.
+        // TODO: compute dynamically by keeping track of gas cost
+        let max_distribution_gas = 100000;
+        // We also leave some gas for the final proposer payment
+        let gas_limit = header.gas_limit() - max_distribution_gas - payment_tx.gas_limit();
 
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp(),
@@ -650,9 +653,6 @@ where
         > = Vec::with_capacity(transactions.len());
 
         let mut blobs_bundle = request.blobs_bundle;
-
-        // Remove proposer payment, we'll later add our own payment
-        transactions.pop();
 
         // Insert the transactions from the unmerged block
         for tx in transactions {
@@ -794,8 +794,7 @@ where
         let proposer_payment_tx = TxEip1559 {
             chain_id,
             nonce: nonce + 1,
-            // Note that this will revert on any smart contract target
-            gas_limit: 21000,
+            gas_limit: payment_tx.gas_limit(),
             max_fee_per_gas: block_base_fee_per_gas.into(),
             max_priority_fee_per_gas: 0,
             to: proposer_fee_recipient.into(),
