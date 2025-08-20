@@ -3,6 +3,8 @@ use alloy_consensus::{
     BlobTransactionValidationError, Block, BlockBody, BlockHeader, EMPTY_OMMER_ROOT_HASH,
     EnvKzgSettings, Header, SignableTransaction, Transaction, TxEip1559, TxReceipt,
 };
+use alloy_eips::eip4895::Withdrawals;
+use alloy_eips::eip7685::Requests;
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
@@ -25,10 +27,11 @@ use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
 use reth_ethereum::chainspec::EthChainSpec;
-use reth_ethereum::evm::primitives::block::BlockExecutor;
-use reth_ethereum::evm::primitives::execute::{BlockBuilder, ExecutorTx};
+use reth_ethereum::evm::primitives::block::{BlockExecutor, BlockExecutorFor};
+use reth_ethereum::evm::primitives::execute::ExecutorTx;
 use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
 use reth_ethereum::primitives::proofs;
+use reth_ethereum::storage::StateProvider;
 use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
@@ -866,110 +869,15 @@ where
 
         let chain_spec = self.provider.chain_spec();
 
-        // This part was taken from `reth_evm::execute::BasicBlockBuilder::finish()`.
-        // Using the `BlockBuilder` trait erases the DB type and makes transaction
-        // simulation or value estimation impossible, so we have to re-implement
-        // the block building ourselves.
-        let (evm, result) = block_executor.finish()?;
-        let (db, evm_env) = evm.finish();
-
-        // merge all transitions into bundle state
-        db.merge_transitions(BundleRetention::Reverts);
-
-        // calculate the state root
-        let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
-        let (state_root, _trie_updates) = state_provider
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
-
-        let (transactions, senders): (Vec<_>, Vec<_>) = all_transactions
-            .into_iter()
-            .map(|tx| tx.into_parts())
-            .unzip();
-
-        // Taken from `reth_evm_ethereum::build::EthBlockAssembler::assemble_block()`.
-        // The function receives an unbuildable `BlockAssemblerInput`, due to being
-        // marked as non-exhaustive and having no constructors.
-        let timestamp = evm_env.block_env.timestamp.saturating_to();
-
-        let transactions_root = proofs::calculate_transaction_root(&transactions);
-
-        // Had to inline this manually due to generics
-        // let receipts_root = Receipt::calculate_receipt_root_no_memo(result.receipts);
-        let receipts_root = ordered_trie_root_with_encoder(&result.receipts, |r, buf| {
-            r.with_bloom_ref().encode_2718(buf)
-        });
-        let logs_bloom = logs_bloom(result.receipts.iter().flat_map(|r| r.logs()));
-
-        let withdrawals = chain_spec
-            .is_shanghai_active_at_timestamp(timestamp)
-            .then(|| new_block_attrs.withdrawals.unwrap_or_default());
-
-        let withdrawals_root = withdrawals
-            .as_deref()
-            .map(|w| proofs::calculate_withdrawals_root(w));
-        let requests_hash = chain_spec
-            .is_prague_active_at_timestamp(timestamp)
-            .then(|| result.requests.requests_hash());
-
-        let mut excess_blob_gas = None;
-        let mut blob_gas_used = None;
-
-        // only determine cancun fields when active
-        if chain_spec.is_cancun_active_at_timestamp(timestamp) {
-            blob_gas_used = Some(
-                transactions
-                    .iter()
-                    .map(|tx| tx.blob_gas_used().unwrap_or_default())
-                    .sum(),
-            );
-            excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_header.timestamp())
-            {
-                parent_header.maybe_next_block_excess_blob_gas(
-                    chain_spec.blob_params_at_timestamp(timestamp),
-                )
-            } else {
-                // for the first post-fork block, both parent.blob_gas_used and
-                // parent.excess_blob_gas are evaluated as 0
-                Some(alloy_eips::eip7840::BlobParams::cancun().next_block_excess_blob_gas(0, 0))
-            };
-        }
-
-        let new_header = Header {
-            parent_hash,
-            ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: evm_env.block_env.beneficiary,
-            state_root,
-            transactions_root,
-            receipts_root,
-            withdrawals_root,
-            logs_bloom,
-            timestamp,
-            mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
-            nonce: BEACON_NONCE.into(),
-            base_fee_per_gas: Some(evm_env.block_env.basefee),
-            number: evm_env.block_env.number.saturating_to(),
-            gas_limit: evm_env.block_env.gas_limit,
-            difficulty: evm_env.block_env.difficulty,
-            gas_used: result.gas_used,
-            extra_data: header.extra_data.clone(),
-            parent_beacon_block_root: header.parent_beacon_block_root,
-            blob_gas_used,
-            excess_blob_gas,
-            requests_hash,
-        };
-
-        let block = Block {
-            header: new_header,
-            body: BlockBody {
-                transactions,
-                ommers: Default::default(),
-                withdrawals,
-            },
-        };
-
-        // Continuation from `BasicBlockBuilder::finish`
-        let new_block = RecoveredBlock::new_unhashed(block, senders);
+        let (new_block, requests) = self.assemble_block(
+            block_executor,
+            &state_provider,
+            all_transactions,
+            &chain_spec,
+            new_block_attrs.withdrawals,
+            parent_header,
+            header,
+        )?;
 
         let blob_gas_used = new_block.blob_gas_used().unwrap_or(0);
         let excess_blob_gas = new_block.excess_blob_gas().unwrap_or(0);
@@ -981,8 +889,7 @@ where
             blob_gas_used,
             excess_blob_gas,
         };
-        let execution_requests = result
-            .requests
+        let execution_requests = requests
             .try_into()
             .or(Err(ValidationApiError::ExecutionRequests))?;
 
@@ -1076,6 +983,138 @@ where
         .expect("we just encoded it with encode_2718");
         let recovered_signed_tx = Recovered::new_unchecked(signed_tx, self.merger_signer.address());
         Ok(recovered_signed_tx)
+    }
+
+    fn assemble_block<'a, DB, ChainSpec>(
+        &self,
+        block_executor: impl BlockExecutorFor<'a, <E as ConfigureEvm>::BlockExecutorFactory, DB>,
+        state_provider: &dyn StateProvider,
+        recovered_txs: Vec<
+            Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
+        >,
+        chain_spec: &ChainSpec,
+        withdrawals_opt: Option<Withdrawals>,
+        parent_header: reth_primitives::SealedHeader<
+            <<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
+        >,
+        old_header: Header,
+    ) -> Result<
+        (
+            RecoveredBlock<Block<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>,
+            Requests,
+        ),
+        ValidationApiError,
+    >
+    where
+        DB: Database + core::fmt::Debug + 'a,
+        DB::Error: Send + Sync + 'static,
+        ChainSpec: EthChainSpec + EthereumHardforks,
+    {
+        // This part was taken from `reth_evm::execute::BasicBlockBuilder::finish()`.
+        // Using the `BlockBuilder` trait erases the DB type and makes transaction
+        // simulation or value estimation impossible, so we have to re-implement
+        // the block building ourselves.
+        let (evm, result) = block_executor.finish()?;
+        let (db, evm_env) = evm.finish();
+
+        // merge all transitions into bundle state
+        db.merge_transitions(BundleRetention::Reverts);
+
+        // calculate the state root
+        let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
+        let (state_root, _trie_updates) = state_provider
+            .state_root_with_updates(hashed_state.clone())
+            .map_err(BlockExecutionError::other)?;
+
+        let (transactions, senders): (Vec<_>, Vec<_>) =
+            recovered_txs.into_iter().map(|tx| tx.into_parts()).unzip();
+
+        // Taken from `reth_evm_ethereum::build::EthBlockAssembler::assemble_block()`.
+        // The function receives an unbuildable `BlockAssemblerInput`, due to being
+        // marked as non-exhaustive and having no constructors.
+        let timestamp = evm_env.block_env.timestamp.saturating_to();
+
+        let transactions_root = proofs::calculate_transaction_root(&transactions);
+
+        // Had to inline this manually due to generics
+        // let receipts_root = Receipt::calculate_receipt_root_no_memo(result.receipts);
+        let receipts_root = ordered_trie_root_with_encoder(&result.receipts, |r, buf| {
+            r.with_bloom_ref().encode_2718(buf)
+        });
+        let logs_bloom = logs_bloom(result.receipts.iter().flat_map(|r| r.logs()));
+
+        let withdrawals = chain_spec
+            .is_shanghai_active_at_timestamp(timestamp)
+            .then(|| withdrawals_opt.unwrap_or_default());
+
+        let withdrawals_root = withdrawals
+            .as_deref()
+            .map(|w| proofs::calculate_withdrawals_root(w));
+        let requests_hash = chain_spec
+            .is_prague_active_at_timestamp(timestamp)
+            .then(|| result.requests.requests_hash());
+
+        let mut excess_blob_gas = None;
+        let mut blob_gas_used = None;
+
+        // only determine cancun fields when active
+        if chain_spec.is_cancun_active_at_timestamp(timestamp) {
+            blob_gas_used = Some(
+                transactions
+                    .iter()
+                    .map(|tx| tx.blob_gas_used().unwrap_or_default())
+                    .sum(),
+            );
+            excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_header.timestamp())
+            {
+                parent_header.maybe_next_block_excess_blob_gas(
+                    chain_spec.blob_params_at_timestamp(timestamp),
+                )
+            } else {
+                // for the first post-fork block, both parent.blob_gas_used and
+                // parent.excess_blob_gas are evaluated as 0
+                Some(alloy_eips::eip7840::BlobParams::cancun().next_block_excess_blob_gas(0, 0))
+            };
+        }
+
+        let header = Header {
+            parent_hash: old_header.parent_hash(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: evm_env.block_env.beneficiary,
+            state_root,
+            transactions_root,
+            receipts_root,
+            withdrawals_root,
+            logs_bloom,
+            timestamp,
+            mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
+            nonce: BEACON_NONCE.into(),
+            base_fee_per_gas: Some(evm_env.block_env.basefee),
+            number: evm_env.block_env.number.saturating_to(),
+            gas_limit: evm_env.block_env.gas_limit,
+            difficulty: evm_env.block_env.difficulty,
+            gas_used: result.gas_used,
+            extra_data: old_header.extra_data().clone(),
+            parent_beacon_block_root: old_header.parent_beacon_block_root(),
+            blob_gas_used,
+            excess_blob_gas,
+            requests_hash,
+        };
+
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions,
+                ommers: Default::default(),
+                withdrawals,
+            },
+        };
+
+        // Continuation from `BasicBlockBuilder::finish`
+        Ok((
+            RecoveredBlock::new_unhashed(block, senders),
+            result.requests,
+        ))
     }
 
     fn get_parent_header(
