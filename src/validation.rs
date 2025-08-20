@@ -71,6 +71,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+type RecoveredBlockFor<E> =
+    RecoveredBlock<Block<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>;
+type RecoveredTx<E> = Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>;
+
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
 pub struct ValidationApi<Provider, E: ConfigureEvm> {
@@ -657,9 +661,7 @@ where
 
         let mut gas_used = 0;
 
-        let mut all_transactions: Vec<
-            Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
-        > = Vec::with_capacity(transactions.len());
+        let mut all_transactions: Vec<RecoveredTx<E>> = Vec::with_capacity(transactions.len());
 
         let mut blobs_bundle = request.blobs_bundle;
 
@@ -943,7 +945,7 @@ where
         evm_env: EvmEnvFor<E>,
         reverting_txs: &[usize],
         dropping_txs: &[usize],
-        txs: &[Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>],
+        txs: &[RecoveredTx<E>],
     ) -> (bool, u64, Vec<bool>, CacheDB<DBRef>)
     where
         DBRef: DatabaseRef + core::fmt::Debug,
@@ -992,13 +994,7 @@ where
         (true, gas_used_in_bundle, included_txs, evm.into_db())
     }
 
-    fn sign_transaction(
-        &self,
-        tx: TxEip1559,
-    ) -> Result<
-        Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
-        ValidationApiError,
-    > {
+    fn sign_transaction(&self, tx: TxEip1559) -> Result<RecoveredTx<E>, ValidationApiError> {
         let signature = self
             .merger_signer
             .sign_hash_sync(&tx.signature_hash())
@@ -1020,21 +1016,13 @@ where
         &self,
         block_executor: impl BlockExecutorFor<'a, <E as ConfigureEvm>::BlockExecutorFactory, DB>,
         state_provider: &dyn StateProvider,
-        recovered_txs: Vec<
-            Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
-        >,
+        recovered_txs: Vec<RecoveredTx<E>>,
         withdrawals_opt: Option<Withdrawals>,
         parent_header: reth_primitives::SealedHeader<
             <<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
         >,
         old_header: Header,
-    ) -> Result<
-        (
-            RecoveredBlock<Block<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>,
-            Requests,
-        ),
-        ValidationApiError,
-    >
+    ) -> Result<(RecoveredBlockFor<E>, Requests), ValidationApiError>
     where
         DB: Database + core::fmt::Debug + 'a,
         DB::Error: Send + Sync + 'static,
@@ -1625,10 +1613,7 @@ pub trait BlockSubmissionValidationApi {
 /// Recovers transactions from a bundle
 fn recover_transactions<E>(
     bundle: &MergeableBundle,
-) -> Result<
-    Vec<Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>,
-    alloy_rlp::Error,
->
+) -> Result<Vec<RecoveredTx<E>>, alloy_rlp::Error>
 where
     E: ConfigureEvm,
 {
