@@ -687,9 +687,11 @@ where
             };
 
             let db = block_executor.evm_mut().db_mut();
+            let reverting_txs = &bundle.reverting_txs;
+            let dropping_txs = &bundle.dropping_txs;
 
             let (bundle_is_valid, gas_used_in_bundle, _, cached_db) =
-                self.simulate_bundle(db, evm_env.clone(), &bundle, &txs);
+                self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
 
             if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
                 continue;
@@ -726,9 +728,11 @@ where
             let (origin, bundle, txs) = std::mem::take(&mut mergeable_transactions[i]);
 
             let db = block_executor.evm_mut().db_mut();
+            let reverting_txs = &bundle.reverting_txs;
+            let dropping_txs = &bundle.dropping_txs;
 
             let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
-                self.simulate_bundle(db, evm_env.clone(), &bundle, &txs);
+                self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
 
             if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
                 continue;
@@ -813,11 +817,17 @@ where
             input: calldata.into(),
         };
 
-        let signed_disperse_tx = self.sign_transaction(disperse_tx)?;
+        let signed_disperse_tx_arr = [self.sign_transaction(disperse_tx)?];
 
+        let db = block_executor.evm_mut().db_mut();
+        let (is_valid, _, _, _) =
+            self.simulate_bundle(db, evm_env.clone(), &[], &[], &signed_disperse_tx_arr);
+        if !is_valid {
+            return Err(ValidationApiError::RevenueAllocationReverted);
+        }
+
+        let [signed_disperse_tx] = signed_disperse_tx_arr;
         all_transactions.push(signed_disperse_tx);
-
-        drop(block_executor);
 
         // Add proposer payment tx
         let proposer_payment_tx = TxEip1559 {
@@ -832,9 +842,25 @@ where
             input: Default::default(),
         };
 
-        let signed_proposer_payment_tx = self.sign_transaction(proposer_payment_tx)?;
+        let signed_proposer_payment_tx_arr = [self.sign_transaction(proposer_payment_tx)?];
+
+        let db = block_executor.evm_mut().db_mut();
+        let (is_valid, _, _, _) = self.simulate_bundle(
+            db,
+            evm_env.clone(),
+            &[],
+            &[],
+            &signed_proposer_payment_tx_arr,
+        );
+        if !is_valid {
+            return Err(ValidationApiError::RevenueAllocationReverted);
+        }
+
+        let [signed_proposer_payment_tx] = signed_proposer_payment_tx_arr;
 
         all_transactions.push(signed_proposer_payment_tx);
+
+        drop(block_executor);
 
         let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
 
@@ -885,7 +911,8 @@ where
         &self,
         db_ref: DBRef,
         evm_env: EvmEnvFor<E>,
-        bundle: &MergeableBundle,
+        reverting_txs: &[usize],
+        dropping_txs: &[usize],
         txs: &[Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>],
     ) -> (bool, u64, Vec<bool>, CacheDB<DBRef>)
     where
@@ -905,9 +932,9 @@ where
             match evm.transact(tx) {
                 Ok(result) => {
                     // If tx reverted and is not allowed to
-                    if !result.result.is_success() && !bundle.reverting_txs.contains(&i) {
+                    if !result.result.is_success() && !reverting_txs.contains(&i) {
                         // We check if we can drop it instead, else we discard this bundle
-                        if bundle.dropping_txs.contains(&i) {
+                        if dropping_txs.contains(&i) {
                             // Tx should be dropped
                             included_txs[i] = false;
                         } else {
@@ -921,7 +948,7 @@ where
                 }
                 Err(e) => {
                     if e.is_invalid_tx_err()
-                        && (bundle.dropping_txs.contains(&i) || bundle.reverting_txs.contains(&i))
+                        && (dropping_txs.contains(&i) || reverting_txs.contains(&i))
                     {
                         // The transaction might have been invalidated by another one, so we drop it
                         included_txs[i] = false;
@@ -1212,6 +1239,10 @@ pub enum ValidationApiError {
     ExecutionRequests,
     #[error("could not find a proposer payment tx")]
     MissingProposerPayment,
+    #[error("revenue allocation tx reverted")]
+    RevenueAllocationReverted,
+    #[error("proposer payment tx reverted")]
+    ProposerPaymentReverted,
 }
 
 impl From<ValidationApiError> for ErrorObject<'static> {
@@ -1234,6 +1265,8 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::BlockTooOld
             | ValidationApiError::NextEvmEnvFail
             | ValidationApiError::NextBuilderFail
+            | ValidationApiError::RevenueAllocationReverted
+            | ValidationApiError::ProposerPaymentReverted
             | ValidationApiError::Consensus(_)
             | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
