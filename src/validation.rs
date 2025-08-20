@@ -71,9 +71,9 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-type RecoveredBlockFor<E> =
-    RecoveredBlock<Block<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>>;
-type RecoveredTx<E> = Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>;
+type SignedTx<E> = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx;
+type RecoveredBlockFor<E> = RecoveredBlock<Block<SignedTx<E>>>;
+type RecoveredTx<E> = Recovered<SignedTx<E>>;
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -586,9 +586,7 @@ where
     ) -> Result<MergeBlockResponseV1, ValidationApiError> {
         info!(target: "rpc::relay", "Merging block v1");
 
-        let block: alloy_consensus::Block<
-            <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx,
-        > = request
+        let block: alloy_consensus::Block<SignedTx<E>> = request
             .execution_payload
             .try_into_block()
             .map_err(NewPayloadError::Eth)?;
@@ -1004,10 +1002,8 @@ where
         // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
         let mut buf = vec![];
         signed_tx.encode_2718(&mut buf);
-        let signed_tx = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx::decode_2718(
-            &mut buf.as_slice(),
-        )
-        .expect("we just encoded it with encode_2718");
+        let signed_tx = SignedTx::<E>::decode_2718(&mut buf.as_slice())
+            .expect("we just encoded it with encode_2718");
         let recovered_signed_tx = Recovered::new_unchecked(signed_tx, self.merger_signer.address());
         Ok(recovered_signed_tx)
     }
@@ -1617,15 +1613,21 @@ fn recover_transactions<E>(
 where
     E: ConfigureEvm,
 {
-    bundle.transactions.iter().map(|b|{
-        let mut buf = b.as_ref();
-        let tx = <<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx as Decodable2718>::decode_2718(&mut buf)?;
-        if !buf.is_empty() {
-            return Err(alloy_rlp::Error::UnexpectedLength);
-        }
-        let recovered = tx.try_into_recovered().or(Err(alloy_rlp::Error::Custom("invalid signature")))?;
-        Ok(recovered)
-    }).collect()
+    bundle
+        .transactions
+        .iter()
+        .map(|b| {
+            let mut buf = b.as_ref();
+            let tx = <SignedTx<E> as Decodable2718>::decode_2718(&mut buf)?;
+            if !buf.is_empty() {
+                return Err(alloy_rlp::Error::UnexpectedLength);
+            }
+            let recovered = tx
+                .try_into_recovered()
+                .or(Err(alloy_rlp::Error::Custom("invalid signature")))?;
+            Ok(recovered)
+        })
+        .collect()
 }
 
 /// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
