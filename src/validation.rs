@@ -714,13 +714,9 @@ where
             // Keep the bundle for further processing
             if !total_value.is_zero() {
                 let index = mergeable_transactions.len();
-                // Compute a score by dividing the value by the gas used
+                // Use the tx's value as its score
                 // We could use other heuristics here
-                // TODO: should we normalize this somehow?
-                // TODO: we can reduce this to a smaller integer to reduce sorting overhead
-                let score = total_value
-                    .checked_div(U256::from(gas_used_in_bundle))
-                    .unwrap_or_default();
+                let score = total_value;
                 txs_by_score.push((score, index));
                 mergeable_transactions.push((origin, bundle, txs));
             }
