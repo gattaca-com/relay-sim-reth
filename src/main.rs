@@ -107,16 +107,25 @@ struct CliExt {
 
     #[arg(long)]
     pub relay_fee_recipient: Address,
+
+    #[arg(long)]
+    pub distribution_contract: Address,
+
+    #[arg(long)]
+    pub validate_merged_blocks: bool,
 }
 
 impl CliExt {
     /// Returns the default configuration for the validation API.
     pub fn into_validation_api_config(self) -> ValidationApiConfig {
-        ValidationApiConfig::new(
-            self.blacklist_provider.clone().unwrap_or_default(),
-            self.merger_private_key,
-            self.relay_fee_recipient,
-        )
+        ValidationApiConfig {
+            blacklist_endpoint: self.blacklist_provider.unwrap_or_default(),
+            merger_private_key: self.merger_private_key,
+            relay_fee_recipient: self.relay_fee_recipient,
+            distribution_contract: self.distribution_contract,
+            validate_merged_blocks: self.validate_merged_blocks,
+            ..Default::default()
+        }
     }
 }
 

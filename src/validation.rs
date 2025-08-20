@@ -1309,29 +1309,14 @@ pub struct ValidationApiConfig {
     pub validate_merged_blocks: bool,
 }
 
-impl ValidationApiConfig {
-    /// Default validation blocks window of 3 blocks
-    pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
-
-    pub fn new(
-        blacklist_endpoint: String,
-        merger_private_key: String,
-        relay_fee_recipient: Address,
-    ) -> Self {
-        Self {
-            blacklist_endpoint,
-            merger_private_key,
-            relay_fee_recipient,
-            ..Default::default()
-        }
-    }
-}
+/// Default validation blocks window of 3 blocks
+pub const DEFAULT_VALIDATION_WINDOW: u64 = 3;
 
 impl Default for ValidationApiConfig {
     fn default() -> Self {
         Self {
             blacklist_endpoint: Default::default(),
-            validation_window: Self::DEFAULT_VALIDATION_WINDOW,
+            validation_window: DEFAULT_VALIDATION_WINDOW,
             merger_private_key: String::from(
                 "0x0000000000000000000000000000000000000000000000000000000000000000",
             ),
