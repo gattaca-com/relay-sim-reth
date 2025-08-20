@@ -1,6 +1,6 @@
-use alloy_consensus::{
-    BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
-};
+mod error;
+
+use alloy_consensus::{BlockHeader, EnvKzgSettings, Transaction, TxReceipt};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
@@ -11,7 +11,6 @@ use alloy_rpc_types_engine::{
     PraguePayloadFields,
 };
 use async_trait::async_trait;
-use bytes::Bytes;
 use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
@@ -20,22 +19,20 @@ use reth_ethereum::{
     chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
     evm::{
-        primitives::{Evm, block::BlockExecutionError, execute::Executor},
+        primitives::{Evm, execute::Executor},
         revm::{cached::CachedReads, database::StateProviderDatabase},
     },
-    node::core::rpc::result::{internal_rpc_err, invalid_params_rpc_err},
+    node::core::rpc::result::internal_rpc_err,
     primitives::{
         GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor, SignedTransaction,
         constants::GAS_LIMIT_BOUND_DIVISOR,
     },
-    provider::{BlockExecutionOutput, ChainSpecProvider, ProviderError},
+    provider::{BlockExecutionOutput, ChainSpecProvider},
     rpc::eth::utils::recover_raw_transaction,
     storage::{BlockReaderIdExt, StateProviderFactory},
 };
 use reth_metrics::{Metrics, metrics::Gauge};
-use reth_node_builder::{
-    BlockBody, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator,
-};
+use reth_node_builder::{BlockBody, ConfigureEvm, NodePrimitives, PayloadValidator};
 use reth_tasks::TaskSpawner;
 use revm::{Database, database::State};
 use revm_primitives::{Address, B256, U256};
@@ -48,6 +45,9 @@ use tokio::{
     time,
 };
 use tracing::{info, warn};
+
+use crate::inclusion::types::InclusionList;
+use crate::validation::error::ValidationApiError;
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -229,8 +229,7 @@ where
 
         let mut accessed_blacklisted = None;
 
-        let result = executor
-            .execute_one(&block)?;
+        let result = executor.execute_one(&block)?;
 
         let state = executor.into_state();
 
@@ -689,102 +688,12 @@ impl Default for ValidationApiConfig {
     }
 }
 
-/// Errors thrown by the validation API.
-#[derive(Debug, thiserror::Error)]
-pub enum ValidationApiError {
-    #[error("block gas limit mismatch: {_0}")]
-    GasLimitMismatch(GotExpected<u64>),
-    #[error("block gas used mismatch: {_0}")]
-    GasUsedMismatch(GotExpected<u64>),
-    #[error("block parent hash mismatch: {_0}")]
-    ParentHashMismatch(GotExpected<B256>),
-    #[error("block hash mismatch: {_0}")]
-    BlockHashMismatch(GotExpected<B256>),
-    #[error("missing latest block in database")]
-    MissingLatestBlock,
-    #[error("parent block not found")]
-    MissingParentBlock,
-    #[error("block is too old, outside validation window")]
-    BlockTooOld,
-    #[error("could not verify proposer payment")]
-    ProposerPayment,
-    #[error("invalid blobs bundle")]
-    InvalidBlobsBundle,
-    #[error("block accesses blacklisted address: {_0}")]
-    Blacklist(Address),
-    #[error(transparent)]
-    Blob(#[from] BlobTransactionValidationError),
-    #[error(transparent)]
-    Consensus(#[from] ConsensusError),
-    #[error(transparent)]
-    Provider(#[from] ProviderError),
-    #[error(transparent)]
-    Execution(#[from] BlockExecutionError),
-    #[error(transparent)]
-    Payload(#[from] NewPayloadError),
-    #[error("inclusion list not statisfied")]
-    InclusionList,
-}
-
-impl From<ValidationApiError> for ErrorObject<'static> {
-    fn from(error: ValidationApiError) -> Self {
-        match error {
-            ValidationApiError::GasLimitMismatch(_)
-            | ValidationApiError::GasUsedMismatch(_)
-            | ValidationApiError::ParentHashMismatch(_)
-            | ValidationApiError::BlockHashMismatch(_)
-            | ValidationApiError::Blacklist(_)
-            | ValidationApiError::ProposerPayment
-            | ValidationApiError::InvalidBlobsBundle
-            | ValidationApiError::InclusionList
-            | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
-
-            ValidationApiError::MissingLatestBlock
-            | ValidationApiError::MissingParentBlock
-            | ValidationApiError::BlockTooOld
-            | ValidationApiError::Consensus(_)
-            | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
-            ValidationApiError::Execution(err) => match err {
-                error @ BlockExecutionError::Validation(_) => {
-                    invalid_params_rpc_err(error.to_string())
-                }
-                error @ BlockExecutionError::Internal(_) => internal_rpc_err(error.to_string()),
-            },
-            ValidationApiError::Payload(err) => match err {
-                error @ NewPayloadError::Eth(_) => invalid_params_rpc_err(error.to_string()),
-                error @ NewPayloadError::Other(_) => internal_rpc_err(error.to_string()),
-            },
-        }
-    }
-}
-
 /// Metrics for the validation endpoint.
 #[derive(Metrics)]
 #[metrics(scope = "builder.validation")]
 pub(crate) struct ValidationMetrics {
     /// The number of entries configured in the builder validation disallow list.
     pub(crate) disallow_size: Gauge,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct InclusionList {
-    pub txs: Vec<InclusionListTx>,
-}
-
-impl InclusionList {
-    pub const fn _empty() -> Self {
-        Self { txs: vec![] }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct InclusionListTx {
-    pub hash: B256,
-    pub nonce: u64,
-    pub sender: Address,
-    pub gas_priority_fee: u64,
-    pub bytes: Bytes,
-    pub wait_time: u32,
 }
 
 #[serde_as]
