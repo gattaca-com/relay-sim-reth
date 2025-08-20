@@ -873,7 +873,6 @@ where
             block_executor,
             &state_provider,
             all_transactions,
-            &chain_spec,
             new_block_attrs.withdrawals,
             parent_header,
             header,
@@ -985,14 +984,13 @@ where
         Ok(recovered_signed_tx)
     }
 
-    fn assemble_block<'a, DB, ChainSpec>(
+    fn assemble_block<'a, DB>(
         &self,
         block_executor: impl BlockExecutorFor<'a, <E as ConfigureEvm>::BlockExecutorFactory, DB>,
         state_provider: &dyn StateProvider,
         recovered_txs: Vec<
             Recovered<<<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx>,
         >,
-        chain_spec: &ChainSpec,
         withdrawals_opt: Option<Withdrawals>,
         parent_header: reth_primitives::SealedHeader<
             <<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
@@ -1008,8 +1006,9 @@ where
     where
         DB: Database + core::fmt::Debug + 'a,
         DB::Error: Send + Sync + 'static,
-        ChainSpec: EthChainSpec + EthereumHardforks,
     {
+        let chain_spec = self.provider.chain_spec();
+
         // This part was taken from `reth_evm::execute::BasicBlockBuilder::finish()`.
         // Using the `BlockBuilder` trait erases the DB type and makes transaction
         // simulation or value estimation impossible, so we have to re-implement
