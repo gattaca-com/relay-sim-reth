@@ -23,7 +23,7 @@ use reth_ethereum::{
     rpc::{api::eth::RpcNodeCore, eth::error::RpcPoolError},
 };
 use reth_node_builder::FullNodeComponents;
-use revm_primitives::Bytes;
+use revm_primitives::{Address, Bytes};
 use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
 
@@ -110,7 +110,7 @@ struct CliExt {
     pub merger_private_key: String,
 
     #[arg(long)]
-    pub relay_fee_recipient: String,
+    pub relay_fee_recipient: Address,
 }
 
 /// trait interface for a custom rpc namespace: `relay`

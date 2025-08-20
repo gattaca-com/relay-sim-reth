@@ -115,10 +115,6 @@ where
             .parse()
             .expect("Failed to parse merger private key");
 
-        let relay_fee_recipient = relay_fee_recipient
-            .parse()
-            .expect("Failed to parse relay fee recipient");
-
         let inner = Arc::new(ValidationApiInner {
             provider,
             consensus,
@@ -1303,7 +1299,7 @@ pub struct ValidationApiConfig {
     /// and it will be used for signing the revenue distribution transaction.
     pub merger_private_key: String,
     /// The address to send relay revenue to.
-    pub relay_fee_recipient: String,
+    pub relay_fee_recipient: Address,
     /// Configuration for revenue distribution.
     pub distribution_config: DistributionConfig,
     /// The address of the contract used to distribute rewards.
@@ -1320,7 +1316,7 @@ impl ValidationApiConfig {
     pub fn new(
         blacklist_endpoint: String,
         merger_private_key: String,
-        relay_fee_recipient: String,
+        relay_fee_recipient: Address,
     ) -> Self {
         Self {
             blacklist_endpoint,
@@ -1336,8 +1332,10 @@ impl Default for ValidationApiConfig {
         Self {
             blacklist_endpoint: Default::default(),
             validation_window: Self::DEFAULT_VALIDATION_WINDOW,
-            merger_private_key: String::from("0x00"),
-            relay_fee_recipient: String::from("0x00"),
+            merger_private_key: String::from(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            relay_fee_recipient: address!("0x0000000000000000000000000000000000000000"),
             distribution_config: DistributionConfig::default(),
             // Address of `Disperse.app` contract
             // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
