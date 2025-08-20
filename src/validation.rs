@@ -10,7 +10,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
-    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
+    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4, SignedBidSubmissionV4,
 };
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_engine::{
@@ -103,6 +103,7 @@ where
             relay_fee_recipient,
             distribution_config,
             distribution_contract,
+            validate_merged_blocks,
         } = config;
         let disallow = Arc::new(DashSet::new());
 
@@ -128,6 +129,7 @@ where
             relay_fee_recipient,
             distribution_config,
             distribution_contract,
+            validate_merged_blocks,
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -877,14 +879,50 @@ where
         let block = new_block.into_block().into_ethereum_block();
 
         let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
+
+        let block_hash = payload_inner.payload_inner.block_hash;
+
         let execution_payload = ExecutionPayloadV3 {
             payload_inner,
             blob_gas_used,
             excess_blob_gas,
         };
-        let execution_requests = requests
+        let execution_requests: ExecutionRequestsV4 = requests
             .try_into()
             .or(Err(ValidationApiError::ExecutionRequests))?;
+
+        if self.validate_merged_blocks {
+            let gas_used = execution_payload.payload_inner.payload_inner.gas_used;
+            let message = BidTrace {
+                slot: 0, // unused
+                parent_hash,
+                block_hash,
+                builder_pubkey: Default::default(),  // unused
+                proposer_pubkey: Default::default(), // unused
+                proposer_fee_recipient,
+                gas_limit: new_block_attrs.gas_limit,
+                gas_used,
+                value: proposer_value,
+            };
+            let request = SignedBidSubmissionV4 {
+                message,
+                execution_payload: execution_payload.clone(),
+                blobs_bundle: blobs_bundle.clone(),
+                execution_requests: execution_requests.clone(),
+                signature: Default::default(), // unused
+            };
+            let base = BuilderBlockValidationRequestV4 {
+                request,
+                registered_gas_limit: 0, // unused
+                parent_beacon_block_root: new_block_attrs.parent_beacon_block_root.unwrap(),
+            };
+            let request = ExtendedValidationRequestV4 {
+                base,
+                inclusion_list: None,
+                apply_blacklist: false,
+            };
+            self.validate_builder_submission_v4(request).await?;
+        }
 
         let response = MergeBlockResponseV1 {
             execution_payload,
@@ -1259,6 +1297,8 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     distribution_contract: Address,
     /// Configuration for revenue distribution.
     distribution_config: DistributionConfig,
+    /// Whether to validate merged blocks or not
+    validate_merged_blocks: bool,
 }
 
 impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
@@ -1285,6 +1325,8 @@ pub struct ValidationApiConfig {
     /// The address of the contract used to distribute rewards.
     /// It must have a `disperseEther(address[],uint256[])` function.
     pub distribution_contract: Address,
+    /// Whether to validate merged blocks or not
+    pub validate_merged_blocks: bool,
 }
 
 impl ValidationApiConfig {
@@ -1316,6 +1358,7 @@ impl Default for ValidationApiConfig {
             // Address of `Disperse.app` contract
             // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
             distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
+            validate_merged_blocks: true,
         }
     }
 }
