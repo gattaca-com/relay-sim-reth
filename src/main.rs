@@ -69,11 +69,7 @@ fn main() {
                         ctx.node().provider.clone(),
                         Arc::new(ctx.node().consensus().clone()),
                         RpcNodeCore::evm_config(ctx.node()).clone(),
-                        ValidationApiConfig::new(
-                            args.blacklist_provider.clone().unwrap_or_default(),
-                            args.merger_private_key,
-                            args.relay_fee_recipient,
-                        ),
+                        args.into_validation_api_config(),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
@@ -111,6 +107,17 @@ struct CliExt {
 
     #[arg(long)]
     pub relay_fee_recipient: Address,
+}
+
+impl CliExt {
+    /// Returns the default configuration for the validation API.
+    pub fn into_validation_api_config(self) -> ValidationApiConfig {
+        ValidationApiConfig::new(
+            self.blacklist_provider.clone().unwrap_or_default(),
+            self.merger_private_key,
+            self.relay_fee_recipient,
+        )
+    }
 }
 
 /// trait interface for a custom rpc namespace: `relay`
