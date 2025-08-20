@@ -867,8 +867,6 @@ where
 
         all_transactions.push(signed_proposer_payment_tx);
 
-        let chain_spec = self.provider.chain_spec();
-
         let (new_block, requests) = self.assemble_block(
             block_executor,
             &state_provider,
