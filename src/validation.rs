@@ -1475,6 +1475,7 @@ pub struct ExtendedValidationRequestV4 {
 
 /// Represents one or more transactions to be appended into a block atomically.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
 pub enum MergeableOrder {
     Tx(MergeableTransaction),
     Bundle(MergeableBundle),
