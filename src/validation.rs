@@ -10,7 +10,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
-    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4, SignedBidSubmissionV4,
+    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
 };
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_engine::{
@@ -658,7 +658,8 @@ where
         let mut all_transactions: Vec<RecoveredTx<E>> = Vec::with_capacity(transactions.len());
 
         // Keep track of appended orders with blobs
-        let mut appended_blob_orders = vec![];
+        let mut appended_blob_order_indices = vec![];
+        let mut blob_versioned_hashes = vec![];
 
         // Insert the transactions from the unmerged block
         for tx in transactions {
@@ -666,6 +667,9 @@ where
             gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
             all_transactions.push(tx.clone());
+            if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
+                blob_versioned_hashes.extend(versioned_hashes);
+            }
         }
 
         // We use a read-only reference to the State<DB> as a Database.
@@ -745,7 +749,6 @@ where
             // Execute the transaction bundle
 
             let mut total_value = U256::ZERO;
-            let mut has_blobs = false;
 
             for (i, tx) in txs.into_iter().enumerate() {
                 if !should_be_included[i] {
@@ -754,11 +757,12 @@ where
                 gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
                 all_transactions.push(tx.clone());
-                has_blobs |= tx.blob_count().is_some_and(|c| c > 0);
-            }
-            // Add the bundle blobs to the block
-            if has_blobs {
-                appended_blob_orders.push(original_index);
+                // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
+                // Also store the versioned hash for validation
+                if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
+                    appended_blob_order_indices.push((original_index, i));
+                    blob_versioned_hashes.extend(versioned_hashes);
+                }
             }
             // Consider any balance changes on the beneficiary as tx value
             let new_balance = block_executor
@@ -890,18 +894,6 @@ where
             .try_into()
             .or(Err(ValidationApiError::ExecutionRequests))?;
 
-        let mut blobs_bundle = request.blobs_bundle;
-        appended_blob_orders.into_iter().for_each(|i| {
-            let bundle = request.merging_data[i]
-                .order
-                .blobs_bundle()
-                .cloned()
-                .expect("we already checked");
-            blobs_bundle.blobs.extend(bundle.blobs);
-            blobs_bundle.commitments.extend(bundle.commitments);
-            blobs_bundle.proofs.extend(bundle.proofs);
-        });
-
         if self.validate_merged_blocks {
             let gas_used = execution_payload.payload_inner.payload_inner.gas_used;
             let message = BidTrace {
@@ -915,30 +907,31 @@ where
                 gas_used,
                 value: proposer_value,
             };
-            let request = SignedBidSubmissionV4 {
-                message,
-                execution_payload: execution_payload.clone(),
-                blobs_bundle: blobs_bundle.clone(),
-                execution_requests: execution_requests.clone(),
-                signature: Default::default(), // unused
-            };
-            let base = BuilderBlockValidationRequestV4 {
-                request,
-                registered_gas_limit: 0, // unused
-                parent_beacon_block_root: new_block_attrs.parent_beacon_block_root.unwrap(),
-            };
-            let request = ExtendedValidationRequestV4 {
-                base,
-                inclusion_list: None,
-                apply_blacklist: false,
-            };
-            self.validate_builder_submission_v4(request).await?;
+            let block = self
+                .payload_validator
+                .ensure_well_formed_payload(ExecutionData {
+                    payload: ExecutionPayload::V3(execution_payload.clone()),
+                    sidecar: ExecutionPayloadSidecar::v4(
+                        CancunPayloadFields {
+                            parent_beacon_block_root: new_block_attrs
+                                .parent_beacon_block_root
+                                .unwrap(),
+                            versioned_hashes: blob_versioned_hashes,
+                        },
+                        PraguePayloadFields {
+                            requests: RequestsOrHash::Requests(execution_requests.to_requests()),
+                        },
+                    ),
+                })?;
+
+            self.validate_message_against_block(block, message, 0, false, None)
+                .await?;
         }
 
         let response = MergeBlockResponseV1 {
             execution_payload,
             execution_requests,
-            blobs_bundle,
+            appended_blob_order_indices,
             proposer_value,
         };
 
@@ -1503,13 +1496,6 @@ impl MergeableOrder {
             MergeableOrder::Bundle(bundle) => &bundle.dropping_txs,
         }
     }
-
-    fn blobs_bundle(&self) -> Option<&BlobsBundleV1> {
-        match self {
-            MergeableOrder::Tx(tx) => tx.blobs_bundle.as_ref(),
-            MergeableOrder::Bundle(bundle) => bundle.blobs_bundle.as_ref(),
-        }
-    }
 }
 
 impl From<MergeableTransaction> for MergeableOrder {
@@ -1531,8 +1517,6 @@ pub struct MergeableTransaction {
     pub transaction: Bytes,
     /// Txs that may revert.
     pub can_revert: bool,
-    /// Blobs used by the transaction
-    pub blobs_bundle: Option<BlobsBundleV1>,
 }
 
 /// Represents a bundle of transactions to be appended into a block atomically.
@@ -1544,8 +1528,6 @@ pub struct MergeableBundle {
     pub reverting_txs: Vec<usize>,
     /// Txs that are allowed to be omitted, but not revert.
     pub dropping_txs: Vec<usize>,
-    /// Blobs used by the bundle
-    pub blobs_bundle: Option<BlobsBundleV1>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1565,7 +1547,6 @@ pub struct MergeBlockRequestV1 {
     pub proposer_fee_recipient: Address,
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
-    pub blobs_bundle: BlobsBundleV1,
     pub merging_data: Vec<MergeableOrderWithOrigin>,
 }
 
@@ -1575,7 +1556,9 @@ pub struct MergeBlockResponseV1 {
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     pub execution_requests: ExecutionRequestsV4,
-    pub blobs_bundle: BlobsBundleV1,
+    /// Indices for orders that contains blobs.
+    /// The second value is the index of the tx inside the bundle.
+    pub appended_blob_order_indices: Vec<(usize, usize)>,
     /// Total value for the proposer
     pub proposer_value: U256,
 }
