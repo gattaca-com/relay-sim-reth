@@ -657,7 +657,8 @@ where
 
         let mut all_transactions: Vec<RecoveredTx<E>> = Vec::with_capacity(transactions.len());
 
-        let mut blobs_bundle = request.blobs_bundle;
+        // Keep track of appended orders with blobs
+        let mut appended_blob_orders = vec![];
 
         // Insert the transactions from the unmerged block
         for tx in transactions {
@@ -744,6 +745,7 @@ where
             // Execute the transaction bundle
 
             let mut total_value = U256::ZERO;
+            let mut has_blobs = false;
 
             for (i, tx) in txs.into_iter().enumerate() {
                 if !should_be_included[i] {
@@ -752,12 +754,11 @@ where
                 gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
                 all_transactions.push(tx.clone());
+                has_blobs |= tx.blob_count().is_some_and(|c| c > 0);
             }
             // Add the bundle blobs to the block
-            if let Some(bundle) = order.blobs_bundle().cloned() {
-                blobs_bundle.commitments.extend(bundle.commitments);
-                blobs_bundle.proofs.extend(bundle.proofs);
-                blobs_bundle.blobs.extend(bundle.blobs);
+            if has_blobs {
+                appended_blob_orders.push(original_index);
             }
             // Consider any balance changes on the beneficiary as tx value
             let new_balance = block_executor
@@ -888,6 +889,18 @@ where
         let execution_requests: ExecutionRequestsV4 = requests
             .try_into()
             .or(Err(ValidationApiError::ExecutionRequests))?;
+
+        let mut blobs_bundle = request.blobs_bundle;
+        appended_blob_orders.into_iter().for_each(|i| {
+            let bundle = request.merging_data[i]
+                .order
+                .blobs_bundle()
+                .cloned()
+                .expect("we already checked");
+            blobs_bundle.blobs.extend(bundle.blobs);
+            blobs_bundle.commitments.extend(bundle.commitments);
+            blobs_bundle.proofs.extend(bundle.proofs);
+        });
 
         if self.validate_merged_blocks {
             let gas_used = execution_payload.payload_inner.payload_inner.gas_used;
