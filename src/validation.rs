@@ -681,59 +681,21 @@ where
         // When simulating, we're going to wrap this with an in-memory DB.
         let end_of_block_state = &**block_executor.evm_mut().db_mut();
 
-        let initial_balance = end_of_block_state
-            .basic_ref(beneficiary)?
-            .map_or(U256::ZERO, |info| info.balance);
-
-        // Keep a list of valid transactions and an index by score
-        let mut mergeable_transactions = Vec::with_capacity(request.merging_data.len());
-        let mut txs_by_score = BinaryHeap::with_capacity(mergeable_transactions.len());
-
-        // Simulate orders, ordering them by expected value, discarding invalid ones
-        for (original_index, (origin, order)) in request
-            .merging_data
-            .iter()
-            .map(|mb| (mb.origin, &mb.order))
-            .enumerate()
-        {
-            let Some(txs) = recover_transactions::<E>(order, &applied_txs) else {
-                // The mergeable transactions should come from already validated payloads
-                // But in case decoding fails, we just skip the bundle
-                continue;
-            };
-
-            let db = block_executor.evm_mut().db_mut();
-            let reverting_txs = order.reverting_txs();
-            let dropping_txs = order.dropping_txs();
-
-            let (bundle_is_valid, gas_used_in_bundle, _, cached_db) =
-                self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
-
-            if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
-                continue;
-            }
-
-            // Consider any balance changes on the beneficiary as tx value
-            let new_balance = cached_db
-                .basic_ref(beneficiary)?
-                .map_or(U256::ZERO, |info| info.balance);
-
-            let total_value = new_balance.saturating_sub(initial_balance);
-
-            // Keep the bundle for further processing
-            if !total_value.is_zero() {
-                let index = mergeable_transactions.len();
-                // Use the tx's value as its score
-                // We could use other heuristics here
-                let score = total_value;
-                txs_by_score.push((score, index));
-                mergeable_transactions.push((origin, original_index, txs));
-            }
-        }
+        let (mut txs_by_score, mut mergeable_transactions) = self.score_orders(
+            end_of_block_state,
+            beneficiary,
+            &request.merging_data,
+            evm_env.clone(),
+            &applied_txs,
+            gas_used,
+            gas_limit,
+        )?;
 
         let mut revenues = HashMap::new();
 
-        let mut current_balance = initial_balance;
+        let mut current_balance = end_of_block_state
+            .basic_ref(beneficiary)?
+            .map_or(U256::ZERO, |info| info.balance);
 
         // Append transactions by score until we run out of space
         while let Some((_score, i)) = txs_by_score.pop() {
@@ -954,6 +916,82 @@ where
         Ok(response)
     }
 
+    fn score_orders<DBRef>(
+        &self,
+        end_of_block_state: &DBRef,
+        beneficiary: Address,
+        mergeable_orders: &[MergeableOrderWithOrigin],
+        evm_env: EvmEnvFor<E>,
+        applied_txs: &HashSet<TxHash>,
+        gas_used: u64,
+        gas_limit: u64,
+    ) -> Result<
+        (
+            BinaryHeap<(U256, usize)>,
+            Vec<(Address, usize, Vec<(usize, RecoveredTx<E>)>)>,
+        ),
+        ValidationApiError,
+    >
+    where
+        DBRef: DatabaseRef + core::fmt::Debug,
+        DBRef::Error: Send + Sync + 'static,
+        ValidationApiError: From<DBRef::Error>,
+    {
+        let initial_balance = end_of_block_state
+            .basic_ref(beneficiary)?
+            .map_or(U256::ZERO, |info| info.balance);
+
+        // Keep a list of valid transactions and an index by score
+        let mut mergeable_transactions = Vec::with_capacity(mergeable_orders.len());
+        let mut txs_by_score = BinaryHeap::with_capacity(mergeable_transactions.len());
+
+        // Simulate orders, ordering them by expected value, discarding invalid ones
+        for (original_index, (origin, order)) in mergeable_orders
+            .iter()
+            .map(|mb| (mb.origin, &mb.order))
+            .enumerate()
+        {
+            let Some(txs) = recover_transactions::<E>(order, &applied_txs) else {
+                // The mergeable transactions should come from already validated payloads
+                // But in case decoding fails, we just skip the bundle
+                continue;
+            };
+
+            let reverting_txs = order.reverting_txs();
+            let dropping_txs = order.dropping_txs();
+
+            let (bundle_is_valid, gas_used_in_bundle, _, cached_db) = self.simulate_bundle(
+                end_of_block_state,
+                evm_env.clone(),
+                reverting_txs,
+                dropping_txs,
+                &txs,
+            );
+
+            if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
+                continue;
+            }
+
+            // Consider any balance changes on the beneficiary as tx value
+            let new_balance = cached_db
+                .basic_ref(beneficiary)?
+                .map_or(U256::ZERO, |info| info.balance);
+
+            let total_value = new_balance.saturating_sub(initial_balance);
+
+            // Keep the bundle for further processing
+            if !total_value.is_zero() {
+                let index = mergeable_transactions.len();
+                // Use the tx's value as its score
+                // We could use other heuristics here
+                let score = total_value;
+                txs_by_score.push((score, index));
+                mergeable_transactions.push((origin, original_index, txs));
+            }
+        }
+        Ok((txs_by_score, mergeable_transactions))
+    }
+
     /// Simulates a bundle.
     /// Returns whether the bundle is valid, the amount of gas used, and a list
     /// marking whether to include a transaction or not.
@@ -978,7 +1016,7 @@ where
         let mut included_txs = vec![true; txs.last().map(|(i, _)| *i + 1).unwrap_or(0)];
 
         // Check the bundle can be included in the block
-        for (i, tx) in txs.iter() {
+        for (i, tx) in txs {
             let i = *i;
             match evm.transact(tx) {
                 Ok(result) => {
@@ -1512,18 +1550,6 @@ impl MergeableOrder {
             MergeableOrder::Tx(_) => &[],
             MergeableOrder::Bundle(bundle) => &bundle.dropping_txs,
         }
-    }
-}
-
-impl From<MergeableTransaction> for MergeableOrder {
-    fn from(tx: MergeableTransaction) -> Self {
-        MergeableOrder::Tx(tx)
-    }
-}
-
-impl From<MergeableBundle> for MergeableOrder {
-    fn from(bundle: MergeableBundle) -> Self {
-        MergeableOrder::Bundle(bundle)
     }
 }
 
