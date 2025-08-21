@@ -953,10 +953,10 @@ where
         DBRef: DatabaseRef + core::fmt::Debug,
         DBRef::Error: Send + Sync + 'static,
     {
-        // Clone current state to avoid mutating it
+        // Wrap current state in cache to avoid mutating it
         let cached_db = CacheDB::new(db_ref);
-        // Create a new EVM with the cloned pre-state
-        let mut evm = self.evm_config.evm_with_env(cached_db, evm_env.clone());
+        // Create a new EVM with the pre-state
+        let mut evm = self.evm_config.evm_with_env(cached_db, evm_env);
 
         let mut gas_used_in_bundle = 0;
         let mut included_txs = vec![true; txs.len()];
@@ -976,8 +976,8 @@ where
                         }
                     }
                     gas_used_in_bundle += result.result.gas_used();
-                    // Apply the state changes to the cloned state
-                    // Note that this only commits to the State object, not the database
+                    // Apply the state changes to the simulated state
+                    // Note that this only commits to the cache wrapper, not the underlying database
                     evm.db_mut().commit(result.state);
                 }
                 Err(e) => {
