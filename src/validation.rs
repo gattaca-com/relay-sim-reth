@@ -784,21 +784,13 @@ where
         }
         drop(mergeable_transactions);
 
-        let (distributed_value, mut updated_revenues) = split_revenue(
+        let (proposer_value, distributed_value, updated_revenues) = prepare_revenues(
             &self.distribution_config,
             revenues,
             relay_fee_recipient,
-            proposer_fee_recipient,
+            request.original_value,
+            beneficiary,
         );
-
-        // Just in case, we remove the beneficiary address from the distribution
-        updated_revenues.remove(&beneficiary);
-
-        // We also remove the proposer revenue, to pay it in a direct transaction
-        let proposer_added_value = updated_revenues
-            .remove(&proposer_fee_recipient)
-            .unwrap_or(U256::ZERO);
-        let proposer_value = request.original_value + proposer_added_value;
 
         let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
@@ -1711,30 +1703,30 @@ impl DistributionConfig {
     }
 }
 
-fn split_revenue(
+/// Computes revenue distribution, splitting merged block revenue to the multiple participants.
+/// Returns the proposer value, the distributed value to other parties, and the
+/// revenue to be distributed to each address.
+fn prepare_revenues(
     distribution_config: &DistributionConfig,
     revenues: HashMap<Address, U256>,
     relay_fee_recipient: Address,
-    proposer_fee_recipient: Address,
-) -> (U256, HashMap<Address, U256>) {
+    original_block_value: U256,
+    block_beneficiary: Address,
+) -> (U256, U256, HashMap<Address, U256>) {
     let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
     let mut distributed_value = U256::ZERO;
+    let mut proposer_added_value = U256::ZERO;
 
     // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
     // We assume the winning builder controls the beneficiary address, and so it will receive any undistributed revenue.
     for (origin, revenue) in revenues {
+        // Compute the revenue for the relay and bundle origin
         let relay_revenue = distribution_config.relay_split(revenue);
         updated_revenues
             .entry(relay_fee_recipient)
             .and_modify(|v| *v += relay_revenue)
             .or_insert(relay_revenue);
-
-        let proposer_revenue = distribution_config.proposer_split(revenue);
-        updated_revenues
-            .entry(proposer_fee_recipient)
-            .and_modify(|v| *v += proposer_revenue)
-            .or_insert(proposer_revenue);
 
         let builder_revenue = distribution_config.builder_split(revenue);
         updated_revenues
@@ -1742,10 +1734,21 @@ fn split_revenue(
             .and_modify(|v| *v += builder_revenue)
             .or_insert(builder_revenue);
 
-        distributed_value += builder_revenue + relay_revenue + proposer_revenue;
+        // Add both to the total value to be distributed
+        distributed_value += builder_revenue + relay_revenue;
+
+        // Add proposer revenue to the proposer added value
+        proposer_added_value += distribution_config.proposer_split(revenue);
     }
 
-    (distributed_value, updated_revenues)
+    // Just in case, we remove the beneficiary address from the distribution and update the total
+    distributed_value -= updated_revenues
+        .remove(&block_beneficiary)
+        .unwrap_or(U256::ZERO);
+
+    let proposer_value = original_block_value + proposer_added_value;
+
+    (proposer_value, distributed_value, updated_revenues)
 }
 
 #[cfg(test)]
