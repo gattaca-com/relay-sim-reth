@@ -1,5 +1,6 @@
 //#![warn(unused_crate_dependencies)]
 
+pub(crate) mod block_merging;
 mod inclusion;
 mod state_recorder;
 mod validation;
