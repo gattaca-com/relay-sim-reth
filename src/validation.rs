@@ -59,6 +59,7 @@ use revm::database::CacheDB;
 use revm::database::states::bundle_state::BundleRetention;
 use revm::{Database, database::State};
 use revm::{DatabaseCommit, DatabaseRef};
+use revm_primitives::alloy_primitives::TxHash;
 use revm_primitives::{Address, B256, U256, address};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -657,6 +658,9 @@ where
 
         let mut all_transactions: Vec<RecoveredTx<E>> = Vec::with_capacity(transactions.len());
 
+        // Keep track of already applied txs, to discard duplicates
+        let mut applied_txs = HashSet::with_capacity(transactions.len());
+
         // Keep track of appended orders with blobs
         let mut appended_blob_order_indices = vec![];
         let mut blob_versioned_hashes = vec![];
@@ -667,6 +671,7 @@ where
             gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
             all_transactions.push(tx.clone());
+            applied_txs.insert(*tx.tx_hash());
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
                 blob_versioned_hashes.extend(versioned_hashes);
             }
@@ -691,7 +696,7 @@ where
             .map(|mb| (mb.origin, &mb.order))
             .enumerate()
         {
-            let Ok(txs) = recover_transactions::<E>(order) else {
+            let Some(txs) = recover_transactions::<E>(order, &applied_txs) else {
                 // The mergeable transactions should come from already validated payloads
                 // But in case decoding fails, we just skip the bundle
                 continue;
@@ -734,10 +739,29 @@ where
         while let Some((_score, i)) = txs_by_score.pop() {
             let (origin, original_index, txs) = std::mem::take(&mut mergeable_transactions[i]);
             let order = &request.merging_data[original_index].order;
-
-            let db = block_executor.evm_mut().db_mut();
             let reverting_txs = order.reverting_txs();
             let dropping_txs = order.dropping_txs();
+
+            // Check for already applied transactions and try to drop them
+            let filtered_txs = txs
+                .into_iter()
+                .filter_map(|(i, tx)| {
+                    if !applied_txs.contains(tx.tx_hash()) {
+                        Some(Ok((i, tx)))
+                    } else if dropping_txs.contains(&i) {
+                        None
+                    } else {
+                        Some(Err(()))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>();
+
+            // Discard the bundle if any duplicates couldn't be dropped
+            let Ok(txs) = filtered_txs else {
+                continue;
+            };
+
+            let db = block_executor.evm_mut().db_mut();
 
             let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
                 self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
@@ -750,7 +774,7 @@ where
 
             let mut total_value = U256::ZERO;
 
-            for (i, tx) in txs.into_iter().enumerate() {
+            for (i, tx) in txs.into_iter() {
                 if !should_be_included[i] {
                     continue;
                 }
@@ -817,7 +841,7 @@ where
             input: calldata.into(),
         };
 
-        let signed_disperse_tx_arr = [self.sign_transaction(disperse_tx)?];
+        let signed_disperse_tx_arr = [(0, self.sign_transaction(disperse_tx)?)];
 
         let db = block_executor.evm_mut().db_mut();
         let (is_valid, _, _, _) =
@@ -826,7 +850,7 @@ where
             return Err(ValidationApiError::RevenueAllocationReverted);
         }
 
-        let [signed_disperse_tx] = signed_disperse_tx_arr;
+        let [(_, signed_disperse_tx)] = signed_disperse_tx_arr;
         all_transactions.push(signed_disperse_tx);
 
         // Add proposer payment tx
@@ -842,7 +866,7 @@ where
             input: Default::default(),
         };
 
-        let signed_proposer_payment_tx_arr = [self.sign_transaction(proposer_payment_tx)?];
+        let signed_proposer_payment_tx_arr = [(0, self.sign_transaction(proposer_payment_tx)?)];
 
         let db = block_executor.evm_mut().db_mut();
         let (is_valid, _, _, _) = self.simulate_bundle(
@@ -856,7 +880,7 @@ where
             return Err(ValidationApiError::RevenueAllocationReverted);
         }
 
-        let [signed_proposer_payment_tx] = signed_proposer_payment_tx_arr;
+        let [(_, signed_proposer_payment_tx)] = signed_proposer_payment_tx_arr;
 
         all_transactions.push(signed_proposer_payment_tx);
 
@@ -939,7 +963,7 @@ where
         evm_env: EvmEnvFor<E>,
         reverting_txs: &[usize],
         dropping_txs: &[usize],
-        txs: &[RecoveredTx<E>],
+        txs: &[(usize, RecoveredTx<E>)],
     ) -> (bool, u64, Vec<bool>, CacheDB<DBRef>)
     where
         DBRef: DatabaseRef + core::fmt::Debug,
@@ -951,10 +975,11 @@ where
         let mut evm = self.evm_config.evm_with_env(cached_db, evm_env);
 
         let mut gas_used_in_bundle = 0;
-        let mut included_txs = vec![true; txs.len()];
+        let mut included_txs = vec![true; txs.last().map(|(i, _)| *i + 1).unwrap_or(0)];
 
         // Check the bundle can be included in the block
-        for (i, tx) in txs.iter().enumerate() {
+        for (i, tx) in txs.iter() {
+            let i = *i;
             match evm.transact(tx) {
                 Ok(result) => {
                     // If tx reverted and is not allowed to
@@ -1595,25 +1620,42 @@ pub trait BlockSubmissionValidationApi {
 }
 
 /// Recovers transactions from a bundle
-fn recover_transactions<E>(order: &MergeableOrder) -> Result<Vec<RecoveredTx<E>>, alloy_rlp::Error>
+fn recover_transactions<E>(
+    order: &MergeableOrder,
+    applied_txs: &HashSet<TxHash>,
+) -> Option<Vec<(usize, RecoveredTx<E>)>>
 where
     E: ConfigureEvm,
 {
     order
         .transactions()
         .iter()
-        .map(|b| {
+        .enumerate()
+        .filter_map(|(i, b)| {
             let mut buf = b.as_ref();
-            let tx = <SignedTx<E> as Decodable2718>::decode_2718(&mut buf)?;
+            let Ok(tx) = <SignedTx<E> as Decodable2718>::decode_2718(&mut buf) else {
+                return Some(Err(()));
+            };
             if !buf.is_empty() {
-                return Err(alloy_rlp::Error::UnexpectedLength);
+                return Some(Err(()));
             }
-            let recovered = tx
-                .try_into_recovered()
-                .or(Err(alloy_rlp::Error::Custom("invalid signature")))?;
-            Ok(recovered)
+            // Check if it was already applied
+            if !applied_txs.contains(tx.tx_hash()) {
+                if order.dropping_txs().contains(&i) {
+                    // If the transaction was already applied and can be dropped, we drop it
+                    return None;
+                } else {
+                    // If it can't be dropped, we return an error
+                    return Some(Err(()));
+                }
+            }
+            let Ok(recovered) = tx.try_into_recovered() else {
+                return Some(Err(()));
+            };
+            Some(Ok((i, recovered)))
         })
-        .collect()
+        .collect::<Result<_, _>>()
+        .ok()
 }
 
 /// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
