@@ -680,21 +680,21 @@ where
         let mut txs_by_score = BinaryHeap::with_capacity(mergeable_transactions.len());
 
         // Simulate orders, ordering them by expected value, discarding invalid ones
-        for (origin, order) in request
+        for (original_index, (origin, order)) in request
             .merging_data
-            .into_iter()
-            .map(|mb| (mb.origin, mb.order))
+            .iter()
+            .map(|mb| (mb.origin, &mb.order))
+            .enumerate()
         {
-            let bundle = order.into_bundle();
-            let Ok(txs) = recover_transactions::<E>(&bundle) else {
+            let Ok(txs) = recover_transactions::<E>(order) else {
                 // The mergeable transactions should come from already validated payloads
                 // But in case decoding fails, we just skip the bundle
                 continue;
             };
 
             let db = block_executor.evm_mut().db_mut();
-            let reverting_txs = &bundle.reverting_txs;
-            let dropping_txs = &bundle.dropping_txs;
+            let reverting_txs = order.reverting_txs();
+            let dropping_txs = order.dropping_txs();
 
             let (bundle_is_valid, gas_used_in_bundle, _, cached_db) =
                 self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
@@ -717,7 +717,7 @@ where
                 // We could use other heuristics here
                 let score = total_value;
                 txs_by_score.push((score, index));
-                mergeable_transactions.push((origin, bundle, txs));
+                mergeable_transactions.push((origin, original_index, txs));
             }
         }
 
@@ -727,11 +727,12 @@ where
 
         // Append transactions by score until we run out of space
         while let Some((_score, i)) = txs_by_score.pop() {
-            let (origin, bundle, txs) = std::mem::take(&mut mergeable_transactions[i]);
+            let (origin, original_index, txs) = std::mem::take(&mut mergeable_transactions[i]);
+            let order = &request.merging_data[original_index].order;
 
             let db = block_executor.evm_mut().db_mut();
-            let reverting_txs = &bundle.reverting_txs;
-            let dropping_txs = &bundle.dropping_txs;
+            let reverting_txs = order.reverting_txs();
+            let dropping_txs = order.dropping_txs();
 
             let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
                 self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
@@ -753,7 +754,7 @@ where
                 all_transactions.push(tx.clone());
             }
             // Add the bundle blobs to the block
-            if let Some(bundle) = bundle.blobs_bundle {
+            if let Some(bundle) = order.blobs_bundle().cloned() {
                 blobs_bundle.commitments.extend(bundle.commitments);
                 blobs_bundle.proofs.extend(bundle.proofs);
                 blobs_bundle.blobs.extend(bundle.blobs);
@@ -1467,18 +1468,32 @@ pub enum MergeableOrder {
 }
 
 impl MergeableOrder {
-    fn into_bundle(self) -> MergeableBundle {
+    fn transactions(&self) -> &[Bytes] {
         match self {
-            MergeableOrder::Tx(tx) => {
-                let reverting_txs = if tx.can_revert { vec![0] } else { vec![] };
-                MergeableBundle {
-                    transactions: vec![tx.transaction],
-                    reverting_txs,
-                    dropping_txs: vec![],
-                    blobs_bundle: tx.blobs_bundle,
-                }
-            }
-            MergeableOrder::Bundle(bundle) => bundle,
+            MergeableOrder::Tx(tx) => std::slice::from_ref(&tx.transaction),
+            MergeableOrder::Bundle(bundle) => &bundle.transactions,
+        }
+    }
+
+    fn reverting_txs(&self) -> &[usize] {
+        match self {
+            MergeableOrder::Tx(tx) if tx.can_revert => &[0],
+            MergeableOrder::Tx(_) => &[],
+            MergeableOrder::Bundle(bundle) => &bundle.reverting_txs,
+        }
+    }
+
+    fn dropping_txs(&self) -> &[usize] {
+        match self {
+            MergeableOrder::Tx(_) => &[],
+            MergeableOrder::Bundle(bundle) => &bundle.dropping_txs,
+        }
+    }
+
+    fn blobs_bundle(&self) -> Option<&BlobsBundleV1> {
+        match self {
+            MergeableOrder::Tx(tx) => tx.blobs_bundle.as_ref(),
+            MergeableOrder::Bundle(bundle) => bundle.blobs_bundle.as_ref(),
         }
     }
 }
@@ -1591,14 +1606,12 @@ pub trait BlockSubmissionValidationApi {
 }
 
 /// Recovers transactions from a bundle
-fn recover_transactions<E>(
-    bundle: &MergeableBundle,
-) -> Result<Vec<RecoveredTx<E>>, alloy_rlp::Error>
+fn recover_transactions<E>(order: &MergeableOrder) -> Result<Vec<RecoveredTx<E>>, alloy_rlp::Error>
 where
     E: ConfigureEvm,
 {
-    bundle
-        .transactions
+    order
+        .transactions()
         .iter()
         .map(|b| {
             let mut buf = b.as_ref();
