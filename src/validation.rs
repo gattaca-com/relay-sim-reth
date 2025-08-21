@@ -681,94 +681,30 @@ where
         // When simulating, we're going to wrap this with an in-memory DB.
         let end_of_block_state = &**block_executor.evm_mut().db_mut();
 
-        let (mut txs_by_score, mut mergeable_transactions) = self.score_orders(
+        let (txs_by_score, mergeable_transactions) = self.score_orders(
             end_of_block_state,
             beneficiary,
             &request.merging_data,
             evm_env.clone(),
             &applied_txs,
-            gas_used,
             gas_limit,
+            gas_used,
         )?;
 
-        let mut revenues = HashMap::new();
-
-        let mut current_balance = end_of_block_state
-            .basic_ref(beneficiary)?
-            .map_or(U256::ZERO, |info| info.balance);
-
-        // Append transactions by score until we run out of space
-        while let Some((_score, i)) = txs_by_score.pop() {
-            let (origin, original_index, txs) = std::mem::take(&mut mergeable_transactions[i]);
-            let order = &request.merging_data[original_index].order;
-            let reverting_txs = order.reverting_txs();
-            let dropping_txs = order.dropping_txs();
-
-            // Check for already applied transactions and try to drop them
-            let filtered_txs = txs
-                .into_iter()
-                .filter_map(|(i, tx)| {
-                    if !applied_txs.contains(tx.tx_hash()) {
-                        Some(Ok((i, tx)))
-                    } else if dropping_txs.contains(&i) {
-                        None
-                    } else {
-                        Some(Err(()))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>();
-
-            // Discard the bundle if any duplicates couldn't be dropped
-            let Ok(txs) = filtered_txs else {
-                continue;
-            };
-
-            let db = block_executor.evm_mut().db_mut();
-
-            let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
-                self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
-
-            if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
-                continue;
-            }
-
-            // Execute the transaction bundle
-
-            let mut total_value = U256::ZERO;
-
-            for (i, tx) in txs.into_iter() {
-                if !should_be_included[i] {
-                    continue;
-                }
-                gas_used += block_executor.execute_transaction(tx.as_executable())?;
-
-                all_transactions.push(tx.clone());
-                // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
-                // Also store the versioned hash for validation
-                if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-                    appended_blob_order_indices.push((original_index, i));
-                    blob_versioned_hashes.extend(versioned_hashes);
-                }
-            }
-            // Consider any balance changes on the beneficiary as tx value
-            let new_balance = block_executor
-                .evm_mut()
-                .db_mut()
-                .basic(beneficiary)?
-                .map_or(U256::ZERO, |info| info.balance);
-
-            total_value += new_balance.saturating_sub(current_balance);
-            current_balance = new_balance;
-
-            // Update the revenue for the bundle's origin
-            if !total_value.is_zero() {
-                revenues
-                    .entry(origin)
-                    .and_modify(|v| *v += total_value)
-                    .or_insert(total_value);
-            }
-        }
-        drop(mergeable_transactions);
+        let revenues = self.append_greedily_until_gas_limit(
+            &mut block_executor,
+            beneficiary,
+            evm_env.clone(),
+            txs_by_score,
+            mergeable_transactions,
+            &request.merging_data,
+            applied_txs,
+            gas_limit,
+            &mut gas_used,
+            &mut all_transactions,
+            &mut appended_blob_order_indices,
+            &mut blob_versioned_hashes,
+        )?;
 
         let (proposer_value, distributed_value, updated_revenues) = prepare_revenues(
             &self.distribution_config,
@@ -923,8 +859,8 @@ where
         mergeable_orders: &[MergeableOrderWithOrigin],
         evm_env: EvmEnvFor<E>,
         applied_txs: &HashSet<TxHash>,
-        gas_used: u64,
         gas_limit: u64,
+        gas_used: u64,
     ) -> Result<
         (
             BinaryHeap<(U256, usize)>,
@@ -951,7 +887,7 @@ where
             .map(|mb| (mb.origin, &mb.order))
             .enumerate()
         {
-            let Some(txs) = recover_transactions::<E>(order, &applied_txs) else {
+            let Some(txs) = recover_transactions::<E>(order, applied_txs) else {
                 // The mergeable transactions should come from already validated payloads
                 // But in case decoding fails, we just skip the bundle
                 continue;
@@ -990,6 +926,110 @@ where
             }
         }
         Ok((txs_by_score, mergeable_transactions))
+    }
+
+    fn append_greedily_until_gas_limit<'a, DB>(
+        &self,
+        block_executor: &mut impl BlockExecutorFor<'a, <E as ConfigureEvm>::BlockExecutorFactory, DB>,
+        beneficiary: Address,
+        evm_env: EvmEnvFor<E>,
+        mut txs_by_score: BinaryHeap<(U256, usize)>,
+        mut mergeable_transactions: Vec<(Address, usize, Vec<(usize, RecoveredTx<E>)>)>,
+        merging_data: &[MergeableOrderWithOrigin],
+        mut applied_txs: HashSet<TxHash>,
+        gas_limit: u64,
+        gas_used: &mut u64,
+        all_transactions: &mut Vec<RecoveredTx<E>>,
+        appended_blob_order_indices: &mut Vec<(usize, usize)>,
+        blob_versioned_hashes: &mut Vec<B256>,
+    ) -> Result<HashMap<Address, U256>, ValidationApiError>
+    where
+        DB: Database + DatabaseRef + std::fmt::Debug + 'a,
+        <DB as Database>::Error: Send + Sync + 'static,
+        <DB as DatabaseRef>::Error: Send + Sync + 'static,
+        ValidationApiError: From<<DB as DatabaseRef>::Error> + From<<DB as Database>::Error>,
+    {
+        let mut revenues = HashMap::new();
+
+        let mut current_balance = block_executor
+            .evm_mut()
+            .db_mut()
+            .basic_ref(beneficiary)?
+            .map_or(U256::ZERO, |info| info.balance);
+
+        // Append transactions by score until we run out of space
+        while let Some((_score, i)) = txs_by_score.pop() {
+            let (origin, original_index, txs) = std::mem::take(&mut mergeable_transactions[i]);
+            let order = &merging_data[original_index].order;
+            let reverting_txs = order.reverting_txs();
+            let dropping_txs = order.dropping_txs();
+
+            // Check for already applied transactions and try to drop them
+            let filtered_txs = txs
+                .into_iter()
+                .filter_map(|(i, tx)| {
+                    if !applied_txs.contains(tx.tx_hash()) {
+                        Some(Ok((i, tx)))
+                    } else if dropping_txs.contains(&i) {
+                        None
+                    } else {
+                        Some(Err(()))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>();
+
+            // Discard the bundle if any duplicates couldn't be dropped
+            let Ok(txs) = filtered_txs else {
+                continue;
+            };
+
+            let db = block_executor.evm_mut().db_mut();
+
+            let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
+                self.simulate_bundle(db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
+
+            if !bundle_is_valid || *gas_used + gas_used_in_bundle > gas_limit {
+                continue;
+            }
+
+            // Execute the transaction bundle
+
+            let mut total_value = U256::ZERO;
+
+            for (i, tx) in txs.into_iter() {
+                if !should_be_included[i] {
+                    continue;
+                }
+                *gas_used += block_executor.execute_transaction(tx.as_executable())?;
+
+                all_transactions.push(tx.clone());
+                applied_txs.insert(*tx.tx_hash());
+                // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
+                // Also store the versioned hash for validation
+                if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
+                    appended_blob_order_indices.push((original_index, i));
+                    blob_versioned_hashes.extend(versioned_hashes);
+                }
+            }
+            // Consider any balance changes on the beneficiary as tx value
+            let new_balance = block_executor
+                .evm_mut()
+                .db_mut()
+                .basic(beneficiary)?
+                .map_or(U256::ZERO, |info| info.balance);
+
+            total_value += new_balance.saturating_sub(current_balance);
+            current_balance = new_balance;
+
+            // Update the revenue for the bundle's origin
+            if !total_value.is_zero() {
+                revenues
+                    .entry(origin)
+                    .and_modify(|v| *v += total_value)
+                    .or_insert(total_value);
+            }
+        }
+        Ok(revenues)
     }
 
     /// Simulates a bundle.
