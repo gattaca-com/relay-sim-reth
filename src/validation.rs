@@ -667,7 +667,8 @@ where
             all_transactions.push(tx.clone());
         }
 
-        // We have to replace the state with something here, so we use a clone of the original DB.
+        // We use a read-only reference to the State<DB> as a Database.
+        // When simulating, we're going to wrap this with an in-memory DB.
         let end_of_block_state = &**block_executor.evm_mut().db_mut();
 
         let initial_balance = end_of_block_state
