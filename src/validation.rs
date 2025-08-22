@@ -559,12 +559,12 @@ where
         parent_hash: B256,
     ) -> Result<
         SealedHeader<<<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader>,
-        ValidationApiError,
+        GetParentError,
     > {
         let latest_header = self
             .provider
             .latest_header()?
-            .ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
+            .ok_or_else(|| GetParentError::MissingLatestBlock)?;
 
         let parent_header = if parent_hash == latest_header.hash() {
             latest_header
@@ -573,19 +573,31 @@ where
             let parent_header = self
                 .provider
                 .sealed_header_by_hash(parent_hash)?
-                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
+                .ok_or_else(|| GetParentError::MissingParentBlock)?;
 
             if latest_header
                 .number()
                 .saturating_sub(parent_header.number())
                 > self.validation_window
             {
-                return Err(ValidationApiError::BlockTooOld);
+                return Err(GetParentError::BlockTooOld);
             }
             parent_header
         };
         Ok(parent_header)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GetParentError {
+    #[error("missing latest block in database")]
+    MissingLatestBlock,
+    #[error("parent block not found")]
+    MissingParentBlock,
+    #[error("block is too old, outside validation window")]
+    BlockTooOld,
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
 }
 
 #[async_trait]
@@ -750,12 +762,8 @@ pub enum ValidationApiError {
     ParentHashMismatch(GotExpected<B256>),
     #[error("block hash mismatch: {_0}")]
     BlockHashMismatch(GotExpected<B256>),
-    #[error("missing latest block in database")]
-    MissingLatestBlock,
-    #[error("parent block not found")]
-    MissingParentBlock,
-    #[error("block is too old, outside validation window")]
-    BlockTooOld,
+    #[error("could not find parent block: {_0}")]
+    GetParent(#[from] GetParentError),
     #[error("could not verify proposer payment")]
     ProposerPayment,
     #[error("invalid blobs bundle")]
@@ -774,18 +782,6 @@ pub enum ValidationApiError {
     Payload(#[from] NewPayloadError),
     #[error("inclusion list not statisfied")]
     InclusionList,
-    #[error("failed to create EvmEnv for next block")]
-    NextEvmEnvFail,
-    #[error("failed to create builder for next block")]
-    NextBuilderFail,
-    #[error("failed to decode execution requests")]
-    ExecutionRequests,
-    #[error("could not find a proposer payment tx")]
-    MissingProposerPayment,
-    #[error("revenue allocation tx reverted")]
-    RevenueAllocationReverted,
-    #[error("proposer payment tx reverted")]
-    ProposerPaymentReverted,
 }
 
 impl From<ValidationApiError> for ErrorObject<'static> {
@@ -799,17 +795,9 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::ProposerPayment
             | ValidationApiError::InvalidBlobsBundle
             | ValidationApiError::InclusionList
-            | ValidationApiError::ExecutionRequests
-            | ValidationApiError::MissingProposerPayment
             | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
-            ValidationApiError::MissingLatestBlock
-            | ValidationApiError::MissingParentBlock
-            | ValidationApiError::BlockTooOld
-            | ValidationApiError::NextEvmEnvFail
-            | ValidationApiError::NextBuilderFail
-            | ValidationApiError::RevenueAllocationReverted
-            | ValidationApiError::ProposerPaymentReverted
+            ValidationApiError::GetParent(_)
             | ValidationApiError::Consensus(_)
             | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {

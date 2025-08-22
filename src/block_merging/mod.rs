@@ -37,13 +37,15 @@ use std::collections::HashSet;
 use std::collections::{BinaryHeap, HashMap};
 use tracing::info;
 
+use crate::block_merging::error::BlockMergingApiError;
 use crate::block_merging::types::{
     BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder,
     MergeableOrderWithOrigin, RecoveredBlockFor, RecoveredTx, SignedTx,
 };
-use crate::validation::{ValidationApi, ValidationApiError};
+use crate::validation::ValidationApi;
 
 mod api;
+mod error;
 pub(crate) mod types;
 
 impl<Provider, E> ValidationApi<Provider, E>
@@ -58,7 +60,7 @@ where
     async fn merge_block_v1(
         &self,
         request: BlockMergeRequestV1,
-    ) -> Result<BlockMergeResponseV1, ValidationApiError> {
+    ) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
         info!(target: "rpc::relay", "Merging block v1");
 
         let block: alloy_consensus::Block<SignedTx<E>> = request
@@ -79,12 +81,12 @@ where
         // Check that block has proposer payment, otherwise reject it.
         // Also remove proposer payment, we'll later add our own
         let Some(payment_tx) = transactions.pop() else {
-            return Err(ValidationApiError::MissingProposerPayment);
+            return Err(BlockMergingApiError::MissingProposerPayment);
         };
         if payment_tx.value() != request.original_value
             || payment_tx.to() != Some(proposer_fee_recipient)
         {
-            return Err(ValidationApiError::ProposerPayment);
+            return Err(BlockMergingApiError::InvalidProposerPayment);
         }
 
         // Leave some gas for the final revenue distribution call
@@ -122,7 +124,7 @@ where
         let evm_env = self
             .evm_config
             .next_evm_env(&parent_header, &new_block_attrs)
-            .or(Err(ValidationApiError::NextEvmEnvFail))?;
+            .or(Err(BlockMergingApiError::NextEvmEnvFail))?;
 
         let evm = self.evm_config.evm_with_env(&mut state_db, evm_env.clone());
         let ctx = self
@@ -231,7 +233,7 @@ where
             &signed_disperse_tx_arr,
         );
         if !is_valid {
-            return Err(ValidationApiError::RevenueAllocationReverted);
+            return Err(BlockMergingApiError::RevenueAllocationReverted);
         }
 
         let [(_, signed_disperse_tx)] = signed_disperse_tx_arr;
@@ -262,7 +264,7 @@ where
             &signed_proposer_payment_tx_arr,
         );
         if !is_valid {
-            return Err(ValidationApiError::RevenueAllocationReverted);
+            return Err(BlockMergingApiError::ProposerPaymentReverted);
         }
 
         let [(_, signed_proposer_payment_tx)] = signed_proposer_payment_tx_arr;
@@ -293,7 +295,7 @@ where
         };
         let execution_requests: ExecutionRequestsV4 = requests
             .try_into()
-            .or(Err(ValidationApiError::ExecutionRequests))?;
+            .or(Err(BlockMergingApiError::ExecutionRequests))?;
 
         if self.validate_merged_blocks {
             let gas_used = execution_payload.payload_inner.payload_inner.gas_used;
@@ -339,7 +341,7 @@ where
         Ok(response)
     }
 
-    fn sign_transaction(&self, tx: TxEip1559) -> Result<RecoveredTx<E>, ValidationApiError> {
+    fn sign_transaction(&self, tx: TxEip1559) -> Result<RecoveredTx<E>, BlockMergingApiError> {
         let signature = self
             .merger_signer
             .sign_hash_sync(&tx.signature_hash())
@@ -365,7 +367,7 @@ where
             <<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
         >,
         old_header: Header,
-    ) -> Result<(RecoveredBlockFor<E>, Requests), ValidationApiError>
+    ) -> Result<(RecoveredBlockFor<E>, Requests), BlockMergingApiError>
     where
         DB: Database + core::fmt::Debug + 'a,
         DB::Error: Send + Sync + 'static,
@@ -616,13 +618,13 @@ pub(crate) fn score_orders<E, DBRef>(
         BinaryHeap<(U256, usize)>,
         Vec<(Address, usize, Vec<(usize, RecoveredTx<E>)>)>,
     ),
-    ValidationApiError,
+    BlockMergingApiError,
 >
 where
     E: ConfigureEvm,
     DBRef: DatabaseRef + core::fmt::Debug,
     DBRef::Error: Send + Sync + 'static,
-    ValidationApiError: From<DBRef::Error>,
+    BlockMergingApiError: From<DBRef::Error>,
 {
     let initial_balance = end_of_block_state
         .basic_ref(beneficiary)?
@@ -694,13 +696,13 @@ pub(crate) fn append_greedily_until_gas_limit<'a, E, DB>(
     all_transactions: &mut Vec<RecoveredTx<E>>,
     appended_blob_order_indices: &mut Vec<(usize, usize)>,
     blob_versioned_hashes: &mut Vec<B256>,
-) -> Result<HashMap<Address, U256>, ValidationApiError>
+) -> Result<HashMap<Address, U256>, BlockMergingApiError>
 where
     E: ConfigureEvm,
     DB: Database + DatabaseRef + std::fmt::Debug + 'a,
     <DB as Database>::Error: Send + Sync + 'static,
     <DB as DatabaseRef>::Error: Send + Sync + 'static,
-    ValidationApiError: From<<DB as DatabaseRef>::Error> + From<<DB as Database>::Error>,
+    BlockMergingApiError: From<<DB as DatabaseRef>::Error> + From<<DB as Database>::Error>,
 {
     let mut revenues = HashMap::new();
 
