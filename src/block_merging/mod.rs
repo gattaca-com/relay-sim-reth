@@ -189,68 +189,20 @@ impl BlockMergingApi {
                 beneficiary,
             );
 
-            let calldata = encode_disperse_eth_calldata(&updated_revenues);
-
-            // Get the chain ID from the configured provider
-            let chain_id = self.validation.provider.chain_spec().chain_id();
-            let signer = &self.merger_signer;
-            let signer_address = signer.address();
-
-            let nonce = block_executor.evm_mut().db_mut().basic(signer_address)?.map_or(0, |info| info.nonce) + 1;
-
-            let disperse_tx = TxEip1559 {
-                chain_id,
-                nonce,
-                // TODO: compute proper gas limit
-                gas_limit: max_distribution_gas,
-                max_fee_per_gas: block_base_fee_per_gas.into(),
-                max_priority_fee_per_gas: 0,
-                to: self.distribution_contract.into(),
-                value: distributed_value,
-                access_list: Default::default(),
-                input: calldata.into(),
-            };
-
-            let signed_disperse_tx = sign_transaction(&self.merger_signer, disperse_tx)?;
-            let mut is_valid = false;
-
-            // Execute the disperse transaction
-            block_executor.execute_transaction_with_result_closure(&signed_disperse_tx, |result| {
-                is_valid = result.is_success()
-            })?;
-            all_transactions.push(signed_disperse_tx);
-
-            if !is_valid {
-                return Err(BlockMergingApiError::RevenueAllocationReverted);
-            }
-
-            // Add proposer payment tx
-            let proposer_payment_tx = TxEip1559 {
-                chain_id,
-                nonce: nonce + 1,
-                gas_limit: payment_tx.gas_limit(),
-                max_fee_per_gas: block_base_fee_per_gas.into(),
-                max_priority_fee_per_gas: 0,
-                to: proposer_fee_recipient.into(),
-                value: proposer_value,
-                access_list: Default::default(),
-                input: Default::default(),
-            };
-
-            let signed_proposer_payment_tx = sign_transaction(&self.merger_signer, proposer_payment_tx)?;
-            let mut is_valid = false;
-
-            // Execute the proposer payment transaction
-            block_executor.execute_transaction_with_result_closure(&signed_proposer_payment_tx, |result| {
-                is_valid = result.is_success()
-            })?;
-
-            all_transactions.push(signed_proposer_payment_tx);
-
-            let chain_spec = self.validation.provider.chain_spec();
+            self.append_payment_txs(
+                &mut block_executor,
+                &updated_revenues,
+                distributed_value,
+                &mut all_transactions,
+                max_distribution_gas,
+                block_base_fee_per_gas.into(),
+                payment_tx.gas_limit(),
+                proposer_fee_recipient,
+                proposer_value,
+            )?;
 
             let (new_block, requests) = assemble_block(
-                &chain_spec,
+                &validation.provider.chain_spec(),
                 block_executor,
                 &state_provider,
                 all_transactions,
@@ -312,6 +264,89 @@ impl BlockMergingApi {
         }
 
         Ok(response)
+    }
+
+    fn append_payment_txs<'a, DB>(
+        &self,
+        block_executor: &mut impl BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
+        updated_revenues: &HashMap<Address, U256>,
+        distributed_value: U256,
+        all_transactions: &mut Vec<RecoveredTx>,
+        distribution_gas_limit: u64,
+        block_base_fee_per_gas: u128,
+        payment_tx_gas_limit: u64,
+        proposer_fee_recipient: Address,
+        proposer_value: U256,
+    ) -> Result<(), BlockMergingApiError>
+    where
+        DB: Database + std::fmt::Debug + 'a,
+        DB::Error: Send + Sync + 'static,
+        BlockMergingApiError: From<DB::Error>,
+    {
+        let calldata = encode_disperse_eth_calldata(updated_revenues);
+
+        // Get the chain ID from the configured provider
+        let chain_id = self.validation.provider.chain_spec().chain_id();
+
+        // Get the chain ID from the configured provider
+        let signer = &self.merger_signer;
+        let signer_address = signer.address();
+
+        let nonce = block_executor.evm_mut().db_mut().basic(signer_address)?.map_or(0, |info| info.nonce) + 1;
+
+        let disperse_tx = TxEip1559 {
+            chain_id,
+            nonce,
+            // TODO: compute proper gas limit
+            gas_limit: distribution_gas_limit,
+            max_fee_per_gas: block_base_fee_per_gas,
+            max_priority_fee_per_gas: 0,
+            to: self.distribution_contract.into(),
+            value: distributed_value,
+            access_list: Default::default(),
+            input: calldata.into(),
+        };
+
+        let signed_disperse_tx = sign_transaction(&self.merger_signer, disperse_tx)?;
+        let mut is_valid = false;
+
+        // Execute the disperse transaction
+        block_executor
+            .execute_transaction_with_result_closure(&signed_disperse_tx, |result| is_valid = result.is_success())?;
+        all_transactions.push(signed_disperse_tx);
+
+        if !is_valid {
+            return Err(BlockMergingApiError::RevenueAllocationReverted);
+        }
+
+        // Add proposer payment tx
+        let proposer_payment_tx = TxEip1559 {
+            chain_id,
+            nonce: nonce + 1,
+            gas_limit: payment_tx_gas_limit,
+            max_fee_per_gas: block_base_fee_per_gas,
+            max_priority_fee_per_gas: 0,
+            to: proposer_fee_recipient.into(),
+            value: proposer_value,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+
+        let signed_proposer_payment_tx = sign_transaction(&self.merger_signer, proposer_payment_tx)?;
+        let mut is_valid = false;
+
+        // Execute the proposer payment transaction
+        block_executor.execute_transaction_with_result_closure(&signed_proposer_payment_tx, |result| {
+            is_valid = result.is_success()
+        })?;
+
+        if !is_valid {
+            return Err(BlockMergingApiError::ProposerPaymentReverted);
+        }
+
+        all_transactions.push(signed_proposer_payment_tx);
+
+        Ok(())
     }
 }
 
