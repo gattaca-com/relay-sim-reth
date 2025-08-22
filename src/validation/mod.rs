@@ -1,5 +1,5 @@
 pub(crate) mod error;
-mod types;
+pub(crate) mod types;
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
