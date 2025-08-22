@@ -46,7 +46,7 @@ use crate::block_merging::{
     error::BlockMergingApiError,
     types::{
         BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder, MergeableOrderWithOrigin,
-        RecoveredBlockFor, RecoveredTx, SignedTx,
+        RecoveredTx, SignedTx,
     },
 };
 
@@ -309,7 +309,7 @@ impl BlockMergingApi {
         Ok(response)
     }
 
-    fn sign_transaction(&self, tx: TxEip1559) -> Result<Recovered<SignedTx<EthEvmConfig>>, BlockMergingApiError> {
+    fn sign_transaction(&self, tx: TxEip1559) -> Result<RecoveredTx, BlockMergingApiError> {
         let signature =
             self.merger_signer.sign_hash_sync(&tx.signature_hash()).expect("signer is local and private key is valid");
         let signed_tx = tx.into_signed(signature);
@@ -317,8 +317,7 @@ impl BlockMergingApi {
         // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
         let mut buf = vec![];
         signed_tx.encode_2718(&mut buf);
-        let signed_tx =
-            SignedTx::<EthEvmConfig>::decode_2718(&mut buf.as_slice()).expect("we just encoded it with encode_2718");
+        let signed_tx = SignedTx::decode_2718(&mut buf.as_slice()).expect("we just encoded it with encode_2718");
         let recovered_signed_tx = Recovered::new_unchecked(signed_tx, self.merger_signer.address());
         Ok(recovered_signed_tx)
     }
@@ -327,13 +326,13 @@ impl BlockMergingApi {
         &self,
         block_executor: impl BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
         state_provider: &dyn StateProvider,
-        recovered_txs: Vec<RecoveredTx<EthEvmConfig>>,
+        recovered_txs: Vec<RecoveredTx>,
         withdrawals_opt: Option<Withdrawals>,
         parent_header: reth_primitives::SealedHeader<
             <<EthEvmConfig as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
         >,
         old_header: Header,
-    ) -> Result<(RecoveredBlockFor<EthEvmConfig>, Requests), BlockMergingApiError>
+    ) -> Result<(RecoveredBlock<Block>, Requests), BlockMergingApiError>
     where
         DB: Database + core::fmt::Debug + 'a,
         DB::Error: Send + Sync + 'static,
@@ -427,14 +426,14 @@ impl BlockMergingApi {
 pub(crate) fn recover_transactions(
     order: &MergeableOrder,
     applied_txs: &HashSet<TxHash>,
-) -> Option<Vec<(usize, RecoveredTx<EthEvmConfig>)>> {
+) -> Option<Vec<(usize, RecoveredTx)>> {
     order
         .transactions()
         .iter()
         .enumerate()
         .filter_map(|(i, b)| {
             let mut buf = b.as_ref();
-            let Ok(tx) = <SignedTx<EthEvmConfig> as Decodable2718>::decode_2718(&mut buf) else {
+            let Ok(tx) = <SignedTx as Decodable2718>::decode_2718(&mut buf) else {
                 return Some(Err(()));
             };
             if !buf.is_empty() {
@@ -543,10 +542,7 @@ pub(crate) fn score_orders<DBRef>(
     applied_txs: &HashSet<TxHash>,
     gas_limit: u64,
     gas_used: u64,
-) -> Result<
-    (BinaryHeap<(U256, usize)>, Vec<(Address, usize, Vec<(usize, RecoveredTx<EthEvmConfig>)>)>),
-    BlockMergingApiError,
->
+) -> Result<(BinaryHeap<(U256, usize)>, Vec<(Address, usize, Vec<(usize, RecoveredTx)>)>), BlockMergingApiError>
 where
     DBRef: DatabaseRef + core::fmt::Debug,
     DBRef::Error: Send + Sync + 'static,
@@ -600,12 +596,12 @@ pub(crate) fn append_greedily_until_gas_limit<'a, DB>(
     beneficiary: Address,
     evm_env: EvmEnvFor<EthEvmConfig>,
     mut txs_by_score: BinaryHeap<(U256, usize)>,
-    mut mergeable_transactions: Vec<(Address, usize, Vec<(usize, RecoveredTx<EthEvmConfig>)>)>,
+    mut mergeable_transactions: Vec<(Address, usize, Vec<(usize, RecoveredTx)>)>,
     merging_data: &[MergeableOrderWithOrigin],
     mut applied_txs: HashSet<TxHash>,
     gas_limit: u64,
     gas_used: &mut u64,
-    all_transactions: &mut Vec<RecoveredTx<EthEvmConfig>>,
+    all_transactions: &mut Vec<RecoveredTx>,
     appended_blob_order_indices: &mut Vec<(usize, usize)>,
     blob_versioned_hashes: &mut Vec<B256>,
 ) -> Result<HashMap<Address, U256>, BlockMergingApiError>
@@ -697,7 +693,7 @@ pub(crate) fn simulate_order<DBRef>(
     evm_env: EvmEnvFor<EthEvmConfig>,
     reverting_txs: &[usize],
     dropping_txs: &[usize],
-    txs: &[(usize, Recovered<SignedTx<EthEvmConfig>>)],
+    txs: &[(usize, RecoveredTx)],
 ) -> (bool, u64, Vec<bool>, CacheDB<DBRef>)
 where
     DBRef: DatabaseRef + core::fmt::Debug,

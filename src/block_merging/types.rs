@@ -1,17 +1,15 @@
-use alloy_consensus::Block;
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use bytes::Bytes;
-use reth_ethereum::primitives::RecoveredBlock;
+use reth_ethereum::evm::EthEvmConfig;
 use reth_node_builder::ConfigureEvm;
 use reth_primitives::{NodePrimitives, Recovered};
 use revm_primitives::{Address, U256, address};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-pub(crate) type SignedTx<E> = <<E as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx;
-pub(crate) type RecoveredBlockFor<E> = RecoveredBlock<Block<SignedTx<E>>>;
-pub(crate) type RecoveredTx<E> = Recovered<SignedTx<E>>;
+pub(crate) type SignedTx = <<EthEvmConfig as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx;
+pub(crate) type RecoveredTx = Recovered<SignedTx>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BlockMergingConfig {
