@@ -103,7 +103,7 @@ impl BlockMergingApi {
 
         let parent_hash = header.parent_hash;
 
-        let (response, block_hash, blob_versioned_hashes) = {
+        let (response, block_hash, blob_versioned_hashes, request_cache) = {
             let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
 
             let mut request_cache = validation.cached_reads(parent_hash).await;
@@ -272,8 +272,10 @@ impl BlockMergingApi {
                 appended_blob_order_indices,
                 proposer_value,
             };
-            (response, block_hash, blob_versioned_hashes)
+            (response, block_hash, blob_versioned_hashes, request_cache)
         };
+
+        self.validation.update_cached_reads(parent_hash, request_cache).await;
 
         if self.validate_merged_blocks {
             let gas_used = response.execution_payload.payload_inner.payload_inner.gas_used;
