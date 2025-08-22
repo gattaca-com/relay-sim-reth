@@ -152,7 +152,7 @@ impl BlockMergingApi {
             // When simulating, we're going to wrap this with an in-memory DB.
             let end_of_block_state = &**block_executor.evm_mut().db_mut();
 
-            let (txs_by_score, mergeable_transactions) = score_orders(
+            let scored_orders = score_orders(
                 evm_config,
                 end_of_block_state,
                 beneficiary,
@@ -168,9 +168,7 @@ impl BlockMergingApi {
                 &mut block_executor,
                 beneficiary,
                 evm_env.clone(),
-                txs_by_score,
-                mergeable_transactions,
-                &request.merging_data,
+                scored_orders,
                 applied_txs,
                 gas_limit,
                 &mut gas_used,
@@ -533,16 +531,61 @@ pub(crate) fn prepare_revenues(
     (proposer_value, distributed_value, updated_revenues)
 }
 
-pub(crate) fn score_orders<DBRef>(
+/// Keeps a list of recovered transactions per bundle, and an index by score
+struct ScoredOrders<'a> {
+    original_orders: &'a [MergeableOrderWithOrigin],
+    scored_orders: Vec<(usize, Vec<(usize, RecoveredTx)>)>,
+    orders_by_score: BinaryHeap<(U256, usize)>,
+}
+
+impl<'a> ScoredOrders<'a> {
+    /// Returns a new instance of `ScoredOrders` from the given original orders and a scoring function.
+    /// The function receives a reference to an order and may return a score and a list of recovered transactions.
+    fn from_orders_with_scorer<F, Error>(
+        original_orders: &'a [MergeableOrderWithOrigin],
+        scorer: F,
+    ) -> Result<Self, Error>
+    where
+        F: Fn(&MergeableOrderWithOrigin) -> Result<Option<(U256, Vec<(usize, RecoveredTx)>)>, Error>,
+    {
+        let mut scored_orders = Vec::with_capacity(original_orders.len());
+        let mut orders_by_score = BinaryHeap::with_capacity(original_orders.len());
+        for (i, order) in original_orders.iter().enumerate() {
+            if let Some((score, recovered_txs)) = scorer(order)? {
+                orders_by_score.push((score, scored_orders.len()));
+                scored_orders.push((i, recovered_txs));
+            }
+        }
+        Ok(Self { original_orders, scored_orders, orders_by_score })
+    }
+
+    /// Returns an iterator over the scored orders by score, in descending order.
+    fn iter_by_score(mut self) -> impl Iterator<Item = ScoredOrder<'a>> {
+        std::iter::from_fn(move || {
+            let (_score, scored_orders_index) = self.orders_by_score.pop()?;
+            let (original_index, txs) = std::mem::take(&mut self.scored_orders[scored_orders_index]);
+            let mergeable_order = &self.original_orders[original_index];
+            Some(ScoredOrder { original_index, mergeable_order, recovered_txs: txs })
+        })
+    }
+}
+
+struct ScoredOrder<'a> {
+    original_index: usize,
+    mergeable_order: &'a MergeableOrderWithOrigin,
+    recovered_txs: Vec<(usize, RecoveredTx)>,
+}
+
+fn score_orders<'a, DBRef>(
     evm_config: &EthEvmConfig,
     end_of_block_state: &DBRef,
     beneficiary: Address,
-    mergeable_orders: &[MergeableOrderWithOrigin],
+    mergeable_orders: &'a [MergeableOrderWithOrigin],
     evm_env: EvmEnvFor<EthEvmConfig>,
     applied_txs: &HashSet<TxHash>,
     gas_limit: u64,
     gas_used: u64,
-) -> Result<(BinaryHeap<(U256, usize)>, Vec<(usize, Vec<(usize, RecoveredTx)>)>), BlockMergingApiError>
+) -> Result<ScoredOrders<'a>, BlockMergingApiError>
 where
     DBRef: DatabaseRef + core::fmt::Debug,
     DBRef::Error: Send + Sync + 'static,
@@ -550,16 +593,12 @@ where
 {
     let initial_balance = end_of_block_state.basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
-    // Keep a list of valid transactions and an index by score
-    let mut mergeable_transactions = Vec::with_capacity(mergeable_orders.len());
-    let mut txs_by_score = BinaryHeap::with_capacity(mergeable_transactions.len());
-
-    // Simulate orders, ordering them by expected value, discarding invalid ones
-    for (original_index, (_origin, order)) in mergeable_orders.iter().map(|mb| (mb.origin, &mb.order)).enumerate() {
+    ScoredOrders::from_orders_with_scorer(mergeable_orders, |order_with_origin| -> Result<_, BlockMergingApiError> {
+        let order = &order_with_origin.order;
+        // The mergeable transactions should come from already validated payloads
+        // But in case decoding fails, we just skip the bundle
         let Some(txs) = recover_transactions(order, applied_txs) else {
-            // The mergeable transactions should come from already validated payloads
-            // But in case decoding fails, we just skip the bundle
-            continue;
+            return Ok(None);
         };
 
         let reverting_txs = order.reverting_txs();
@@ -569,7 +608,7 @@ where
             simulate_order(evm_config, end_of_block_state, evm_env.clone(), reverting_txs, dropping_txs, &txs);
 
         if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
-            continue;
+            return Ok(None);
         }
 
         // Consider any balance changes on the beneficiary as tx value
@@ -577,27 +616,23 @@ where
 
         let total_value = new_balance.saturating_sub(initial_balance);
 
-        // Keep the bundle for further processing
-        if !total_value.is_zero() {
-            let index = mergeable_transactions.len();
-            // Use the tx's value as its score
-            // We could use other heuristics here
-            let score = total_value;
-            txs_by_score.push((score, index));
-            mergeable_transactions.push((original_index, txs));
+        // If the total value is zero, discard the bundle
+        if total_value.is_zero() {
+            return Ok(None);
         }
-    }
-    Ok((txs_by_score, mergeable_transactions))
+        // Use the tx's value as its score
+        // We could use other heuristics here
+        let score = total_value;
+        Ok(Some((score, txs)))
+    })
 }
 
-pub(crate) fn append_greedily_until_gas_limit<'a, DB>(
+fn append_greedily_until_gas_limit<'a, DB>(
     evm_config: &EthEvmConfig,
     block_executor: &mut impl BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
     beneficiary: Address,
     evm_env: EvmEnvFor<EthEvmConfig>,
-    mut txs_by_score: BinaryHeap<(U256, usize)>,
-    mut mergeable_transactions: Vec<(usize, Vec<(usize, RecoveredTx)>)>,
-    merging_data: &[MergeableOrderWithOrigin],
+    scored_orders: ScoredOrders,
     mut applied_txs: HashSet<TxHash>,
     gas_limit: u64,
     gas_used: &mut u64,
@@ -617,15 +652,15 @@ where
         block_executor.evm_mut().db_mut().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
     // Append transactions by score until we run out of space
-    while let Some((_score, i)) = txs_by_score.pop() {
-        let (original_index, txs) = std::mem::take(&mut mergeable_transactions[i]);
-        let order = &merging_data[original_index].order;
-        let origin = merging_data[original_index].origin;
+    for scored_order in scored_orders.iter_by_score() {
+        let order = &scored_order.mergeable_order.order;
+        let origin = scored_order.mergeable_order.origin;
         let reverting_txs = order.reverting_txs();
         let dropping_txs = order.dropping_txs();
 
         // Check for already applied transactions and try to drop them
-        let filtered_txs = txs
+        let filtered_txs = scored_order
+            .recovered_txs
             .into_iter()
             .filter_map(|(i, tx)| {
                 if !applied_txs.contains(tx.tx_hash()) {
@@ -667,7 +702,7 @@ where
             // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
             // Also store the versioned hash for validation
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-                appended_blob_order_indices.push((original_index, i));
+                appended_blob_order_indices.push((scored_order.original_index, i));
                 blob_versioned_hashes.extend(versioned_hashes);
             }
         }
