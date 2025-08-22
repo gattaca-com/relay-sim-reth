@@ -1,6 +1,4 @@
-//#![warn(unused_crate_dependencies)]
-
-pub(crate) mod block_merging;
+mod block_merging;
 mod inclusion;
 mod state_recorder;
 mod validation;
@@ -8,25 +6,22 @@ mod validation;
 use std::sync::Arc;
 
 use clap::Parser;
-use inclusion::inclusion_producer;
-use jsonrpsee::{
-    PendingSubscriptionSink, SubscriptionMessage,
-    core::{RpcResult, SubscriptionResult},
-    proc_macros::rpc,
-};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_ethereum::{
     cli::{chainspec::EthereumChainSpecParser, interface::Cli},
     node::{EthereumEngineValidator, EthereumNode, node::EthereumAddOns},
-    rpc::{api::eth::RpcNodeCore, eth::error::RpcPoolError},
+    rpc::api::eth::RpcNodeCore,
 };
 use reth_node_builder::FullNodeComponents;
 use revm_primitives::{Address, Bytes};
-use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
 
 use crate::{
     block_merging::{BlockMergingApi, BlockMergingApiServer, types::BlockMergingConfig},
+    inclusion::{
+        api::{InclusionExt, InclusionExtApiServer},
+        inclusion_producer::inclusion_producer,
+    },
     state_recorder::run_block_state_recorder,
     validation::BlockSubmissionValidationApiServer,
 };
@@ -53,22 +48,6 @@ fn main() {
                         return Ok(());
                     }
 
-                    // Handle to the transaction pool.
-                    let pool = ctx.pool().clone();
-
-                    // Block commit update stream.
-                    let notifications = ctx.provider().canonical_state_stream();
-
-                    // List publisher
-                    let (publisher, published) = tokio::sync::watch::channel(None::<Vec<Bytes>>);
-
-                    tokio::spawn(inclusion_producer(pool, notifications, publisher));
-
-                    let ext = InclusionExt { published };
-
-                    // now we merge our extension namespace into all configured transports
-                    ctx.modules.merge_configured(ext.into_rpc())?;
-
                     let validation_api = ValidationApi::new(
                         ctx.node().provider.clone(),
                         Arc::new(ctx.node().consensus().clone()),
@@ -78,11 +57,28 @@ fn main() {
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
                     if args.enable_block_merging_ext {
-                        let block_merging_api = BlockMergingApi::new(validation_api.clone(), args.into());
+                        let block_merging_api = BlockMergingApi::new(validation_api.clone(), args.clone().into());
                         ctx.modules.merge_configured(block_merging_api.into_rpc())?;
                     }
 
                     ctx.modules.merge_configured(validation_api.into_rpc())?;
+
+                    if args.enable_inclusion_ext {
+                        // Handle to the transaction pool.
+                        let pool = ctx.pool().clone();
+
+                        // Block commit update stream.
+                        let notifications = ctx.provider().canonical_state_stream();
+
+                        // List publisher
+                        let (publisher, published) = tokio::sync::watch::channel(None::<Vec<Bytes>>);
+
+                        tokio::spawn(inclusion_producer(pool, notifications, publisher));
+
+                        let ext = InclusionExt { published };
+                        // now we merge our extension namespace into all configured transports
+                        ctx.modules.merge_configured(ext.into_rpc())?;
+                    }
 
                     Ok(())
                 })
@@ -94,10 +90,10 @@ fn main() {
         .unwrap();
 }
 
-/// Our custom cli args extension that adds one flag to reth default CLI.
+/// Our custom cli args extension that adds flags to reth default CLI.
 #[derive(Debug, Clone, Default, clap::Args)]
 struct CliExt {
-    /// CLI flag to enable the txpool extension namespace
+    /// CLI flag to enable the validation extension and other enabled ones
     #[arg(long)]
     pub enable_ext: bool,
 
@@ -109,6 +105,9 @@ struct CliExt {
 
     #[arg(long, default_value = "/root/blocks")]
     pub record_blocks_dir: String,
+
+    #[arg(long, default_value_t = true)]
+    pub enable_inclusion_ext: bool,
 
     #[arg(long, default_value_t = true)]
     pub enable_block_merging_ext: bool,
@@ -135,72 +134,5 @@ impl From<CliExt> for BlockMergingConfig {
             distribution_contract: cli.distribution_contract,
             validate_merged_blocks: cli.validate_merged_blocks,
         }
-    }
-}
-
-/// trait interface for a custom rpc namespace: `relay`
-///
-/// This defines an additional namespace where all methods are configured as trait functions.
-#[rpc(server, namespace = "relay")]
-pub trait InclusionExtApi {
-    /// Returns the current inclusion list.
-    #[method(name = "inclusionList")]
-    fn inclusion_list(&self) -> RpcResult<Vec<Bytes>>;
-
-    /// Creates a subscription that returns the inclusion list when it is published.
-    #[subscription(name = "subscribeInclusionList", item = usize)]
-    fn subscribe_inclusion_list(&self) -> SubscriptionResult;
-}
-
-/// The type that implements the `inclusion` rpc namespace trait
-pub struct InclusionExt {
-    published: Receiver<Option<Vec<Bytes>>>,
-}
-
-impl InclusionExtApiServer for InclusionExt {
-    fn inclusion_list(&self) -> RpcResult<Vec<Bytes>> {
-        match self.published.borrow().clone() {
-            Some(list) => RpcResult::Ok(list),
-            None => RpcResult::Err(RpcPoolError::Other("list not ready".into()).into()),
-        }
-    }
-
-    fn subscribe_inclusion_list(&self, pending_subscription_sink: PendingSubscriptionSink) -> SubscriptionResult {
-        let mut published = self.published.clone();
-        tokio::spawn(async move {
-            let sink = match pending_subscription_sink.accept().await {
-                Ok(sink) => sink,
-                Err(e) => {
-                    println!("failed to accept subscription: {e}");
-                    return;
-                }
-            };
-
-            loop {
-                match published.changed().await {
-                    Ok(_) => {
-                        let msg =
-                            published.borrow_and_update().clone().and_then(|list| {
-                                match SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &list) {
-                                    Ok(msg) => Some(msg),
-                                    Err(e) => {
-                                        tracing::error!(error=?e, "could not serialize inclusion list");
-                                        None
-                                    }
-                                }
-                            });
-                        if let Some(msg) = msg {
-                            let _ = sink.send(msg).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error=?e, "list publisher closed - exiting");
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(())
     }
 }

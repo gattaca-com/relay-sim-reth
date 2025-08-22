@@ -19,8 +19,8 @@ pub async fn inclusion_producer<P: TransactionPool>(
     mut notifications: CanonStateNotificationStream,
     published: Sender<Option<Vec<Bytes>>>,
 ) {
-    // Maintain 2 collections - 1 ordered by Inclusion List score, with `TxHash` as value. The other mapping `TxHash` to
-    // tx.
+    // Maintain 2 collections - 1 ordered by Inclusion List score, with `TxHash` as value. The other
+    // mapping `TxHash` to tx.
     let mut ordered_txs = BTreeSet::new();
     let mut pending_txs = HashMap::new();
 

@@ -3,13 +3,7 @@ use std::sync::Arc;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use jsonrpsee::{proc_macros::rpc, types::ErrorObject};
-use reth_ethereum::{
-    node::core::rpc::result::internal_rpc_err,
-    provider::ChainSpecProvider,
-    storage::{BlockReaderIdExt, StateProviderFactory},
-};
-use reth_node_builder::ConfigureEvm;
-use reth_primitives::{EthereumHardforks, NodePrimitives};
+use reth_ethereum::node::core::rpc::result::internal_rpc_err;
 use revm_primitives::Address;
 use tokio::sync::oneshot;
 
@@ -28,17 +22,14 @@ pub trait BlockMergingApi {
 
 /// The type that implements the block merging rpc trait
 #[derive(Clone, Debug, derive_more::Deref)]
-pub(crate) struct BlockMergingApi<Provider, E: ConfigureEvm> {
+pub(crate) struct BlockMergingApi {
     #[deref]
-    inner: Arc<BlockMergingApiInner<Provider, E>>,
+    inner: Arc<BlockMergingApiInner>,
 }
 
-impl<Provider, E> BlockMergingApi<Provider, E>
-where
-    E: ConfigureEvm,
-{
+impl BlockMergingApi {
     /// Create a new instance of the [`BlockMergingApi`]
-    pub fn new(validation: ValidationApi<Provider, E>, config: BlockMergingConfig) -> Self {
+    pub fn new(validation: ValidationApi, config: BlockMergingConfig) -> Self {
         let BlockMergingConfig { .. } = config;
 
         let merger_signer = config.merger_private_key.parse().expect("Failed to parse merger private key");
@@ -56,9 +47,9 @@ where
     }
 }
 
-pub(crate) struct BlockMergingApiInner<Provider, E: ConfigureEvm> {
+pub(crate) struct BlockMergingApiInner {
     /// The validation API.
-    pub(crate) validation: ValidationApi<Provider, E>,
+    pub(crate) validation: ValidationApi,
     /// The address to send relay revenue to.
     pub(crate) relay_fee_recipient: Address,
     /// The signer to use for merging blocks. It will be used for signing the
@@ -73,22 +64,14 @@ pub(crate) struct BlockMergingApiInner<Provider, E: ConfigureEvm> {
     pub(crate) validate_merged_blocks: bool,
 }
 
-impl<Provider, E: ConfigureEvm> core::fmt::Debug for BlockMergingApiInner<Provider, E> {
+impl core::fmt::Debug for BlockMergingApiInner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BlockMergingApiInner").finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl<Provider, E> BlockMergingApiServer for BlockMergingApi<Provider, E>
-where
-    Provider: BlockReaderIdExt<Header = <E::Primitives as NodePrimitives>::BlockHeader>
-        + ChainSpecProvider<ChainSpec: EthereumHardforks>
-        + StateProviderFactory
-        + Clone
-        + 'static,
-    E: ConfigureEvm + 'static,
-{
+impl BlockMergingApiServer for BlockMergingApi {
     /// A Request to append mergeable transactions to a block.
     async fn merge_block_v1(&self, request: BlockMergeRequestV1) -> jsonrpsee::core::RpcResult<BlockMergeResponseV1> {
         let this = self.clone();

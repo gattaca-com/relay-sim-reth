@@ -6,7 +6,7 @@ use reth_ethereum::{
 };
 use reth_node_builder::NewPayloadError;
 
-use crate::validation::{GetParentError, ValidationApiError};
+use crate::validation::error::{GetParentError, ValidationApiError};
 
 /// Errors thrown by the block merging API.
 #[derive(Debug, thiserror::Error)]
