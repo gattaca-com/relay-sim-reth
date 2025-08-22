@@ -211,17 +211,18 @@ impl BlockMergingApi {
                 input: calldata.into(),
             };
 
-            let signed_disperse_tx_arr = [(0, sign_transaction(&self.merger_signer, disperse_tx)?)];
+            let signed_disperse_tx = sign_transaction(&self.merger_signer, disperse_tx)?;
+            let mut is_valid = false;
 
-            let db = block_executor.evm_mut().db_mut();
-            let (is_valid, _, _, _) =
-                simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_disperse_tx_arr);
+            // Execute the disperse transaction
+            block_executor.execute_transaction_with_result_closure(&signed_disperse_tx, |result| {
+                is_valid = result.is_success()
+            })?;
+            all_transactions.push(signed_disperse_tx);
+
             if !is_valid {
                 return Err(BlockMergingApiError::RevenueAllocationReverted);
             }
-
-            let [(_, signed_disperse_tx)] = signed_disperse_tx_arr;
-            all_transactions.push(signed_disperse_tx);
 
             // Add proposer payment tx
             let proposer_payment_tx = TxEip1559 {
@@ -236,16 +237,13 @@ impl BlockMergingApi {
                 input: Default::default(),
             };
 
-            let signed_proposer_payment_tx_arr = [(0, sign_transaction(&self.merger_signer, proposer_payment_tx)?)];
+            let signed_proposer_payment_tx = sign_transaction(&self.merger_signer, proposer_payment_tx)?;
+            let mut is_valid = false;
 
-            let db = block_executor.evm_mut().db_mut();
-            let (is_valid, _, _, _) =
-                simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_proposer_payment_tx_arr);
-            if !is_valid {
-                return Err(BlockMergingApiError::ProposerPaymentReverted);
-            }
-
-            let [(_, signed_proposer_payment_tx)] = signed_proposer_payment_tx_arr;
+            // Execute the proposer payment transaction
+            block_executor.execute_transaction_with_result_closure(&signed_proposer_payment_tx, |result| {
+                is_valid = result.is_success()
+            })?;
 
             all_transactions.push(signed_proposer_payment_tx);
 
