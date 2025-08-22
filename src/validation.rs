@@ -10,7 +10,6 @@ use alloy_rpc_types_engine::{
     BlobsBundleV1, CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
     PraguePayloadFields,
 };
-use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use bytes::Bytes;
 use core::fmt;
@@ -41,7 +40,7 @@ use reth_node_builder::{
 use reth_primitives::SealedHeader;
 use reth_tasks::TaskSpawner;
 use revm::{Database, database::State};
-use revm_primitives::{Address, B256, U256, address};
+use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{collections::HashSet, sync::Arc, time::Duration};
@@ -51,8 +50,6 @@ use tokio::{
     time,
 };
 use tracing::{info, warn};
-
-use crate::block_merging::types::DistributionConfig;
 
 /// The type that implements the `validation` rpc namespace trait
 #[derive(Clone, Debug, derive_more::Deref)]
@@ -82,17 +79,13 @@ where
         let ValidationApiConfig {
             blacklist_endpoint,
             validation_window,
-            merger_private_key,
-            relay_fee_recipient,
-            distribution_config,
-            distribution_contract,
-            validate_merged_blocks,
         } = config;
         let disallow = Arc::new(DashSet::new());
 
-        let merger_signer = merger_private_key
-            .parse()
-            .expect("Failed to parse merger private key");
+        // let merger_signer = block_merging_config
+        //     .merger_private_key
+        //     .parse()
+        //     .expect("Failed to parse merger private key");
 
         let inner = Arc::new(ValidationApiInner {
             provider,
@@ -104,11 +97,6 @@ where
             cached_state: Default::default(),
             task_spawner,
             metrics: Default::default(),
-            merger_signer,
-            relay_fee_recipient,
-            distribution_config,
-            distribution_contract,
-            validate_merged_blocks,
         });
 
         inner.metrics.disallow_size.set(inner.disallow.len() as f64);
@@ -682,28 +670,16 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     /// Set of disallowed addresses
     disallow: Arc<DashSet<Address>>,
     /// The maximum block distance - parent to latest - allowed for validation
-    pub(crate) validation_window: u64,
+    validation_window: u64,
     /// Cached state reads to avoid redundant disk I/O across multiple validation attempts
     /// targeting the same state. Stores a tuple of (`block_hash`, `cached_reads`) for the
     /// latest head block state. Uses async `RwLock` to safely handle concurrent validation
     /// requests.
-    pub(crate) cached_state: RwLock<(B256, CachedReads)>,
+    cached_state: RwLock<(B256, CachedReads)>,
     /// Task spawner for blocking operations
     pub(crate) task_spawner: Box<dyn TaskSpawner>,
     /// Validation metrics
     metrics: ValidationMetrics,
-    /// The address to send relay revenue to.
-    pub(crate) relay_fee_recipient: Address,
-    /// The signer to use for merging blocks. It will be used for signing the
-    /// revenue distribution and proposer payment transactions.
-    pub(crate) merger_signer: PrivateKeySigner,
-    /// The address of the contract used to distribute rewards.
-    /// It must have a `disperseEther(address[],uint256[])` function.
-    pub(crate) distribution_contract: Address,
-    /// Configuration for revenue distribution.
-    pub(crate) distribution_config: DistributionConfig,
-    /// Whether to validate merged blocks or not
-    pub(crate) validate_merged_blocks: bool,
 }
 
 impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
@@ -719,19 +695,6 @@ pub struct ValidationApiConfig {
     pub blacklist_endpoint: String,
     /// The maximum block distance - parent to latest - allowed for validation
     pub validation_window: u64,
-    /// Private key to use for merging blocks.
-    /// The address of this key will be used as the beneficiary for merged blocks,
-    /// and it will be used for signing the revenue distribution transaction.
-    pub merger_private_key: String,
-    /// The address to send relay revenue to.
-    pub relay_fee_recipient: Address,
-    /// Configuration for revenue distribution.
-    pub distribution_config: DistributionConfig,
-    /// The address of the contract used to distribute rewards.
-    /// It must have a `disperseEther(address[],uint256[])` function.
-    pub distribution_contract: Address,
-    /// Whether to validate merged blocks or not
-    pub validate_merged_blocks: bool,
 }
 
 /// Default validation blocks window of 3 blocks
@@ -742,15 +705,6 @@ impl Default for ValidationApiConfig {
         Self {
             blacklist_endpoint: Default::default(),
             validation_window: DEFAULT_VALIDATION_WINDOW,
-            merger_private_key: String::from(
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-            ),
-            relay_fee_recipient: address!("0x0000000000000000000000000000000000000000"),
-            distribution_config: DistributionConfig::default(),
-            // Address of `Disperse.app` contract
-            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
-            distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
-            validate_merged_blocks: true,
         }
     }
 }

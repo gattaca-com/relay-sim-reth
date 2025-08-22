@@ -20,7 +20,6 @@ use reth_ethereum::evm::primitives::block::{
 };
 use reth_ethereum::evm::primitives::execute::ExecutorTx;
 use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
-
 use reth_ethereum::evm::revm::database::StateProviderDatabase;
 use reth_ethereum::provider::ChainSpecProvider;
 use reth_ethereum::storage::{BlockReaderIdExt, StateProvider, StateProviderFactory};
@@ -42,13 +41,14 @@ use crate::block_merging::types::{
     BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder,
     MergeableOrderWithOrigin, RecoveredBlockFor, RecoveredTx, SignedTx,
 };
-use crate::validation::ValidationApi;
+
+pub(crate) use crate::block_merging::api::{BlockMergingApi, BlockMergingApiServer};
 
 mod api;
 mod error;
 pub(crate) mod types;
 
-impl<Provider, E> ValidationApi<Provider, E>
+impl<Provider, E> BlockMergingApi<Provider, E>
 where
     Provider: BlockReaderIdExt<Header = <E::Primitives as NodePrimitives>::BlockHeader>
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
@@ -62,6 +62,8 @@ where
         request: BlockMergeRequestV1,
     ) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
         info!(target: "rpc::relay", "Merging block v1");
+        let validation = &self.validation;
+        let evm_config = &validation.evm_config;
 
         let block: alloy_consensus::Block<SignedTx<E>> = request
             .execution_payload
@@ -110,27 +112,24 @@ where
 
         let parent_hash = header.parent_hash();
 
-        let state_provider = self.provider.state_by_block_hash(parent_hash)?;
+        let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
 
-        let mut request_cache = self.cached_reads(parent_hash).await;
+        let mut request_cache = validation.cached_reads(parent_hash).await;
 
         let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
 
         let mut state_db = State::builder().with_database_ref(&cached_db).build();
 
-        let parent_header = self.get_parent_header(parent_hash)?;
+        let parent_header = validation.get_parent_header(parent_hash)?;
 
         // Execute the base block
-        let evm_env = self
-            .evm_config
+        let evm_env = evm_config
             .next_evm_env(&parent_header, &new_block_attrs)
             .or(Err(BlockMergingApiError::NextEvmEnvFail))?;
 
-        let evm = self.evm_config.evm_with_env(&mut state_db, evm_env.clone());
-        let ctx = self
-            .evm_config
-            .context_for_next_block(&parent_header, new_block_attrs.clone());
-        let mut block_executor = self.evm_config.create_executor(evm, ctx);
+        let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
+        let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
+        let mut block_executor = evm_config.create_executor(evm, ctx);
 
         block_executor.apply_pre_execution_changes()?;
 
@@ -162,7 +161,7 @@ where
         let end_of_block_state = &**block_executor.evm_mut().db_mut();
 
         let (txs_by_score, mergeable_transactions) = score_orders(
-            &self.evm_config,
+            evm_config,
             end_of_block_state,
             beneficiary,
             &request.merging_data,
@@ -173,7 +172,7 @@ where
         )?;
 
         let revenues = append_greedily_until_gas_limit(
-            &self.evm_config,
+            evm_config,
             &mut block_executor,
             beneficiary,
             evm_env.clone(),
@@ -199,7 +198,7 @@ where
         let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
         // Get the chain ID from the configured provider
-        let chain_id = self.provider.chain_spec().chain_id();
+        let chain_id = self.validation.provider.chain_spec().chain_id();
 
         let nonce = block_executor
             .evm_mut()
@@ -225,7 +224,7 @@ where
 
         let db = block_executor.evm_mut().db_mut();
         let (is_valid, _, _, _) = simulate_order(
-            &self.evm_config,
+            evm_config,
             db,
             evm_env.clone(),
             &[],
@@ -256,7 +255,7 @@ where
 
         let db = block_executor.evm_mut().db_mut();
         let (is_valid, _, _, _) = simulate_order(
-            &self.evm_config,
+            evm_config,
             db,
             evm_env.clone(),
             &[],
@@ -311,6 +310,7 @@ where
                 value: proposer_value,
             };
             let block = self
+                .validation
                 .payload_validator
                 .ensure_well_formed_payload(ExecutionData {
                     payload: ExecutionPayload::V3(execution_payload.clone()),
@@ -327,7 +327,8 @@ where
                     ),
                 })?;
 
-            self.validate_message_against_block(block, message, 0, false, None)
+            self.validation
+                .validate_message_against_block(block, message, 0, false, None)
                 .await?;
         }
 
@@ -372,7 +373,7 @@ where
         DB: Database + core::fmt::Debug + 'a,
         DB::Error: Send + Sync + 'static,
     {
-        let chain_spec = self.provider.chain_spec();
+        let chain_spec = self.validation.provider.chain_spec();
 
         // This part was taken from `reth_evm::execute::BasicBlockBuilder::finish()`.
         // Using the `BlockBuilder` trait erases the DB type and makes transaction
@@ -650,7 +651,7 @@ where
         let dropping_txs = order.dropping_txs();
 
         let (bundle_is_valid, gas_used_in_bundle, _, cached_db) = simulate_order(
-            &evm_config,
+            evm_config,
             end_of_block_state,
             evm_env.clone(),
             reverting_txs,
@@ -741,7 +742,7 @@ where
         let db = block_executor.evm_mut().db_mut();
 
         let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) = simulate_order(
-            &evm_config,
+            evm_config,
             db,
             evm_env.clone(),
             reverting_txs,

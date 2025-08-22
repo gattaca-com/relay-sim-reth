@@ -1,3 +1,4 @@
+use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use jsonrpsee::{proc_macros::rpc, types::ErrorObject};
 use reth_ethereum::{
@@ -7,9 +8,13 @@ use reth_ethereum::{
 };
 use reth_node_builder::ConfigureEvm;
 use reth_primitives::{EthereumHardforks, NodePrimitives};
+use revm_primitives::Address;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use crate::block_merging::types::{BlockMergeRequestV1, BlockMergeResponseV1};
+use crate::block_merging::types::{
+    BlockMergeRequestV1, BlockMergeResponseV1, BlockMergingConfig, DistributionConfig,
+};
 use crate::validation::ValidationApi;
 
 /// Block validation rpc interface.
@@ -23,8 +28,65 @@ pub trait BlockMergingApi {
     ) -> jsonrpsee::core::RpcResult<BlockMergeResponseV1>;
 }
 
+/// The type that implements the block merging rpc trait
+#[derive(Clone, Debug, derive_more::Deref)]
+pub(crate) struct BlockMergingApi<Provider, E: ConfigureEvm> {
+    #[deref]
+    inner: Arc<BlockMergingApiInner<Provider, E>>,
+}
+
+impl<Provider, E> BlockMergingApi<Provider, E>
+where
+    E: ConfigureEvm,
+{
+    /// Create a new instance of the [`BlockMergingApi`]
+    pub fn new(validation: ValidationApi<Provider, E>, config: BlockMergingConfig) -> Self {
+        let BlockMergingConfig { .. } = config;
+
+        let merger_signer = config
+            .merger_private_key
+            .parse()
+            .expect("Failed to parse merger private key");
+
+        let inner = Arc::new(BlockMergingApiInner {
+            validation,
+            relay_fee_recipient: config.relay_fee_recipient,
+            merger_signer,
+            distribution_contract: config.distribution_contract,
+            distribution_config: config.distribution_config,
+            validate_merged_blocks: config.validate_merged_blocks,
+        });
+
+        Self { inner }
+    }
+}
+
+pub(crate) struct BlockMergingApiInner<Provider, E: ConfigureEvm> {
+    /// The validation API.
+    pub(crate) validation: ValidationApi<Provider, E>,
+    /// The address to send relay revenue to.
+    pub(crate) relay_fee_recipient: Address,
+    /// The signer to use for merging blocks. It will be used for signing the
+    /// revenue distribution and proposer payment transactions.
+    pub(crate) merger_signer: PrivateKeySigner,
+    /// The address of the contract used to distribute rewards.
+    /// It must have a `disperseEther(address[],uint256[])` function.
+    pub(crate) distribution_contract: Address,
+    /// Configuration for revenue distribution.
+    pub(crate) distribution_config: DistributionConfig,
+    /// Whether to validate merged blocks or not
+    pub(crate) validate_merged_blocks: bool,
+}
+
+impl<Provider, E: ConfigureEvm> core::fmt::Debug for BlockMergingApiInner<Provider, E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BlockMergingApiInner")
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait]
-impl<Provider, E> BlockMergingApiServer for ValidationApi<Provider, E>
+impl<Provider, E> BlockMergingApiServer for BlockMergingApi<Provider, E>
 where
     Provider: BlockReaderIdExt<Header = <E::Primitives as NodePrimitives>::BlockHeader>
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
@@ -41,12 +103,14 @@ where
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
 
-        self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::merge_block_v1(&this, request)
-                .await
-                .map_err(ErrorObject::from);
-            let _ = tx.send(result);
-        }));
+        self.validation
+            .task_spawner
+            .spawn_blocking(Box::pin(async move {
+                let result = Self::merge_block_v1(&this, request)
+                    .await
+                    .map_err(ErrorObject::from);
+                let _ = tx.send(result);
+            }));
 
         rx.await
             .map_err(|_| internal_rpc_err("Internal blocking task error"))?

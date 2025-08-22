@@ -8,7 +8,10 @@ mod validation;
 use std::sync::Arc;
 
 use crate::{
-    state_recorder::run_block_state_recorder, validation::BlockSubmissionValidationApiServer,
+    block_merging::BlockMergingApiServer,
+    block_merging::{BlockMergingApi, types::BlockMergingConfig},
+    state_recorder::run_block_state_recorder,
+    validation::BlockSubmissionValidationApiServer,
 };
 use clap::Parser;
 use inclusion::inclusion_producer;
@@ -70,10 +73,15 @@ fn main() {
                         ctx.node().provider.clone(),
                         Arc::new(ctx.node().consensus().clone()),
                         RpcNodeCore::evm_config(ctx.node()).clone(),
-                        args.into_validation_api_config(),
+                        args.clone().into(),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
+                    if args.enable_block_merging_ext {
+                        let block_merging_api =
+                            BlockMergingApi::new(validation_api.clone(), args.into());
+                        ctx.modules.merge_configured(block_merging_api.into_rpc())?;
+                    }
 
                     ctx.modules.merge_configured(validation_api.into_rpc())?;
 
@@ -103,6 +111,9 @@ struct CliExt {
     #[arg(long, default_value = "/root/blocks")]
     pub record_blocks_dir: String,
 
+    #[arg(long, default_value_t = true)]
+    pub enable_block_merging_ext: bool,
+
     #[arg(long)]
     pub merger_private_key: String,
 
@@ -116,16 +127,23 @@ struct CliExt {
     pub validate_merged_blocks: bool,
 }
 
-impl CliExt {
-    /// Returns the default configuration for the validation API.
-    pub fn into_validation_api_config(self) -> ValidationApiConfig {
+impl From<CliExt> for ValidationApiConfig {
+    fn from(cli: CliExt) -> Self {
         ValidationApiConfig {
-            blacklist_endpoint: self.blacklist_provider.unwrap_or_default(),
-            merger_private_key: self.merger_private_key,
-            relay_fee_recipient: self.relay_fee_recipient,
-            distribution_contract: self.distribution_contract,
-            validate_merged_blocks: self.validate_merged_blocks,
+            blacklist_endpoint: cli.blacklist_provider.unwrap_or_default(),
             ..Default::default()
+        }
+    }
+}
+
+impl From<CliExt> for BlockMergingConfig {
+    fn from(cli: CliExt) -> Self {
+        BlockMergingConfig {
+            merger_private_key: cli.merger_private_key,
+            relay_fee_recipient: cli.relay_fee_recipient,
+            distribution_config: Default::default(),
+            distribution_contract: cli.distribution_contract,
+            validate_merged_blocks: cli.validate_merged_blocks,
         }
     }
 }
