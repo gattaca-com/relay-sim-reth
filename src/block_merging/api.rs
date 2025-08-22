@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{proc_macros::rpc, types::ErrorObject};
 use reth_ethereum::{
     node::core::rpc::result::internal_rpc_err,
     provider::ChainSpecProvider,
@@ -42,7 +42,9 @@ where
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::merge_block_v1(&this, request).await;
+            let result = Self::merge_block_v1(&this, request)
+                .await
+                .map_err(ErrorObject::from);
             let _ = tx.send(result);
         }));
 
