@@ -34,7 +34,7 @@ use reth_ethereum::{
     storage::{StateProvider, StateProviderFactory},
 };
 use reth_node_builder::{Block as _, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, PayloadValidator};
-use reth_primitives::{EthereumHardforks, NodePrimitives, Recovered, RecoveredBlock, logs_bloom};
+use reth_primitives::{EthereumHardforks, Recovered, RecoveredBlock, logs_bloom};
 use revm::{
     Database, DatabaseCommit, DatabaseRef,
     database::{CacheDB, State, states::bundle_state::BundleRetention},
@@ -694,9 +694,7 @@ fn assemble_block<'a, DB>(
     state_provider: &dyn StateProvider,
     recovered_txs: Vec<RecoveredTx>,
     withdrawals_opt: Option<Withdrawals>,
-    parent_header: reth_primitives::SealedHeader<
-        <<EthEvmConfig as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
-    >,
+    parent_header: reth_primitives::SealedHeader,
     old_header: Header,
 ) -> Result<(RecoveredBlock<Block>, Requests), BlockMergingApiError>
 where
