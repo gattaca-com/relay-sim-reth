@@ -542,7 +542,7 @@ pub(crate) fn score_orders<DBRef>(
     applied_txs: &HashSet<TxHash>,
     gas_limit: u64,
     gas_used: u64,
-) -> Result<(BinaryHeap<(U256, usize)>, Vec<(Address, usize, Vec<(usize, RecoveredTx)>)>), BlockMergingApiError>
+) -> Result<(BinaryHeap<(U256, usize)>, Vec<(usize, Vec<(usize, RecoveredTx)>)>), BlockMergingApiError>
 where
     DBRef: DatabaseRef + core::fmt::Debug,
     DBRef::Error: Send + Sync + 'static,
@@ -555,7 +555,7 @@ where
     let mut txs_by_score = BinaryHeap::with_capacity(mergeable_transactions.len());
 
     // Simulate orders, ordering them by expected value, discarding invalid ones
-    for (original_index, (origin, order)) in mergeable_orders.iter().map(|mb| (mb.origin, &mb.order)).enumerate() {
+    for (original_index, (_origin, order)) in mergeable_orders.iter().map(|mb| (mb.origin, &mb.order)).enumerate() {
         let Some(txs) = recover_transactions(order, applied_txs) else {
             // The mergeable transactions should come from already validated payloads
             // But in case decoding fails, we just skip the bundle
@@ -584,7 +584,7 @@ where
             // We could use other heuristics here
             let score = total_value;
             txs_by_score.push((score, index));
-            mergeable_transactions.push((origin, original_index, txs));
+            mergeable_transactions.push((original_index, txs));
         }
     }
     Ok((txs_by_score, mergeable_transactions))
@@ -596,7 +596,7 @@ pub(crate) fn append_greedily_until_gas_limit<'a, DB>(
     beneficiary: Address,
     evm_env: EvmEnvFor<EthEvmConfig>,
     mut txs_by_score: BinaryHeap<(U256, usize)>,
-    mut mergeable_transactions: Vec<(Address, usize, Vec<(usize, RecoveredTx)>)>,
+    mut mergeable_transactions: Vec<(usize, Vec<(usize, RecoveredTx)>)>,
     merging_data: &[MergeableOrderWithOrigin],
     mut applied_txs: HashSet<TxHash>,
     gas_limit: u64,
@@ -618,8 +618,9 @@ where
 
     // Append transactions by score until we run out of space
     while let Some((_score, i)) = txs_by_score.pop() {
-        let (origin, original_index, txs) = std::mem::take(&mut mergeable_transactions[i]);
+        let (original_index, txs) = std::mem::take(&mut mergeable_transactions[i]);
         let order = &merging_data[original_index].order;
+        let origin = merging_data[original_index].origin;
         let reverting_txs = order.reverting_txs();
         let dropping_txs = order.dropping_txs();
 
