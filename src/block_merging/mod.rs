@@ -539,8 +539,10 @@ struct ScoredOrders<'a> {
 }
 
 impl<'a> ScoredOrders<'a> {
-    /// Returns a new instance of `ScoredOrders` from the given original orders and a scoring function.
-    /// The function receives a reference to an order and may return a score and a list of recovered transactions.
+    /// Creates an ordered index for `original_orders` using the `scorer` function.
+    /// The scoring function receives a reference to an order and may return a
+    /// score and a list of recovered transactions, or [`None`] if the order should
+    /// be discarded.
     fn from_orders_with_scorer<F, Error>(
         original_orders: &'a [MergeableOrderWithOrigin],
         scorer: F,
@@ -563,6 +565,8 @@ impl<'a> ScoredOrders<'a> {
     fn iter_by_score(mut self) -> impl Iterator<Item = ScoredOrder<'a>> {
         std::iter::from_fn(move || {
             let (_score, scored_orders_index) = self.orders_by_score.pop()?;
+            // NOTE: this `take` won't cause problems because indices to this array are
+            // unique across the score index
             let (original_index, txs) = std::mem::take(&mut self.scored_orders[scored_orders_index]);
             let mergeable_order = &self.original_orders[original_index];
             Some(ScoredOrder { original_index, mergeable_order, recovered_txs: txs })
