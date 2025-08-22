@@ -1,4 +1,5 @@
 mod error;
+mod types;
 
 use alloy_consensus::{BlockHeader, EnvKzgSettings, Transaction, TxReceipt};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
@@ -11,12 +12,13 @@ use alloy_rpc_types_engine::{
     PraguePayloadFields,
 };
 use async_trait::async_trait;
-use core::fmt;
 use dashmap::DashSet;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{core::RpcResult, types::ErrorObject};
+use reth_ethereum::node::EthereumEngineValidator;
+use reth_ethereum::storage::HeaderProvider;
+use reth_ethereum::{Block, EthPrimitives, Receipt, TransactionSigned};
 use reth_ethereum::{
-    chainspec::EthereumHardforks,
     consensus::{ConsensusError, FullConsensus},
     evm::{
         primitives::{Evm, execute::Executor},
@@ -24,16 +26,16 @@ use reth_ethereum::{
     },
     node::core::rpc::result::internal_rpc_err,
     primitives::{
-        GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor, SignedTransaction,
+        GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor,
         constants::GAS_LIMIT_BOUND_DIVISOR,
     },
-    provider::{BlockExecutionOutput, ChainSpecProvider},
+    provider::BlockExecutionOutput,
     rpc::eth::utils::recover_raw_transaction,
     storage::{BlockReaderIdExt, StateProviderFactory},
 };
 use reth_metrics::{Metrics, metrics::Gauge};
-use reth_node_builder::{BlockBody, ConfigureEvm, NodePrimitives, PayloadValidator};
-use reth_tasks::TaskSpawner;
+use reth_node_builder::{BlockBody, ConfigureEvm, PayloadValidator};
+use reth_tasks::TaskExecutor;
 use revm::{Database, database::State};
 use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
@@ -48,31 +50,24 @@ use tracing::{info, warn};
 
 use crate::inclusion::types::InclusionList;
 use crate::validation::error::ValidationApiError;
+use crate::validation::types::{RethConsensus, RethProvider};
 
 /// The type that implements the `validation` rpc namespace trait
-#[derive(Clone, Debug, derive_more::Deref)]
-pub struct ValidationApi<Provider, E: ConfigureEvm> {
+#[derive(Clone, derive_more::Deref)]
+pub struct ValidationApi {
     #[deref]
-    inner: Arc<ValidationApiInner<Provider, E>>,
+    inner: Arc<ValidationApiInner>,
 }
 
-impl<Provider, E> ValidationApi<Provider, E>
-where
-    E: ConfigureEvm,
-{
+impl ValidationApi {
     /// Create a new instance of the [`ValidationApi`]
     pub fn new(
-        provider: Provider,
-        consensus: Arc<dyn FullConsensus<E::Primitives, Error = ConsensusError>>,
-        evm_config: E,
+        provider: RethProvider,
+        consensus: Arc<RethConsensus>,
+        evm_config: reth_ethereum::evm::EthEvmConfig,
         config: ValidationApiConfig,
-        task_spawner: Box<dyn TaskSpawner>,
-        payload_validator: Arc<
-            dyn PayloadValidator<
-                    Block = <E::Primitives as NodePrimitives>::Block,
-                    ExecutionData = ExecutionData,
-                >,
-        >,
+        task_spawner: Box<TaskExecutor>,
+        payload_validator: Arc<EthereumEngineValidator>,
     ) -> Self {
         let ValidationApiConfig {
             blacklist_endpoint,
@@ -148,18 +143,11 @@ where
     }
 }
 
-impl<Provider, E> ValidationApi<Provider, E>
-where
-    Provider: BlockReaderIdExt<Header = <E::Primitives as NodePrimitives>::BlockHeader>
-        + ChainSpecProvider<ChainSpec: EthereumHardforks>
-        + StateProviderFactory
-        + 'static,
-    E: ConfigureEvm + 'static,
-{
+impl ValidationApi {
     /// Validates the given block and a [`BidTrace`] against it.
     pub async fn validate_message_against_block(
         &self,
-        block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        block: RecoveredBlock<Block>,
         message: BidTrace,
         _registered_gas_limit: u64,
         apply_blacklist: bool,
@@ -285,7 +273,7 @@ where
 
     fn validate_inclusion_list_constraint<DB>(
         &self,
-        block: &RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        block: &RecoveredBlock<Block>,
         post_state: State<DB>,
         inclusion_list: &InclusionList,
     ) -> Result<(), ValidationApiError>
@@ -327,8 +315,9 @@ where
 
             // RLP-decode the raw bytes
             let bytes_slice = req.bytes.as_ref();
-            let transaction = recover_raw_transaction(bytes_slice)
-                .map_err(|_| ValidationApiError::InclusionList)?;
+            let transaction: reth_primitives::Recovered<TransactionSigned> =
+                recover_raw_transaction(bytes_slice)
+                    .map_err(|_| ValidationApiError::InclusionList)?;
 
             // execute the tx
             let outcome = evm.transact(transaction);
@@ -347,7 +336,7 @@ where
     /// Ensures that fields of [`BidTrace`] match the fields of the [`SealedHeaderFor`].
     fn validate_message_against_header(
         &self,
-        header: &SealedHeaderFor<E::Primitives>,
+        header: &SealedHeaderFor<EthPrimitives>,
         message: &BidTrace,
     ) -> Result<(), ValidationApiError> {
         if header.hash() != message.block_hash {
@@ -382,8 +371,8 @@ where
     fn _validate_gas_limit(
         &self,
         registered_gas_limit: u64,
-        parent_header: &SealedHeaderFor<E::Primitives>,
-        header: &SealedHeaderFor<E::Primitives>,
+        parent_header: &SealedHeaderFor<EthPrimitives>,
+        header: &SealedHeaderFor<EthPrimitives>,
     ) -> Result<(), ValidationApiError> {
         let max_gas_limit =
             parent_header.gas_limit() + parent_header.gas_limit() / GAS_LIMIT_BOUND_DIVISOR - 1;
@@ -411,8 +400,8 @@ where
     /// to checking the latest block transaction.
     fn ensure_payment(
         &self,
-        block: &SealedBlock<<E::Primitives as NodePrimitives>::Block>,
-        output: &BlockExecutionOutput<<E::Primitives as NodePrimitives>::Receipt>,
+        block: &SealedBlock<Block>,
+        output: &BlockExecutionOutput<Receipt>,
         message: &BidTrace,
     ) -> Result<(), ValidationApiError> {
         let (mut balance_before, balance_after) =
@@ -559,15 +548,7 @@ where
 }
 
 #[async_trait]
-impl<Provider, E> BlockSubmissionValidationApiServer for ValidationApi<Provider, E>
-where
-    Provider: BlockReaderIdExt<Header = <E::Primitives as NodePrimitives>::BlockHeader>
-        + ChainSpecProvider<ChainSpec: EthereumHardforks>
-        + StateProviderFactory
-        + Clone
-        + 'static,
-    E: ConfigureEvm + 'static,
-{
+impl BlockSubmissionValidationApiServer for ValidationApi {
     async fn validate_builder_submission_v1(
         &self,
         _request: BuilderBlockValidationRequest,
@@ -623,20 +604,15 @@ where
     }
 }
 
-pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
+pub struct ValidationApiInner {
     /// The provider that can interact with the chain.
-    provider: Provider,
+    provider: RethProvider,
     /// Consensus implementation.
-    consensus: Arc<dyn FullConsensus<E::Primitives, Error = ConsensusError>>,
+    consensus: Arc<RethConsensus>,
     /// Execution payload validator.
-    payload_validator: Arc<
-        dyn PayloadValidator<
-                Block = <E::Primitives as NodePrimitives>::Block,
-                ExecutionData = ExecutionData,
-            >,
-    >,
+    payload_validator: Arc<EthereumEngineValidator>,
     /// Block executor factory.
-    evm_config: E,
+    evm_config: reth_ethereum::evm::EthEvmConfig,
     /// Set of disallowed addresses
     disallow: Arc<DashSet<Address>>,
     /// The maximum block distance - parent to latest - allowed for validation
@@ -647,15 +623,9 @@ pub struct ValidationApiInner<Provider, E: ConfigureEvm> {
     /// requests.
     cached_state: RwLock<(B256, CachedReads)>,
     /// Task spawner for blocking operations
-    task_spawner: Box<dyn TaskSpawner>,
+    task_spawner: Box<TaskExecutor>,
     /// Validation metrics
     metrics: ValidationMetrics,
-}
-
-impl<Provider, E: ConfigureEvm> fmt::Debug for ValidationApiInner<Provider, E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ValidationApiInner").finish_non_exhaustive()
-    }
 }
 
 /// Configuration for validation API.
