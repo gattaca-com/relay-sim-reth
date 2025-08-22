@@ -103,195 +103,206 @@ impl BlockMergingApi {
 
         let parent_hash = header.parent_hash;
 
-        let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
+        let (response, block_hash, blob_versioned_hashes) = {
+            let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
 
-        let mut request_cache = validation.cached_reads(parent_hash).await;
+            let mut request_cache = validation.cached_reads(parent_hash).await;
 
-        let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
+            let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
 
-        let mut state_db = State::builder().with_database_ref(&cached_db).build();
+            let mut state_db = State::builder().with_database_ref(&cached_db).build();
 
-        let parent_header = validation.get_parent_header(parent_hash)?;
+            let parent_header = validation.get_parent_header(parent_hash)?;
 
-        // Execute the base block
-        let evm_env =
-            evm_config.next_evm_env(&parent_header, &new_block_attrs).or(Err(BlockMergingApiError::NextEvmEnvFail))?;
+            // Execute the base block
+            let evm_env = evm_config
+                .next_evm_env(&parent_header, &new_block_attrs)
+                .or(Err(BlockMergingApiError::NextEvmEnvFail))?;
 
-        let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
-        let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
-        let mut block_executor = evm_config.create_executor(evm, ctx);
+            let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
+            let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
+            let mut block_executor = evm_config.create_executor(evm, ctx);
 
-        block_executor.apply_pre_execution_changes()?;
+            block_executor.apply_pre_execution_changes()?;
 
-        let mut gas_used = 0;
+            let mut gas_used = 0;
 
-        let mut all_transactions = Vec::with_capacity(transactions.len());
+            let mut all_transactions = Vec::with_capacity(transactions.len());
 
-        // Keep track of already applied txs, to discard duplicates
-        let mut applied_txs = HashSet::with_capacity(transactions.len());
+            // Keep track of already applied txs, to discard duplicates
+            let mut applied_txs = HashSet::with_capacity(transactions.len());
 
-        // Keep track of appended orders with blobs
-        let mut appended_blob_order_indices = vec![];
-        let mut blob_versioned_hashes = vec![];
+            // Keep track of appended orders with blobs
+            let mut appended_blob_order_indices = vec![];
+            let mut blob_versioned_hashes = vec![];
 
-        // Insert the transactions from the unmerged block
-        for tx in transactions {
-            let tx = tx.try_into_recovered().expect("signature is valid");
-            gas_used += block_executor.execute_transaction(tx.as_executable())?;
+            // Insert the transactions from the unmerged block
+            for tx in transactions {
+                let tx = tx.try_into_recovered().expect("signature is valid");
+                gas_used += block_executor.execute_transaction(tx.as_executable())?;
 
-            all_transactions.push(tx.clone());
-            applied_txs.insert(*tx.tx_hash());
-            if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-                blob_versioned_hashes.extend(versioned_hashes);
+                all_transactions.push(tx.clone());
+                applied_txs.insert(*tx.tx_hash());
+                if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
+                    blob_versioned_hashes.extend(versioned_hashes);
+                }
             }
-        }
 
-        // We use a read-only reference to the State<DB> as a Database.
-        // When simulating, we're going to wrap this with an in-memory DB.
-        let end_of_block_state = &**block_executor.evm_mut().db_mut();
+            // We use a read-only reference to the State<DB> as a Database.
+            // When simulating, we're going to wrap this with an in-memory DB.
+            let end_of_block_state = &**block_executor.evm_mut().db_mut();
 
-        let (txs_by_score, mergeable_transactions) = score_orders(
-            evm_config,
-            end_of_block_state,
-            beneficiary,
-            &request.merging_data,
-            evm_env.clone(),
-            &applied_txs,
-            gas_limit,
-            gas_used,
-        )?;
+            let (txs_by_score, mergeable_transactions) = score_orders(
+                evm_config,
+                end_of_block_state,
+                beneficiary,
+                &request.merging_data,
+                evm_env.clone(),
+                &applied_txs,
+                gas_limit,
+                gas_used,
+            )?;
 
-        let revenues = append_greedily_until_gas_limit(
-            evm_config,
-            &mut block_executor,
-            beneficiary,
-            evm_env.clone(),
-            txs_by_score,
-            mergeable_transactions,
-            &request.merging_data,
-            applied_txs,
-            gas_limit,
-            &mut gas_used,
-            &mut all_transactions,
-            &mut appended_blob_order_indices,
-            &mut blob_versioned_hashes,
-        )?;
+            let revenues = append_greedily_until_gas_limit(
+                evm_config,
+                &mut block_executor,
+                beneficiary,
+                evm_env.clone(),
+                txs_by_score,
+                mergeable_transactions,
+                &request.merging_data,
+                applied_txs,
+                gas_limit,
+                &mut gas_used,
+                &mut all_transactions,
+                &mut appended_blob_order_indices,
+                &mut blob_versioned_hashes,
+            )?;
 
-        let (proposer_value, distributed_value, updated_revenues) = prepare_revenues(
-            &self.distribution_config,
-            revenues,
-            relay_fee_recipient,
-            request.original_value,
-            beneficiary,
-        );
+            let (proposer_value, distributed_value, updated_revenues) = prepare_revenues(
+                &self.distribution_config,
+                revenues,
+                relay_fee_recipient,
+                request.original_value,
+                beneficiary,
+            );
 
-        let calldata = encode_disperse_eth_calldata(&updated_revenues);
+            let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
-        // Get the chain ID from the configured provider
-        let chain_id = self.validation.provider.chain_spec().chain_id();
+            // Get the chain ID from the configured provider
+            let chain_id = self.validation.provider.chain_spec().chain_id();
 
-        let nonce = block_executor.evm_mut().db_mut().basic(beneficiary)?.map_or(0, |info| info.nonce) + 1;
+            let nonce = block_executor.evm_mut().db_mut().basic(beneficiary)?.map_or(0, |info| info.nonce) + 1;
 
-        let disperse_tx = TxEip1559 {
-            chain_id,
-            nonce,
-            // TODO: compute proper gas limit
-            gas_limit: max_distribution_gas,
-            max_fee_per_gas: block_base_fee_per_gas.into(),
-            max_priority_fee_per_gas: 0,
-            to: self.distribution_contract.into(),
-            value: distributed_value,
-            access_list: Default::default(),
-            input: calldata.into(),
+            let disperse_tx = TxEip1559 {
+                chain_id,
+                nonce,
+                // TODO: compute proper gas limit
+                gas_limit: max_distribution_gas,
+                max_fee_per_gas: block_base_fee_per_gas.into(),
+                max_priority_fee_per_gas: 0,
+                to: self.distribution_contract.into(),
+                value: distributed_value,
+                access_list: Default::default(),
+                input: calldata.into(),
+            };
+
+            let signed_disperse_tx_arr = [(0, self.sign_transaction(disperse_tx)?)];
+
+            let db = block_executor.evm_mut().db_mut();
+            let (is_valid, _, _, _) =
+                simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_disperse_tx_arr);
+            if !is_valid {
+                return Err(BlockMergingApiError::RevenueAllocationReverted);
+            }
+
+            let [(_, signed_disperse_tx)] = signed_disperse_tx_arr;
+            all_transactions.push(signed_disperse_tx);
+
+            // Add proposer payment tx
+            let proposer_payment_tx = TxEip1559 {
+                chain_id,
+                nonce: nonce + 1,
+                gas_limit: payment_tx.gas_limit(),
+                max_fee_per_gas: block_base_fee_per_gas.into(),
+                max_priority_fee_per_gas: 0,
+                to: proposer_fee_recipient.into(),
+                value: proposer_value,
+                access_list: Default::default(),
+                input: Default::default(),
+            };
+
+            let signed_proposer_payment_tx_arr = [(0, self.sign_transaction(proposer_payment_tx)?)];
+
+            let db = block_executor.evm_mut().db_mut();
+            let (is_valid, _, _, _) =
+                simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_proposer_payment_tx_arr);
+            if !is_valid {
+                return Err(BlockMergingApiError::ProposerPaymentReverted);
+            }
+
+            let [(_, signed_proposer_payment_tx)] = signed_proposer_payment_tx_arr;
+
+            all_transactions.push(signed_proposer_payment_tx);
+
+            let (new_block, requests) = self.assemble_block(
+                block_executor,
+                &state_provider,
+                all_transactions,
+                new_block_attrs.withdrawals,
+                parent_header,
+                header,
+            )?;
+
+            let blob_gas_used = new_block.blob_gas_used.unwrap_or(0);
+            let excess_blob_gas = new_block.excess_blob_gas.unwrap_or(0);
+            let block = new_block.into_block().into_ethereum_block();
+
+            let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
+
+            let block_hash = payload_inner.payload_inner.block_hash;
+
+            let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
+            let execution_requests: ExecutionRequestsV4 =
+                requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
+
+            let response = BlockMergeResponseV1 {
+                execution_payload,
+                execution_requests,
+                appended_blob_order_indices,
+                proposer_value,
+            };
+            (response, block_hash, blob_versioned_hashes)
         };
 
-        let signed_disperse_tx_arr = [(0, self.sign_transaction(disperse_tx)?)];
+        if self.validate_merged_blocks {
+            let gas_used = response.execution_payload.payload_inner.payload_inner.gas_used;
+            let message = BidTrace {
+                slot: 0, // unused
+                parent_hash,
+                block_hash,
+                builder_pubkey: Default::default(),  // unused
+                proposer_pubkey: Default::default(), // unused
+                proposer_fee_recipient,
+                gas_limit: new_block_attrs.gas_limit,
+                gas_used,
+                value: response.proposer_value,
+            };
+            let block = self.validation.payload_validator.ensure_well_formed_payload(ExecutionData {
+                payload: ExecutionPayload::V3(response.execution_payload.clone()),
+                sidecar: ExecutionPayloadSidecar::v4(
+                    CancunPayloadFields {
+                        parent_beacon_block_root: new_block_attrs.parent_beacon_block_root.unwrap(),
+                        versioned_hashes: blob_versioned_hashes,
+                    },
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Requests(response.execution_requests.to_requests()),
+                    },
+                ),
+            })?;
 
-        let db = block_executor.evm_mut().db_mut();
-        let (is_valid, _, _, _) = simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_disperse_tx_arr);
-        if !is_valid {
-            return Err(BlockMergingApiError::RevenueAllocationReverted);
+            self.validation.validate_message_against_block(block, message, 0, false, None).await?;
         }
-
-        let [(_, signed_disperse_tx)] = signed_disperse_tx_arr;
-        all_transactions.push(signed_disperse_tx);
-
-        // Add proposer payment tx
-        let proposer_payment_tx = TxEip1559 {
-            chain_id,
-            nonce: nonce + 1,
-            gas_limit: payment_tx.gas_limit(),
-            max_fee_per_gas: block_base_fee_per_gas.into(),
-            max_priority_fee_per_gas: 0,
-            to: proposer_fee_recipient.into(),
-            value: proposer_value,
-            access_list: Default::default(),
-            input: Default::default(),
-        };
-
-        let signed_proposer_payment_tx_arr = [(0, self.sign_transaction(proposer_payment_tx)?)];
-
-        let db = block_executor.evm_mut().db_mut();
-        let (is_valid, _, _, _) =
-            simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_proposer_payment_tx_arr);
-        if !is_valid {
-            return Err(BlockMergingApiError::ProposerPaymentReverted);
-        }
-
-        let [(_, signed_proposer_payment_tx)] = signed_proposer_payment_tx_arr;
-
-        all_transactions.push(signed_proposer_payment_tx);
-
-        let (new_block, requests) = self.assemble_block(
-            block_executor,
-            &state_provider,
-            all_transactions,
-            new_block_attrs.withdrawals,
-            parent_header,
-            header,
-        )?;
-
-        let blob_gas_used = new_block.blob_gas_used.unwrap_or(0);
-        let excess_blob_gas = new_block.excess_blob_gas.unwrap_or(0);
-        let block = new_block.into_block().into_ethereum_block();
-
-        let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
-
-        let block_hash = payload_inner.payload_inner.block_hash;
-
-        let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
-        let execution_requests: ExecutionRequestsV4 =
-            requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
-
-        // if self.validate_merged_blocks {
-        //     let gas_used = execution_payload.payload_inner.payload_inner.gas_used;
-        //     let message = BidTrace {
-        //         slot: 0, // unused
-        //         parent_hash,
-        //         block_hash,
-        //         builder_pubkey: Default::default(),  // unused
-        //         proposer_pubkey: Default::default(), // unused
-        //         proposer_fee_recipient,
-        //         gas_limit: new_block_attrs.gas_limit,
-        //         gas_used,
-        //         value: proposer_value,
-        //     };
-        //     let block = self.validation.payload_validator.ensure_well_formed_payload(ExecutionData {
-        //         payload: ExecutionPayload::V3(execution_payload.clone()),
-        //         sidecar: ExecutionPayloadSidecar::v4(
-        //             CancunPayloadFields {
-        //                 parent_beacon_block_root: new_block_attrs.parent_beacon_block_root.unwrap(),
-        //                 versioned_hashes: blob_versioned_hashes,
-        //             },
-        //             PraguePayloadFields { requests: RequestsOrHash::Requests(execution_requests.to_requests()) },
-        //         ),
-        //     })?;
-
-        //     self.validation.validate_message_against_block(block, message, 0, false, None).await?;
-        // }
-
-        let response =
-            BlockMergeResponseV1 { execution_payload, execution_requests, appended_blob_order_indices, proposer_value };
 
         Ok(response)
     }
