@@ -73,7 +73,9 @@ fn main() {
                         ctx.node().provider.clone(),
                         Arc::new(ctx.node().consensus().clone()),
                         RpcNodeCore::evm_config(ctx.node()).clone(),
-                        args.clone().into(),
+                        ValidationApiConfig::new(
+                            args.blacklist_provider.clone().unwrap_or_default(),
+                        ),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
@@ -125,15 +127,6 @@ struct CliExt {
 
     #[arg(long)]
     pub validate_merged_blocks: bool,
-}
-
-impl From<CliExt> for ValidationApiConfig {
-    fn from(cli: CliExt) -> Self {
-        ValidationApiConfig {
-            blacklist_endpoint: cli.blacklist_provider.unwrap_or_default(),
-            ..Default::default()
-        }
-    }
 }
 
 impl From<CliExt> for BlockMergingConfig {
