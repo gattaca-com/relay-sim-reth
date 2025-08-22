@@ -193,8 +193,10 @@ impl BlockMergingApi {
 
             // Get the chain ID from the configured provider
             let chain_id = self.validation.provider.chain_spec().chain_id();
+            let signer = &self.merger_signer;
+            let signer_address = signer.address();
 
-            let nonce = block_executor.evm_mut().db_mut().basic(beneficiary)?.map_or(0, |info| info.nonce) + 1;
+            let nonce = block_executor.evm_mut().db_mut().basic(signer_address)?.map_or(0, |info| info.nonce) + 1;
 
             let disperse_tx = TxEip1559 {
                 chain_id,
