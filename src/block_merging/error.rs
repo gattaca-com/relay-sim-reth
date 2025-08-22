@@ -38,8 +38,7 @@ pub(crate) enum BlockMergingApiError {
 impl From<BlockMergingApiError> for ErrorObject<'static> {
     fn from(error: BlockMergingApiError) -> Self {
         match error {
-            BlockMergingApiError::MissingProposerPayment
-            | BlockMergingApiError::InvalidProposerPayment => {
+            BlockMergingApiError::MissingProposerPayment | BlockMergingApiError::InvalidProposerPayment => {
                 invalid_params_rpc_err(error.to_string())
             }
 
@@ -51,9 +50,7 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             | BlockMergingApiError::Provider(_) => internal_rpc_err(error.to_string()),
 
             BlockMergingApiError::Execution(err) => match err {
-                error @ BlockExecutionError::Validation(_) => {
-                    invalid_params_rpc_err(error.to_string())
-                }
+                error @ BlockExecutionError::Validation(_) => invalid_params_rpc_err(error.to_string()),
                 error @ BlockExecutionError::Internal(_) => internal_rpc_err(error.to_string()),
             },
             BlockMergingApiError::Payload(err) => match err {

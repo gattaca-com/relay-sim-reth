@@ -33,9 +33,7 @@ pub(crate) struct BlockMergingConfig {
 impl Default for BlockMergingConfig {
     fn default() -> Self {
         Self {
-            merger_private_key: String::from(
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-            ),
+            merger_private_key: String::from("0x0000000000000000000000000000000000000000000000000000000000000000"),
             relay_fee_recipient: address!("0x0000000000000000000000000000000000000000"),
             distribution_config: DistributionConfig::default(),
             // Address of `Disperse.app` contract
@@ -70,13 +68,7 @@ impl Default for DistributionConfig {
         let builder_bips = total_bips / 4;
         let winning_builder_bips = total_bips / 4;
 
-        Self {
-            total_bips,
-            relay_bips,
-            proposer_bips,
-            builder_bips,
-            winning_builder_bips,
-        }
+        Self { total_bips, relay_bips, proposer_bips, builder_bips, winning_builder_bips }
     }
 }
 

@@ -7,12 +7,6 @@ mod validation;
 
 use std::sync::Arc;
 
-use crate::{
-    block_merging::BlockMergingApiServer,
-    block_merging::{BlockMergingApi, types::BlockMergingConfig},
-    state_recorder::run_block_state_recorder,
-    validation::BlockSubmissionValidationApiServer,
-};
 use clap::Parser;
 use inclusion::inclusion_producer;
 use jsonrpsee::{
@@ -30,6 +24,12 @@ use reth_node_builder::FullNodeComponents;
 use revm_primitives::{Address, Bytes};
 use tokio::sync::watch::Receiver;
 use validation::{ValidationApi, ValidationApiConfig};
+
+use crate::{
+    block_merging::{BlockMergingApi, BlockMergingApiServer, types::BlockMergingConfig},
+    state_recorder::run_block_state_recorder,
+    validation::BlockSubmissionValidationApiServer,
+};
 
 fn main() {
     Cli::<EthereumChainSpecParser, CliExt>::parse()
@@ -73,15 +73,12 @@ fn main() {
                         ctx.node().provider.clone(),
                         Arc::new(ctx.node().consensus().clone()),
                         RpcNodeCore::evm_config(ctx.node()).clone(),
-                        ValidationApiConfig::new(
-                            args.blacklist_provider.clone().unwrap_or_default(),
-                        ),
+                        ValidationApiConfig::new(args.blacklist_provider.clone().unwrap_or_default()),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
                     if args.enable_block_merging_ext {
-                        let block_merging_api =
-                            BlockMergingApi::new(validation_api.clone(), args.into());
+                        let block_merging_api = BlockMergingApi::new(validation_api.clone(), args.into());
                         ctx.modules.merge_configured(block_merging_api.into_rpc())?;
                     }
 
@@ -168,10 +165,7 @@ impl InclusionExtApiServer for InclusionExt {
         }
     }
 
-    fn subscribe_inclusion_list(
-        &self,
-        pending_subscription_sink: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
+    fn subscribe_inclusion_list(&self, pending_subscription_sink: PendingSubscriptionSink) -> SubscriptionResult {
         let mut published = self.published.clone();
         tokio::spawn(async move {
             let sink = match pending_subscription_sink.accept().await {
@@ -185,19 +179,16 @@ impl InclusionExtApiServer for InclusionExt {
             loop {
                 match published.changed().await {
                     Ok(_) => {
-                        let msg = published.borrow_and_update().clone().and_then(|list| {
-                            match SubscriptionMessage::new(
-                                sink.method_name(),
-                                sink.subscription_id(),
-                                &list,
-                            ) {
-                                Ok(msg) => Some(msg),
-                                Err(e) => {
-                                    tracing::error!(error=?e, "could not serialize inclusion list");
-                                    None
+                        let msg =
+                            published.borrow_and_update().clone().and_then(|list| {
+                                match SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &list) {
+                                    Ok(msg) => Some(msg),
+                                    Err(e) => {
+                                        tracing::error!(error=?e, "could not serialize inclusion list");
+                                        None
+                                    }
                                 }
-                            }
-                        });
+                            });
                         if let Some(msg) = msg {
                             let _ = sink.send(msg).await;
                         }

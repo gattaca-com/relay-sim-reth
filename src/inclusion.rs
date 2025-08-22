@@ -19,7 +19,8 @@ pub async fn inclusion_producer<P: TransactionPool>(
     mut notifications: CanonStateNotificationStream,
     published: Sender<Option<Vec<Bytes>>>,
 ) {
-    // Maintain 2 collections - 1 ordered by Inclusion List score, with `TxHash` as value. The other mapping `TxHash` to tx.
+    // Maintain 2 collections - 1 ordered by Inclusion List score, with `TxHash` as value. The other mapping `TxHash` to
+    // tx.
     let mut ordered_txs = BTreeSet::new();
     let mut pending_txs = HashMap::new();
 
@@ -80,10 +81,7 @@ fn handle_tx_event<P: TransactionPool>(
             // Remove from tx mapping.
             pending_txs.remove(&tx_hash);
         }
-        FullTransactionEvent::Replaced {
-            transaction,
-            replaced_by: _,
-        } => {
+        FullTransactionEvent::Replaced { transaction, replaced_by: _ } => {
             // Remove
             let tx_hash = transaction.hash();
             pending_txs.remove(tx_hash);

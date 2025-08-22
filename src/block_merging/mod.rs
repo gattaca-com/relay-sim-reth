@@ -1,48 +1,52 @@
-use alloy_consensus::proofs::ordered_trie_root_with_encoder;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+
 use alloy_consensus::{
-    Block, BlockBody, BlockHeader, EMPTY_OMMER_ROOT_HASH, Header, SignableTransaction, Transaction,
-    TxEip1559, TxReceipt, proofs,
+    Block, BlockBody, BlockHeader, EMPTY_OMMER_ROOT_HASH, Header, SignableTransaction, Transaction, TxEip1559,
+    TxReceipt, proofs, proofs::ordered_trie_root_with_encoder,
 };
-use alloy_eips::eip4895::Withdrawals;
-use alloy_eips::eip7685::{Requests, RequestsOrHash};
-use alloy_eips::merge::BEACON_NONCE;
-use alloy_eips::{Decodable2718, Encodable2718};
-use alloy_rpc_types_beacon::relay::BidTrace;
-use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
+use alloy_eips::{
+    Decodable2718, Encodable2718,
+    eip4895::Withdrawals,
+    eip7685::{Requests, RequestsOrHash},
+    merge::BEACON_NONCE,
+};
+use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV4};
 use alloy_rpc_types_engine::{
-    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
-    ExecutionPayloadV2, ExecutionPayloadV3, PraguePayloadFields,
+    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV2,
+    ExecutionPayloadV3, PraguePayloadFields,
 };
 use alloy_signer::SignerSync;
-use reth_ethereum::chainspec::EthChainSpec as _;
-use reth_ethereum::evm::primitives::block::{
-    BlockExecutionError, BlockExecutor as _, BlockExecutorFor,
+use reth_ethereum::{
+    chainspec::EthChainSpec as _,
+    evm::{
+        primitives::{
+            Evm, EvmEnvFor, EvmError,
+            block::{BlockExecutionError, BlockExecutor as _, BlockExecutorFor},
+            execute::ExecutorTx,
+        },
+        revm::database::StateProviderDatabase,
+    },
+    primitives::SignedTransaction,
+    provider::ChainSpecProvider,
+    storage::{BlockReaderIdExt, StateProvider, StateProviderFactory},
 };
-use reth_ethereum::evm::primitives::execute::ExecutorTx;
-use reth_ethereum::evm::primitives::{EvmEnvFor, EvmError};
-use reth_ethereum::evm::revm::database::StateProviderDatabase;
-use reth_ethereum::provider::ChainSpecProvider;
-use reth_ethereum::storage::{BlockReaderIdExt, StateProvider, StateProviderFactory};
-use reth_ethereum::{evm::primitives::Evm, primitives::SignedTransaction};
 use reth_node_builder::{Block as _, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes};
 use reth_primitives::{EthereumHardforks, NodePrimitives, Recovered, RecoveredBlock, logs_bloom};
-use revm::Database;
-use revm::database::states::bundle_state::BundleRetention;
-use revm::database::{CacheDB, State};
-use revm::{DatabaseCommit, DatabaseRef};
-use revm_primitives::alloy_primitives::TxHash;
-use revm_primitives::{Address, B256, U256};
-use std::collections::HashSet;
-use std::collections::{BinaryHeap, HashMap};
+use revm::{
+    Database, DatabaseCommit, DatabaseRef,
+    database::{CacheDB, State, states::bundle_state::BundleRetention},
+};
+use revm_primitives::{Address, B256, U256, alloy_primitives::TxHash};
 use tracing::info;
 
-use crate::block_merging::error::BlockMergingApiError;
-use crate::block_merging::types::{
-    BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder,
-    MergeableOrderWithOrigin, RecoveredBlockFor, RecoveredTx, SignedTx,
-};
-
 pub(crate) use crate::block_merging::api::{BlockMergingApi, BlockMergingApiServer};
+use crate::block_merging::{
+    error::BlockMergingApiError,
+    types::{
+        BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder, MergeableOrderWithOrigin,
+        RecoveredBlockFor, RecoveredTx, SignedTx,
+    },
+};
 
 mod api;
 mod error;
@@ -57,18 +61,13 @@ where
     E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 {
     /// Core logic for appending additional transactions to a block.
-    async fn merge_block_v1(
-        &self,
-        request: BlockMergeRequestV1,
-    ) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
+    async fn merge_block_v1(&self, request: BlockMergeRequestV1) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
         info!(target: "rpc::relay", "Merging block v1");
         let validation = &self.validation;
         let evm_config = &validation.evm_config;
 
-        let block: alloy_consensus::Block<SignedTx<E>> = request
-            .execution_payload
-            .try_into_block()
-            .map_err(NewPayloadError::Eth)?;
+        let block: alloy_consensus::Block<SignedTx<E>> =
+            request.execution_payload.try_into_block().map_err(NewPayloadError::Eth)?;
 
         let (header, body) = block.split();
 
@@ -85,9 +84,7 @@ where
         let Some(payment_tx) = transactions.pop() else {
             return Err(BlockMergingApiError::MissingProposerPayment);
         };
-        if payment_tx.value() != request.original_value
-            || payment_tx.to() != Some(proposer_fee_recipient)
-        {
+        if payment_tx.value() != request.original_value || payment_tx.to() != Some(proposer_fee_recipient) {
             return Err(BlockMergingApiError::InvalidProposerPayment);
         }
 
@@ -123,9 +120,8 @@ where
         let parent_header = validation.get_parent_header(parent_hash)?;
 
         // Execute the base block
-        let evm_env = evm_config
-            .next_evm_env(&parent_header, &new_block_attrs)
-            .or(Err(BlockMergingApiError::NextEvmEnvFail))?;
+        let evm_env =
+            evm_config.next_evm_env(&parent_header, &new_block_attrs).or(Err(BlockMergingApiError::NextEvmEnvFail))?;
 
         let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
         let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
@@ -200,12 +196,7 @@ where
         // Get the chain ID from the configured provider
         let chain_id = self.validation.provider.chain_spec().chain_id();
 
-        let nonce = block_executor
-            .evm_mut()
-            .db_mut()
-            .basic(beneficiary)?
-            .map_or(0, |info| info.nonce)
-            + 1;
+        let nonce = block_executor.evm_mut().db_mut().basic(beneficiary)?.map_or(0, |info| info.nonce) + 1;
 
         let disperse_tx = TxEip1559 {
             chain_id,
@@ -223,14 +214,7 @@ where
         let signed_disperse_tx_arr = [(0, self.sign_transaction(disperse_tx)?)];
 
         let db = block_executor.evm_mut().db_mut();
-        let (is_valid, _, _, _) = simulate_order(
-            evm_config,
-            db,
-            evm_env.clone(),
-            &[],
-            &[],
-            &signed_disperse_tx_arr,
-        );
+        let (is_valid, _, _, _) = simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_disperse_tx_arr);
         if !is_valid {
             return Err(BlockMergingApiError::RevenueAllocationReverted);
         }
@@ -254,14 +238,8 @@ where
         let signed_proposer_payment_tx_arr = [(0, self.sign_transaction(proposer_payment_tx)?)];
 
         let db = block_executor.evm_mut().db_mut();
-        let (is_valid, _, _, _) = simulate_order(
-            evm_config,
-            db,
-            evm_env.clone(),
-            &[],
-            &[],
-            &signed_proposer_payment_tx_arr,
-        );
+        let (is_valid, _, _, _) =
+            simulate_order(evm_config, db, evm_env.clone(), &[], &[], &signed_proposer_payment_tx_arr);
         if !is_valid {
             return Err(BlockMergingApiError::ProposerPaymentReverted);
         }
@@ -287,14 +265,9 @@ where
 
         let block_hash = payload_inner.payload_inner.block_hash;
 
-        let execution_payload = ExecutionPayloadV3 {
-            payload_inner,
-            blob_gas_used,
-            excess_blob_gas,
-        };
-        let execution_requests: ExecutionRequestsV4 = requests
-            .try_into()
-            .or(Err(BlockMergingApiError::ExecutionRequests))?;
+        let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
+        let execution_requests: ExecutionRequestsV4 =
+            requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
 
         if self.validate_merged_blocks {
             let gas_used = execution_payload.payload_inner.payload_inner.gas_used;
@@ -309,51 +282,35 @@ where
                 gas_used,
                 value: proposer_value,
             };
-            let block = self
-                .validation
-                .payload_validator
-                .ensure_well_formed_payload(ExecutionData {
-                    payload: ExecutionPayload::V3(execution_payload.clone()),
-                    sidecar: ExecutionPayloadSidecar::v4(
-                        CancunPayloadFields {
-                            parent_beacon_block_root: new_block_attrs
-                                .parent_beacon_block_root
-                                .unwrap(),
-                            versioned_hashes: blob_versioned_hashes,
-                        },
-                        PraguePayloadFields {
-                            requests: RequestsOrHash::Requests(execution_requests.to_requests()),
-                        },
-                    ),
-                })?;
+            let block = self.validation.payload_validator.ensure_well_formed_payload(ExecutionData {
+                payload: ExecutionPayload::V3(execution_payload.clone()),
+                sidecar: ExecutionPayloadSidecar::v4(
+                    CancunPayloadFields {
+                        parent_beacon_block_root: new_block_attrs.parent_beacon_block_root.unwrap(),
+                        versioned_hashes: blob_versioned_hashes,
+                    },
+                    PraguePayloadFields { requests: RequestsOrHash::Requests(execution_requests.to_requests()) },
+                ),
+            })?;
 
-            self.validation
-                .validate_message_against_block(block, message, 0, false, None)
-                .await?;
+            self.validation.validate_message_against_block(block, message, 0, false, None).await?;
         }
 
-        let response = BlockMergeResponseV1 {
-            execution_payload,
-            execution_requests,
-            appended_blob_order_indices,
-            proposer_value,
-        };
+        let response =
+            BlockMergeResponseV1 { execution_payload, execution_requests, appended_blob_order_indices, proposer_value };
 
         Ok(response)
     }
 
     fn sign_transaction(&self, tx: TxEip1559) -> Result<RecoveredTx<E>, BlockMergingApiError> {
-        let signature = self
-            .merger_signer
-            .sign_hash_sync(&tx.signature_hash())
-            .expect("signer is local and private key is valid");
+        let signature =
+            self.merger_signer.sign_hash_sync(&tx.signature_hash()).expect("signer is local and private key is valid");
         let signed_tx = tx.into_signed(signature);
 
         // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
         let mut buf = vec![];
         signed_tx.encode_2718(&mut buf);
-        let signed_tx = SignedTx::<E>::decode_2718(&mut buf.as_slice())
-            .expect("we just encoded it with encode_2718");
+        let signed_tx = SignedTx::<E>::decode_2718(&mut buf.as_slice()).expect("we just encoded it with encode_2718");
         let recovered_signed_tx = Recovered::new_unchecked(signed_tx, self.merger_signer.address());
         Ok(recovered_signed_tx)
     }
@@ -364,9 +321,7 @@ where
         state_provider: &dyn StateProvider,
         recovered_txs: Vec<RecoveredTx<E>>,
         withdrawals_opt: Option<Withdrawals>,
-        parent_header: reth_primitives::SealedHeader<
-            <<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader,
-        >,
+        parent_header: reth_primitives::SealedHeader<<<E as ConfigureEvm>::Primitives as NodePrimitives>::BlockHeader>,
         old_header: Header,
     ) -> Result<(RecoveredBlockFor<E>, Requests), BlockMergingApiError>
     where
@@ -387,12 +342,10 @@ where
 
         // calculate the state root
         let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
-        let (state_root, _trie_updates) = state_provider
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
+        let (state_root, _trie_updates) =
+            state_provider.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;
 
-        let (transactions, senders): (Vec<_>, Vec<_>) =
-            recovered_txs.into_iter().map(|tx| tx.into_parts()).unzip();
+        let (transactions, senders): (Vec<_>, Vec<_>) = recovered_txs.into_iter().map(|tx| tx.into_parts()).unzip();
 
         // Taken from `reth_evm_ethereum::build::EthBlockAssembler::assemble_block()`.
         // The function receives an unbuildable `BlockAssemblerInput`, due to being
@@ -403,38 +356,25 @@ where
 
         // Had to inline this manually due to generics
         // let receipts_root = Receipt::calculate_receipt_root_no_memo(result.receipts);
-        let receipts_root = ordered_trie_root_with_encoder(&result.receipts, |r, buf| {
-            r.with_bloom_ref().encode_2718(buf)
-        });
+        let receipts_root =
+            ordered_trie_root_with_encoder(&result.receipts, |r, buf| r.with_bloom_ref().encode_2718(buf));
         let logs_bloom = logs_bloom(result.receipts.iter().flat_map(|r| r.logs()));
 
-        let withdrawals = chain_spec
-            .is_shanghai_active_at_timestamp(timestamp)
-            .then(|| withdrawals_opt.unwrap_or_default());
+        let withdrawals =
+            chain_spec.is_shanghai_active_at_timestamp(timestamp).then(|| withdrawals_opt.unwrap_or_default());
 
-        let withdrawals_root = withdrawals
-            .as_deref()
-            .map(|w| proofs::calculate_withdrawals_root(w));
-        let requests_hash = chain_spec
-            .is_prague_active_at_timestamp(timestamp)
-            .then(|| result.requests.requests_hash());
+        let withdrawals_root = withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
+        let requests_hash =
+            chain_spec.is_prague_active_at_timestamp(timestamp).then(|| result.requests.requests_hash());
 
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
 
         // only determine cancun fields when active
         if chain_spec.is_cancun_active_at_timestamp(timestamp) {
-            blob_gas_used = Some(
-                transactions
-                    .iter()
-                    .map(|tx| tx.blob_gas_used().unwrap_or_default())
-                    .sum(),
-            );
-            excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_header.timestamp())
-            {
-                parent_header.maybe_next_block_excess_blob_gas(
-                    chain_spec.blob_params_at_timestamp(timestamp),
-                )
+            blob_gas_used = Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
+            excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_header.timestamp()) {
+                parent_header.maybe_next_block_excess_blob_gas(chain_spec.blob_params_at_timestamp(timestamp))
             } else {
                 // for the first post-fork block, both parent.blob_gas_used and
                 // parent.excess_blob_gas are evaluated as 0
@@ -466,20 +406,10 @@ where
             requests_hash,
         };
 
-        let block = Block {
-            header,
-            body: BlockBody {
-                transactions,
-                ommers: Default::default(),
-                withdrawals,
-            },
-        };
+        let block = Block { header, body: BlockBody { transactions, ommers: Default::default(), withdrawals } };
 
         // Continuation from `BasicBlockBuilder::finish`
-        Ok((
-            RecoveredBlock::new_unhashed(block, senders),
-            result.requests,
-        ))
+        Ok((RecoveredBlock::new_unhashed(block, senders), result.requests))
     }
 }
 
@@ -577,16 +507,10 @@ pub(crate) fn prepare_revenues(
     for (origin, revenue) in revenues {
         // Compute the revenue for the relay and bundle origin
         let relay_revenue = distribution_config.relay_split(revenue);
-        updated_revenues
-            .entry(relay_fee_recipient)
-            .and_modify(|v| *v += relay_revenue)
-            .or_insert(relay_revenue);
+        updated_revenues.entry(relay_fee_recipient).and_modify(|v| *v += relay_revenue).or_insert(relay_revenue);
 
         let builder_revenue = distribution_config.builder_split(revenue);
-        updated_revenues
-            .entry(origin)
-            .and_modify(|v| *v += builder_revenue)
-            .or_insert(builder_revenue);
+        updated_revenues.entry(origin).and_modify(|v| *v += builder_revenue).or_insert(builder_revenue);
 
         // Add both to the total value to be distributed
         distributed_value += builder_revenue + relay_revenue;
@@ -596,9 +520,7 @@ pub(crate) fn prepare_revenues(
     }
 
     // Just in case, we remove the beneficiary address from the distribution and update the total
-    distributed_value -= updated_revenues
-        .remove(&block_beneficiary)
-        .unwrap_or(U256::ZERO);
+    distributed_value -= updated_revenues.remove(&block_beneficiary).unwrap_or(U256::ZERO);
 
     let proposer_value = original_block_value + proposer_added_value;
 
@@ -614,33 +536,21 @@ pub(crate) fn score_orders<E, DBRef>(
     applied_txs: &HashSet<TxHash>,
     gas_limit: u64,
     gas_used: u64,
-) -> Result<
-    (
-        BinaryHeap<(U256, usize)>,
-        Vec<(Address, usize, Vec<(usize, RecoveredTx<E>)>)>,
-    ),
-    BlockMergingApiError,
->
+) -> Result<(BinaryHeap<(U256, usize)>, Vec<(Address, usize, Vec<(usize, RecoveredTx<E>)>)>), BlockMergingApiError>
 where
     E: ConfigureEvm,
     DBRef: DatabaseRef + core::fmt::Debug,
     DBRef::Error: Send + Sync + 'static,
     BlockMergingApiError: From<DBRef::Error>,
 {
-    let initial_balance = end_of_block_state
-        .basic_ref(beneficiary)?
-        .map_or(U256::ZERO, |info| info.balance);
+    let initial_balance = end_of_block_state.basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
     // Keep a list of valid transactions and an index by score
     let mut mergeable_transactions = Vec::with_capacity(mergeable_orders.len());
     let mut txs_by_score = BinaryHeap::with_capacity(mergeable_transactions.len());
 
     // Simulate orders, ordering them by expected value, discarding invalid ones
-    for (original_index, (origin, order)) in mergeable_orders
-        .iter()
-        .map(|mb| (mb.origin, &mb.order))
-        .enumerate()
-    {
+    for (original_index, (origin, order)) in mergeable_orders.iter().map(|mb| (mb.origin, &mb.order)).enumerate() {
         let Some(txs) = recover_transactions::<E>(order, applied_txs) else {
             // The mergeable transactions should come from already validated payloads
             // But in case decoding fails, we just skip the bundle
@@ -650,23 +560,15 @@ where
         let reverting_txs = order.reverting_txs();
         let dropping_txs = order.dropping_txs();
 
-        let (bundle_is_valid, gas_used_in_bundle, _, cached_db) = simulate_order(
-            evm_config,
-            end_of_block_state,
-            evm_env.clone(),
-            reverting_txs,
-            dropping_txs,
-            &txs,
-        );
+        let (bundle_is_valid, gas_used_in_bundle, _, cached_db) =
+            simulate_order(evm_config, end_of_block_state, evm_env.clone(), reverting_txs, dropping_txs, &txs);
 
         if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
             continue;
         }
 
         // Consider any balance changes on the beneficiary as tx value
-        let new_balance = cached_db
-            .basic_ref(beneficiary)?
-            .map_or(U256::ZERO, |info| info.balance);
+        let new_balance = cached_db.basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
         let total_value = new_balance.saturating_sub(initial_balance);
 
@@ -707,11 +609,8 @@ where
 {
     let mut revenues = HashMap::new();
 
-    let mut current_balance = block_executor
-        .evm_mut()
-        .db_mut()
-        .basic_ref(beneficiary)?
-        .map_or(U256::ZERO, |info| info.balance);
+    let mut current_balance =
+        block_executor.evm_mut().db_mut().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
     // Append transactions by score until we run out of space
     while let Some((_score, i)) = txs_by_score.pop() {
@@ -741,14 +640,8 @@ where
 
         let db = block_executor.evm_mut().db_mut();
 
-        let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) = simulate_order(
-            evm_config,
-            db,
-            evm_env.clone(),
-            reverting_txs,
-            dropping_txs,
-            &txs,
-        );
+        let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
+            simulate_order(evm_config, db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
 
         if !bundle_is_valid || *gas_used + gas_used_in_bundle > gas_limit {
             continue;
@@ -774,21 +667,14 @@ where
             }
         }
         // Consider any balance changes on the beneficiary as tx value
-        let new_balance = block_executor
-            .evm_mut()
-            .db_mut()
-            .basic(beneficiary)?
-            .map_or(U256::ZERO, |info| info.balance);
+        let new_balance = block_executor.evm_mut().db_mut().basic(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
         total_value += new_balance.saturating_sub(current_balance);
         current_balance = new_balance;
 
         // Update the revenue for the bundle's origin
         if !total_value.is_zero() {
-            revenues
-                .entry(origin)
-                .and_modify(|v| *v += total_value)
-                .or_insert(total_value);
+            revenues.entry(origin).and_modify(|v| *v += total_value).or_insert(total_value);
         }
     }
     Ok(revenues)
@@ -839,9 +725,7 @@ where
                 evm.db_mut().commit(result.state);
             }
             Err(e) => {
-                if e.is_invalid_tx_err()
-                    && (dropping_txs.contains(&i) || reverting_txs.contains(&i))
-                {
+                if e.is_invalid_tx_err() && (dropping_txs.contains(&i) || reverting_txs.contains(&i)) {
                     // The transaction might have been invalidated by another one, so we drop it
                     included_txs[i] = false;
                 } else {

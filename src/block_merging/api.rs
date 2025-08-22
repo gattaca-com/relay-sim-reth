@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use jsonrpsee::{proc_macros::rpc, types::ErrorObject};
@@ -9,23 +11,19 @@ use reth_ethereum::{
 use reth_node_builder::ConfigureEvm;
 use reth_primitives::{EthereumHardforks, NodePrimitives};
 use revm_primitives::Address;
-use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use crate::block_merging::types::{
-    BlockMergeRequestV1, BlockMergeResponseV1, BlockMergingConfig, DistributionConfig,
+use crate::{
+    block_merging::types::{BlockMergeRequestV1, BlockMergeResponseV1, BlockMergingConfig, DistributionConfig},
+    validation::ValidationApi,
 };
-use crate::validation::ValidationApi;
 
 /// Block validation rpc interface.
 #[rpc(server, namespace = "relay")]
 pub trait BlockMergingApi {
     /// A Request to append mergeable transactions to a block.
     #[method(name = "mergeBlockV1")]
-    async fn merge_block_v1(
-        &self,
-        request: BlockMergeRequestV1,
-    ) -> jsonrpsee::core::RpcResult<BlockMergeResponseV1>;
+    async fn merge_block_v1(&self, request: BlockMergeRequestV1) -> jsonrpsee::core::RpcResult<BlockMergeResponseV1>;
 }
 
 /// The type that implements the block merging rpc trait
@@ -43,10 +41,7 @@ where
     pub fn new(validation: ValidationApi<Provider, E>, config: BlockMergingConfig) -> Self {
         let BlockMergingConfig { .. } = config;
 
-        let merger_signer = config
-            .merger_private_key
-            .parse()
-            .expect("Failed to parse merger private key");
+        let merger_signer = config.merger_private_key.parse().expect("Failed to parse merger private key");
 
         let inner = Arc::new(BlockMergingApiInner {
             validation,
@@ -80,8 +75,7 @@ pub(crate) struct BlockMergingApiInner<Provider, E: ConfigureEvm> {
 
 impl<Provider, E: ConfigureEvm> core::fmt::Debug for BlockMergingApiInner<Provider, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("BlockMergingApiInner")
-            .finish_non_exhaustive()
+        f.debug_struct("BlockMergingApiInner").finish_non_exhaustive()
     }
 }
 
@@ -96,23 +90,15 @@ where
     E: ConfigureEvm + 'static,
 {
     /// A Request to append mergeable transactions to a block.
-    async fn merge_block_v1(
-        &self,
-        request: BlockMergeRequestV1,
-    ) -> jsonrpsee::core::RpcResult<BlockMergeResponseV1> {
+    async fn merge_block_v1(&self, request: BlockMergeRequestV1) -> jsonrpsee::core::RpcResult<BlockMergeResponseV1> {
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
 
-        self.validation
-            .task_spawner
-            .spawn_blocking(Box::pin(async move {
-                let result = Self::merge_block_v1(&this, request)
-                    .await
-                    .map_err(ErrorObject::from);
-                let _ = tx.send(result);
-            }));
+        self.validation.task_spawner.spawn_blocking(Box::pin(async move {
+            let result = Self::merge_block_v1(&this, request).await.map_err(ErrorObject::from);
+            let _ = tx.send(result);
+        }));
 
-        rx.await
-            .map_err(|_| internal_rpc_err("Internal blocking task error"))?
+        rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
     }
 }
