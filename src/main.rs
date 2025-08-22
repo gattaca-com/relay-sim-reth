@@ -4,14 +4,6 @@ mod validation;
 
 use std::sync::Arc;
 
-use crate::{
-    inclusion::{
-        api::{InclusionExt, InclusionExtApiServer},
-        inclusion_producer::inclusion_producer,
-    },
-    state_recorder::run_block_state_recorder,
-    validation::BlockSubmissionValidationApiServer,
-};
 use clap::Parser;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_ethereum::{
@@ -22,6 +14,15 @@ use reth_ethereum::{
 use reth_node_builder::FullNodeComponents;
 use revm_primitives::Bytes;
 use validation::{ValidationApi, ValidationApiConfig};
+
+use crate::{
+    inclusion::{
+        api::{InclusionExt, InclusionExtApiServer},
+        inclusion_producer::inclusion_producer,
+    },
+    state_recorder::run_block_state_recorder,
+    validation::BlockSubmissionValidationApiServer,
+};
 
 fn main() {
     Cli::<EthereumChainSpecParser, CliExt>::parse()
@@ -49,9 +50,7 @@ fn main() {
                         ctx.node().provider.clone(),
                         Arc::new(ctx.node().consensus().clone()),
                         RpcNodeCore::evm_config(ctx.node()).clone(),
-                        ValidationApiConfig::new(
-                            args.blacklist_provider.clone().unwrap_or_default(),
-                        ),
+                        ValidationApiConfig::new(args.blacklist_provider.clone().unwrap_or_default()),
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
@@ -66,8 +65,7 @@ fn main() {
                         let notifications = ctx.provider().canonical_state_stream();
 
                         // List publisher
-                        let (publisher, published) =
-                            tokio::sync::watch::channel(None::<Vec<Bytes>>);
+                        let (publisher, published) = tokio::sync::watch::channel(None::<Vec<Bytes>>);
 
                         tokio::spawn(inclusion_producer(pool, notifications, publisher));
 

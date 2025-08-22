@@ -9,20 +9,14 @@ use reth_chain_state::{CanonStateNotification, CanonStateNotificationStream};
 
 const RETAIN_BLOCKS: usize = 14400;
 
-pub async fn run_block_state_recorder(
-    mut notifications: CanonStateNotificationStream,
-    record_dir: String,
-) {
+pub async fn run_block_state_recorder(mut notifications: CanonStateNotificationStream, record_dir: String) {
     // Read existing record dir contents.
     let mut files = Vec::new();
     if let Ok(mut all_files) = tokio::fs::read_dir(&record_dir).await {
         while let Ok(Some(entry)) = all_files.next_entry().await {
             if let Ok(metadata) = entry.metadata().await {
                 let path = entry.path();
-                files.push((
-                    path,
-                    metadata.created().unwrap_or_else(|_| SystemTime::now()),
-                ));
+                files.push((path, metadata.created().unwrap_or_else(|_| SystemTime::now())));
             }
         }
     }

@@ -66,9 +66,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::Consensus(_)
             | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
             ValidationApiError::Execution(err) => match err {
-                error @ BlockExecutionError::Validation(_) => {
-                    invalid_params_rpc_err(error.to_string())
-                }
+                error @ BlockExecutionError::Validation(_) => invalid_params_rpc_err(error.to_string()),
                 error @ BlockExecutionError::Internal(_) => internal_rpc_err(error.to_string()),
             },
             ValidationApiError::Payload(err) => match err {

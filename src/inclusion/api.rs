@@ -34,10 +34,7 @@ impl InclusionExtApiServer for InclusionExt {
         }
     }
 
-    fn subscribe_inclusion_list(
-        &self,
-        pending_subscription_sink: PendingSubscriptionSink,
-    ) -> SubscriptionResult {
+    fn subscribe_inclusion_list(&self, pending_subscription_sink: PendingSubscriptionSink) -> SubscriptionResult {
         let mut published = self.published.clone();
         tokio::spawn(async move {
             let sink = match pending_subscription_sink.accept().await {
@@ -51,19 +48,16 @@ impl InclusionExtApiServer for InclusionExt {
             loop {
                 match published.changed().await {
                     Ok(_) => {
-                        let msg = published.borrow_and_update().clone().and_then(|list| {
-                            match SubscriptionMessage::new(
-                                sink.method_name(),
-                                sink.subscription_id(),
-                                &list,
-                            ) {
-                                Ok(msg) => Some(msg),
-                                Err(e) => {
-                                    tracing::error!(error=?e, "could not serialize inclusion list");
-                                    None
+                        let msg =
+                            published.borrow_and_update().clone().and_then(|list| {
+                                match SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &list) {
+                                    Ok(msg) => Some(msg),
+                                    Err(e) => {
+                                        tracing::error!(error=?e, "could not serialize inclusion list");
+                                        None
+                                    }
                                 }
-                            }
-                        });
+                            });
                         if let Some(msg) = msg {
                             let _ = sink.send(msg).await;
                         }
