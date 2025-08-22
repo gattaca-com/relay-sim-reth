@@ -34,8 +34,7 @@ use reth_ethereum::{
 };
 use reth_metrics::{Metrics, metrics::Gauge};
 use reth_node_builder::{
-    BlockBody as _, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, NodePrimitives,
-    PayloadValidator,
+    BlockBody as _, ConfigureEvm, NewPayloadError, NodePrimitives, PayloadValidator,
 };
 use reth_primitives::SealedHeader;
 use reth_tasks::TaskSpawner;
@@ -60,7 +59,7 @@ pub struct ValidationApi<Provider, E: ConfigureEvm> {
 
 impl<Provider, E> ValidationApi<Provider, E>
 where
-    E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+    E: ConfigureEvm,
 {
     /// Create a new instance of the [`ValidationApi`]
     pub fn new(
@@ -81,11 +80,6 @@ where
             validation_window,
         } = config;
         let disallow = Arc::new(DashSet::new());
-
-        // let merger_signer = block_merging_config
-        //     .merger_private_key
-        //     .parse()
-        //     .expect("Failed to parse merger private key");
 
         let inner = Arc::new(ValidationApiInner {
             provider,
@@ -161,7 +155,7 @@ where
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
         + 'static,
-    E: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    E: ConfigureEvm + 'static,
 {
     /// Validates the given block and a [`BidTrace`] against it.
     pub async fn validate_message_against_block(
