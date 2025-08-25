@@ -1,3 +1,4 @@
+mod block_merging;
 mod inclusion;
 mod state_recorder;
 mod validation;
@@ -12,10 +13,11 @@ use reth_ethereum::{
     rpc::api::eth::RpcNodeCore,
 };
 use reth_node_builder::FullNodeComponents;
-use revm_primitives::Bytes;
+use revm_primitives::{Address, Bytes};
 use validation::{ValidationApi, ValidationApiConfig};
 
 use crate::{
+    block_merging::{BlockMergingApi, BlockMergingApiServer, types::BlockMergingConfig},
     inclusion::{
         api::{InclusionExt, InclusionExtApiServer},
         inclusion_producer::inclusion_producer,
@@ -54,6 +56,10 @@ fn main() {
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
+                    if args.enable_block_merging_ext {
+                        let block_merging_api = BlockMergingApi::new(validation_api.clone(), args.clone().into());
+                        ctx.modules.merge_configured(block_merging_api.into_rpc())?;
+                    }
 
                     ctx.modules.merge_configured(validation_api.into_rpc())?;
 
@@ -102,4 +108,31 @@ struct CliExt {
 
     #[arg(long, default_value_t = true)]
     pub enable_inclusion_ext: bool,
+
+    #[arg(long, default_value_t = true)]
+    pub enable_block_merging_ext: bool,
+
+    #[arg(long)]
+    pub merger_private_key: String,
+
+    #[arg(long)]
+    pub relay_fee_recipient: Address,
+
+    #[arg(long)]
+    pub distribution_contract: Address,
+
+    #[arg(long)]
+    pub validate_merged_blocks: bool,
+}
+
+impl From<CliExt> for BlockMergingConfig {
+    fn from(cli: CliExt) -> Self {
+        BlockMergingConfig {
+            merger_private_key: cli.merger_private_key,
+            relay_fee_recipient: cli.relay_fee_recipient,
+            distribution_config: Default::default(),
+            distribution_contract: cli.distribution_contract,
+            validate_merged_blocks: cli.validate_merged_blocks,
+        }
+    }
 }
