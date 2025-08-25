@@ -4,12 +4,7 @@ use alloy_consensus::{
     BlockHeader, EMPTY_OMMER_ROOT_HASH, Header, SignableTransaction, Transaction, TxEip1559, TxReceipt,
     proofs::{self, ordered_trie_root_with_encoder},
 };
-use alloy_eips::{
-    Decodable2718, Encodable2718,
-    eip4895::Withdrawals,
-    eip7685::{Requests, RequestsOrHash},
-    merge::BEACON_NONCE,
-};
+use alloy_eips::{Decodable2718, Encodable2718, eip4895::Withdrawals, eip7685::RequestsOrHash, merge::BEACON_NONCE};
 use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV4};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV2,
@@ -107,7 +102,7 @@ impl BlockMergingApi {
 
         let parent_hash = header.parent_hash;
 
-        let (response, block_hash, blob_versioned_hashes, request_cache) = {
+        let (response, blob_versioned_hashes, request_cache) = {
             let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
 
             let mut request_cache = validation.cached_reads(parent_hash).await;
@@ -201,7 +196,7 @@ impl BlockMergingApi {
                 proposer_value,
             )?;
 
-            let (new_block, requests) = assemble_block(
+            let (execution_payload, execution_requests) = assemble_block(
                 &validation.provider.chain_spec(),
                 block_executor,
                 &state_provider,
@@ -211,26 +206,15 @@ impl BlockMergingApi {
                 header,
             )?;
 
-            let blob_gas_used = new_block.blob_gas_used.unwrap_or(0);
-            let excess_blob_gas = new_block.excess_blob_gas.unwrap_or(0);
-            let block = new_block.into_block().into_ethereum_block();
-
-            let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
-
-            let block_hash = payload_inner.payload_inner.block_hash;
-
-            let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
-            let execution_requests: ExecutionRequestsV4 =
-                requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
-
             let response = BlockMergeResponseV1 {
                 execution_payload,
                 execution_requests,
                 appended_blob_order_indices,
                 proposer_value,
             };
-            (response, block_hash, blob_versioned_hashes, request_cache)
+            (response, blob_versioned_hashes, request_cache)
         };
+        let block_hash = response.execution_payload.payload_inner.payload_inner.block_hash;
 
         self.validation.update_cached_reads(parent_hash, request_cache).await;
 
@@ -731,7 +715,7 @@ fn assemble_block<'a, DB>(
     withdrawals_opt: Option<Withdrawals>,
     parent_header: reth_primitives::SealedHeader,
     old_header: Header,
-) -> Result<(RecoveredBlock<Block>, Requests), BlockMergingApiError>
+) -> Result<(ExecutionPayloadV3, ExecutionRequestsV4), BlockMergingApiError>
 where
     DB: Database + core::fmt::Debug + 'a,
     DB::Error: Send + Sync + 'static,
@@ -813,7 +797,20 @@ where
     let block = Block { header, body: BlockBody { transactions, ommers: Default::default(), withdrawals } };
 
     // Continuation from `BasicBlockBuilder::finish`
-    Ok((RecoveredBlock::new_unhashed(block, senders), result.requests))
+    let recovered_block = RecoveredBlock::new_unhashed(block, senders);
+
+    // Assemble into the correct types
+    let blob_gas_used = recovered_block.blob_gas_used.unwrap_or(0);
+    let excess_blob_gas = recovered_block.excess_blob_gas.unwrap_or(0);
+    let block = recovered_block.into_block().into_ethereum_block();
+
+    let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
+
+    let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
+    let execution_requests: ExecutionRequestsV4 =
+        result.requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
+
+    Ok((execution_payload, execution_requests))
 }
 
 #[cfg(test)]
