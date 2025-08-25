@@ -19,7 +19,7 @@ use reth_ethereum::{
         EthEvmConfig,
         primitives::{
             Evm, EvmEnvFor, EvmError,
-            block::{BlockExecutionError, BlockExecutor as _, BlockExecutorFor},
+            block::{BlockExecutionError, BlockExecutorFor},
             execute::ExecutorTx,
         },
         revm::database::StateProviderDatabase,
@@ -120,61 +120,15 @@ impl BlockMergingApi {
 
             let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
             let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
-            let mut block_executor = evm_config.create_executor(evm, ctx);
+            let block_executor = evm_config.create_executor(evm, ctx);
 
-            block_executor.apply_pre_execution_changes()?;
+            let mut builder = BlockBuilder::new(evm_config, evm_env, block_executor, gas_limit);
 
-            let mut gas_used = 0;
+            builder.execute_base_block(transactions)?;
 
-            let mut all_transactions = Vec::with_capacity(transactions.len());
+            let scored_orders = score_orders(&mut builder, beneficiary, &request.merging_data)?;
 
-            // Keep track of already applied txs, to discard duplicates
-            let mut applied_txs = HashSet::with_capacity(transactions.len());
-
-            // Keep track of appended orders with blobs
-            let mut appended_blob_order_indices = vec![];
-            let mut blob_versioned_hashes = vec![];
-
-            // Insert the transactions from the unmerged block
-            for tx in transactions {
-                let tx = tx.try_into_recovered().expect("signature is valid");
-                gas_used += block_executor.execute_transaction(tx.as_executable())?;
-
-                all_transactions.push(tx.clone());
-                applied_txs.insert(*tx.tx_hash());
-                if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-                    blob_versioned_hashes.extend(versioned_hashes);
-                }
-            }
-
-            // We use a read-only reference to the State<DB> as a Database.
-            // When simulating, we're going to wrap this with an in-memory DB.
-            let end_of_block_state = &**block_executor.evm_mut().db_mut();
-
-            let scored_orders = score_orders(
-                evm_config,
-                end_of_block_state,
-                beneficiary,
-                &request.merging_data,
-                evm_env.clone(),
-                &applied_txs,
-                gas_limit,
-                gas_used,
-            )?;
-
-            let revenues = append_greedily_until_gas_limit(
-                evm_config,
-                &mut block_executor,
-                beneficiary,
-                evm_env.clone(),
-                scored_orders,
-                applied_txs,
-                gas_limit,
-                &mut gas_used,
-                &mut all_transactions,
-                &mut appended_blob_order_indices,
-                &mut blob_versioned_hashes,
-            )?;
+            let revenues = append_greedily_until_gas_limit(&mut builder, beneficiary, scored_orders)?;
 
             let (proposer_value, distributed_value, updated_revenues) = prepare_revenues(
                 &self.distribution_config,
@@ -185,10 +139,9 @@ impl BlockMergingApi {
             );
 
             self.append_payment_txs(
-                &mut block_executor,
+                &mut builder,
                 &updated_revenues,
                 distributed_value,
-                &mut all_transactions,
                 max_distribution_gas,
                 block_base_fee_per_gas.into(),
                 payment_tx.gas_limit(),
@@ -196,23 +149,21 @@ impl BlockMergingApi {
                 proposer_value,
             )?;
 
-            let (execution_payload, execution_requests) = assemble_block(
+            let built_block = builder.finish(
                 &validation.provider.chain_spec(),
-                block_executor,
                 &state_provider,
-                all_transactions,
                 new_block_attrs.withdrawals,
                 parent_header,
                 header,
             )?;
 
             let response = BlockMergeResponseV1 {
-                execution_payload,
-                execution_requests,
-                appended_blob_order_indices,
+                execution_payload: built_block.execution_payload,
+                execution_requests: built_block.execution_requests,
+                appended_blob_order_indices: built_block.appended_blob_order_indices,
                 proposer_value,
             };
-            (response, blob_versioned_hashes, request_cache)
+            (response, built_block.blob_versioned_hashes, request_cache)
         };
         let block_hash = response.execution_payload.payload_inner.payload_inner.block_hash;
 
@@ -250,12 +201,11 @@ impl BlockMergingApi {
         Ok(response)
     }
 
-    fn append_payment_txs<'a, DB>(
+    fn append_payment_txs<'a, 'b, BE, DB>(
         &self,
-        block_executor: &mut impl BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
+        builder: &mut BlockBuilder<'b, BE, DB>,
         updated_revenues: &HashMap<Address, U256>,
         distributed_value: U256,
-        all_transactions: &mut Vec<RecoveredTx>,
         distribution_gas_limit: u64,
         block_base_fee_per_gas: u128,
         payment_tx_gas_limit: u64,
@@ -263,9 +213,11 @@ impl BlockMergingApi {
         proposer_value: U256,
     ) -> Result<(), BlockMergingApiError>
     where
-        DB: Database + std::fmt::Debug + 'a,
-        DB::Error: Send + Sync + 'static,
-        BlockMergingApiError: From<DB::Error>,
+        BE: BlockExecutorFor<'b, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
+        DB: Database + DatabaseRef + core::fmt::Debug + 'b,
+        <DB as Database>::Error: Send + Sync + 'static,
+        <DB as DatabaseRef>::Error: Send + Sync + 'static,
+        BlockMergingApiError: From<<DB as DatabaseRef>::Error>,
     {
         let calldata = encode_disperse_eth_calldata(updated_revenues);
 
@@ -276,7 +228,7 @@ impl BlockMergingApi {
         let signer = &self.merger_signer;
         let signer_address = signer.address();
 
-        let nonce = block_executor.evm_mut().db_mut().basic(signer_address)?.map_or(0, |info| info.nonce) + 1;
+        let nonce = builder.get_state().basic_ref(signer_address)?.map_or(0, |info| info.nonce) + 1;
 
         let disperse_tx = TxEip1559 {
             chain_id,
@@ -292,12 +244,9 @@ impl BlockMergingApi {
         };
 
         let signed_disperse_tx = sign_transaction(&self.merger_signer, disperse_tx)?;
-        let mut is_valid = false;
 
         // Execute the disperse transaction
-        block_executor
-            .execute_transaction_with_result_closure(&signed_disperse_tx, |result| is_valid = result.is_success())?;
-        all_transactions.push(signed_disperse_tx);
+        let is_valid = builder.append_payment_transaction(signed_disperse_tx)?;
 
         if !is_valid {
             return Err(BlockMergingApiError::RevenueAllocationReverted);
@@ -317,18 +266,12 @@ impl BlockMergingApi {
         };
 
         let signed_proposer_payment_tx = sign_transaction(&self.merger_signer, proposer_payment_tx)?;
-        let mut is_valid = false;
 
-        // Execute the proposer payment transaction
-        block_executor.execute_transaction_with_result_closure(&signed_proposer_payment_tx, |result| {
-            is_valid = result.is_success()
-        })?;
+        let is_valid = builder.append_payment_transaction(signed_proposer_payment_tx)?;
 
         if !is_valid {
             return Err(BlockMergingApiError::ProposerPaymentReverted);
         }
-
-        all_transactions.push(signed_proposer_payment_tx);
 
         Ok(())
     }
@@ -457,6 +400,166 @@ pub(crate) fn prepare_revenues(
     (proposer_value, distributed_value, updated_revenues)
 }
 
+struct BlockBuilder<'a, BE, DB> {
+    evm_config: &'a EthEvmConfig,
+    evm_env: EvmEnvFor<EthEvmConfig>,
+    block_executor: BE,
+
+    gas_used: u64,
+    gas_limit: u64,
+    transactions: Vec<RecoveredTx>,
+    tx_hashes: HashSet<TxHash>,
+    appended_blob_order_indices: Vec<(usize, usize)>,
+    blob_versioned_hashes: Vec<B256>,
+
+    _phantom: std::marker::PhantomData<&'a DB>,
+}
+
+impl<'a, BE, DB> BlockBuilder<'a, BE, DB>
+where
+    BE: BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
+    DB: Database + DatabaseRef + core::fmt::Debug + 'a,
+    <DB as Database>::Error: Send + Sync + 'static,
+    <DB as DatabaseRef>::Error: Send + Sync + 'static,
+{
+    fn new(evm_config: &'a EthEvmConfig, evm_env: EvmEnvFor<EthEvmConfig>, block_executor: BE, gas_limit: u64) -> Self {
+        Self {
+            evm_config,
+            evm_env,
+            block_executor,
+            gas_used: 0,
+            gas_limit,
+            _phantom: Default::default(),
+            transactions: Default::default(),
+            tx_hashes: Default::default(),
+            appended_blob_order_indices: Default::default(),
+            blob_versioned_hashes: Default::default(),
+        }
+    }
+
+    fn execute_base_block(&mut self, txs: Vec<SignedTx>) -> Result<(), BlockExecutionError> {
+        self.block_executor.apply_pre_execution_changes()?;
+
+        self.transactions = Vec::with_capacity(txs.len());
+
+        // Keep track of already applied txs, to discard duplicates
+        self.tx_hashes = HashSet::with_capacity(txs.len());
+
+        // Insert the transactions from the unmerged block
+        for tx in txs {
+            let tx: RecoveredTx = tx.try_into_recovered().expect("signature is valid");
+            self.gas_used += self.block_executor.execute_transaction(tx.as_executable())?;
+
+            self.transactions.push(tx.clone());
+            self.tx_hashes.insert(*tx.tx_hash());
+            if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
+                self.blob_versioned_hashes.extend(versioned_hashes);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_state(&self) -> &State<DB> {
+        self.block_executor.evm().db()
+    }
+
+    fn was_already_applied(&self, tx_hash: &TxHash) -> bool {
+        self.tx_hashes.contains(tx_hash)
+    }
+
+    fn simulate_order(&self, order: &MergeableOrder, txs: &[(usize, RecoveredTx)]) -> SimulationResult<&State<DB>> {
+        let reverting_txs = order.reverting_txs();
+        let dropping_txs = order.dropping_txs();
+        let mut result =
+            simulate_order(self.evm_config, self.get_state(), self.evm_env.clone(), reverting_txs, dropping_txs, txs);
+        // If we go past gas limit, return an invalid result
+        if self.gas_used + result.gas_used > self.gas_limit {
+            result.is_valid = false;
+        }
+        result
+    }
+
+    fn recover_transactions(&self, order: &MergeableOrder) -> Option<Vec<(usize, RecoveredTx)>> {
+        recover_transactions(order, &self.tx_hashes)
+    }
+
+    fn append_transaction(
+        &mut self,
+        order_index: usize,
+        tx_index: usize,
+        tx: RecoveredTx,
+    ) -> Result<bool, BlockExecutionError> {
+        let mut is_valid = false;
+        self.gas_used += self
+            .block_executor
+            .execute_transaction_with_result_closure(tx.as_executable(), |r| is_valid = r.is_success())?;
+
+        self.transactions.push(tx.clone());
+        self.tx_hashes.insert(*tx.tx_hash());
+        // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
+        // Also store the versioned hash for validation
+        if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
+            self.appended_blob_order_indices.push((order_index, tx_index));
+            self.blob_versioned_hashes.extend(versioned_hashes);
+        }
+        Ok(is_valid)
+    }
+
+    fn append_payment_transaction(&mut self, tx: RecoveredTx) -> Result<bool, BlockExecutionError> {
+        // First two parameters are only used for blob txs, which does not include payment txs
+        self.append_transaction(0, 0, tx)
+    }
+
+    fn finish(
+        self,
+        chain_spec: &<RethProvider as ChainSpecProvider>::ChainSpec,
+        state_provider: &dyn StateProvider,
+        withdrawals_opt: Option<Withdrawals>,
+        parent_header: reth_primitives::SealedHeader,
+        old_header: Header,
+    ) -> Result<BuiltBlock, BlockMergingApiError> {
+        let block_executor = self.block_executor;
+        let recovered_txs = self.transactions;
+        let appended_blob_order_indices = self.appended_blob_order_indices;
+        let blob_versioned_hashes = self.blob_versioned_hashes;
+
+        let (execution_payload, execution_requests) = assemble_block(
+            chain_spec,
+            block_executor,
+            state_provider,
+            recovered_txs,
+            withdrawals_opt,
+            parent_header,
+            old_header,
+        )?;
+
+        let result =
+            BuiltBlock { execution_payload, execution_requests, appended_blob_order_indices, blob_versioned_hashes };
+        Ok(result)
+    }
+}
+
+struct SimulationResult<DB> {
+    is_valid: bool,
+    gas_used: u64,
+    should_be_included: Vec<bool>,
+    resulting_state: CacheDB<DB>,
+}
+
+impl<DB> SimulationResult<DB> {
+    fn new_invalid(resulting_state: CacheDB<DB>) -> Self {
+        Self { is_valid: false, gas_used: 0, should_be_included: vec![], resulting_state }
+    }
+}
+
+struct BuiltBlock {
+    execution_payload: ExecutionPayloadV3,
+    execution_requests: ExecutionRequestsV4,
+    appended_blob_order_indices: Vec<(usize, usize)>,
+    blob_versioned_hashes: Vec<B256>,
+}
+
 /// Keeps a list of recovered transactions per bundle, and an index by score
 struct ScoredOrders<'a> {
     original_orders: &'a [MergeableOrderWithOrigin],
@@ -506,38 +609,33 @@ struct ScoredOrder<'a> {
     recovered_txs: Vec<(usize, RecoveredTx)>,
 }
 
-fn score_orders<'a, DBRef>(
-    evm_config: &EthEvmConfig,
-    end_of_block_state: &DBRef,
+fn score_orders<'a, 'b, BE, DB>(
+    builder: &mut BlockBuilder<'b, BE, DB>,
     beneficiary: Address,
     mergeable_orders: &'a [MergeableOrderWithOrigin],
-    evm_env: EvmEnvFor<EthEvmConfig>,
-    applied_txs: &HashSet<TxHash>,
-    gas_limit: u64,
-    gas_used: u64,
 ) -> Result<ScoredOrders<'a>, BlockMergingApiError>
 where
-    DBRef: DatabaseRef + core::fmt::Debug,
-    DBRef::Error: Send + Sync + 'static,
-    BlockMergingApiError: From<DBRef::Error>,
+    BE: BlockExecutorFor<'b, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
+    DB: Database + DatabaseRef + core::fmt::Debug + 'b,
+    <DB as Database>::Error: Send + Sync + 'static,
+    <DB as DatabaseRef>::Error: Send + Sync + 'static,
+    BlockMergingApiError: From<<DB as DatabaseRef>::Error>,
 {
-    let initial_balance = end_of_block_state.basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+    let initial_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
     ScoredOrders::from_orders_with_scorer(mergeable_orders, |order_with_origin| -> Result<_, BlockMergingApiError> {
         let order = &order_with_origin.order;
         // The mergeable transactions should come from already validated payloads
         // But in case decoding fails, we just skip the bundle
-        let Some(txs) = recover_transactions(order, applied_txs) else {
+        let Some(txs) = builder.recover_transactions(order) else {
             return Ok(None);
         };
 
-        let reverting_txs = order.reverting_txs();
-        let dropping_txs = order.dropping_txs();
+        let simulation_result = builder.simulate_order(order, &txs);
+        let bundle_is_valid = simulation_result.is_valid;
+        let cached_db = simulation_result.resulting_state;
 
-        let (bundle_is_valid, gas_used_in_bundle, _, cached_db) =
-            simulate_order(evm_config, end_of_block_state, evm_env.clone(), reverting_txs, dropping_txs, &txs);
-
-        if !bundle_is_valid || gas_used + gas_used_in_bundle > gas_limit {
+        if !bundle_is_valid {
             return Ok(None);
         }
 
@@ -557,35 +655,26 @@ where
     })
 }
 
-fn append_greedily_until_gas_limit<'a, DB>(
-    evm_config: &EthEvmConfig,
-    block_executor: &mut impl BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
+fn append_greedily_until_gas_limit<'a, 'b, BE, DB>(
+    builder: &mut BlockBuilder<'b, BE, DB>,
     beneficiary: Address,
-    evm_env: EvmEnvFor<EthEvmConfig>,
-    scored_orders: ScoredOrders,
-    mut applied_txs: HashSet<TxHash>,
-    gas_limit: u64,
-    gas_used: &mut u64,
-    all_transactions: &mut Vec<RecoveredTx>,
-    appended_blob_order_indices: &mut Vec<(usize, usize)>,
-    blob_versioned_hashes: &mut Vec<B256>,
+    scored_orders: ScoredOrders<'a>,
 ) -> Result<HashMap<Address, U256>, BlockMergingApiError>
 where
-    DB: Database + DatabaseRef + std::fmt::Debug + 'a,
+    BE: BlockExecutorFor<'b, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
+    DB: Database + DatabaseRef + core::fmt::Debug + 'b,
     <DB as Database>::Error: Send + Sync + 'static,
     <DB as DatabaseRef>::Error: Send + Sync + 'static,
-    BlockMergingApiError: From<<DB as DatabaseRef>::Error> + From<<DB as Database>::Error>,
+    BlockMergingApiError: From<<DB as DatabaseRef>::Error>,
 {
     let mut revenues = HashMap::new();
 
-    let mut current_balance =
-        block_executor.evm_mut().db_mut().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+    let mut current_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
     // Append transactions by score until we run out of space
     for scored_order in scored_orders.iter_by_score() {
         let order = &scored_order.mergeable_order.order;
         let origin = scored_order.mergeable_order.origin;
-        let reverting_txs = order.reverting_txs();
         let dropping_txs = order.dropping_txs();
 
         // Check for already applied transactions and try to drop them
@@ -593,7 +682,7 @@ where
             .recovered_txs
             .into_iter()
             .filter_map(|(i, tx)| {
-                if !applied_txs.contains(tx.tx_hash()) {
+                if !builder.was_already_applied(tx.tx_hash()) {
                     Some(Ok((i, tx)))
                 } else if dropping_txs.contains(&i) {
                     None
@@ -608,12 +697,12 @@ where
             continue;
         };
 
-        let db = block_executor.evm_mut().db_mut();
+        let result = builder.simulate_order(order, &txs);
 
-        let (bundle_is_valid, gas_used_in_bundle, should_be_included, _) =
-            simulate_order(evm_config, db, evm_env.clone(), reverting_txs, dropping_txs, &txs);
+        let bundle_is_valid = result.is_valid;
+        let should_be_included = result.should_be_included;
 
-        if !bundle_is_valid || *gas_used + gas_used_in_bundle > gas_limit {
+        if !bundle_is_valid {
             continue;
         }
 
@@ -621,23 +710,11 @@ where
 
         let mut total_value = U256::ZERO;
 
-        for (i, tx) in txs.into_iter() {
-            if !should_be_included[i] {
-                continue;
-            }
-            *gas_used += block_executor.execute_transaction(tx.as_executable())?;
-
-            all_transactions.push(tx.clone());
-            applied_txs.insert(*tx.tx_hash());
-            // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
-            // Also store the versioned hash for validation
-            if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-                appended_blob_order_indices.push((scored_order.original_index, i));
-                blob_versioned_hashes.extend(versioned_hashes);
-            }
+        for (i, tx) in txs.into_iter().filter(|(i, _tx)| should_be_included[*i]) {
+            builder.append_transaction(scored_order.original_index, i, tx)?;
         }
         // Consider any balance changes on the beneficiary as tx value
-        let new_balance = block_executor.evm_mut().db_mut().basic(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+        let new_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
         total_value += new_balance.saturating_sub(current_balance);
         current_balance = new_balance;
@@ -653,14 +730,14 @@ where
 /// Simulates an order.
 /// Returns whether the order is valid, the amount of gas used, and a list
 /// marking whether to include a transaction of the order or not.
-pub(crate) fn simulate_order<DBRef>(
+fn simulate_order<DBRef>(
     evm_config: &EthEvmConfig,
     db_ref: DBRef,
     evm_env: EvmEnvFor<EthEvmConfig>,
     reverting_txs: &[usize],
     dropping_txs: &[usize],
     txs: &[(usize, RecoveredTx)],
-) -> (bool, u64, Vec<bool>, CacheDB<DBRef>)
+) -> SimulationResult<DBRef>
 where
     DBRef: DatabaseRef + core::fmt::Debug,
     DBRef::Error: Send + Sync + 'static,
@@ -685,7 +762,7 @@ where
                         // Tx should be dropped
                         included_txs[i] = false;
                     } else {
-                        return (false, 0, vec![], evm.into_db());
+                        return SimulationResult::new_invalid(evm.into_db());
                     }
                 }
                 gas_used_in_bundle += result.result.gas_used();
@@ -699,12 +776,17 @@ where
                     included_txs[i] = false;
                 } else {
                     // The error isn't transaction-related, so we just drop this bundle
-                    return (false, 0, vec![], evm.into_db());
+                    return SimulationResult::new_invalid(evm.into_db());
                 }
             }
         };
     }
-    (true, gas_used_in_bundle, included_txs, evm.into_db())
+    SimulationResult {
+        is_valid: true,
+        gas_used: gas_used_in_bundle,
+        should_be_included: included_txs,
+        resulting_state: evm.into_db(),
+    }
 }
 
 fn assemble_block<'a, DB>(
