@@ -52,48 +52,48 @@ impl Default for BlockMergingConfig {
 #[derive(Debug, Serialize, Eq, PartialEq, Deserialize, Clone)]
 pub(crate) struct DistributionConfig {
     /// Base points allocated to the relay.
-    relay_bips: u64,
+    relay_bps: u64,
     /// Base points allocated to the builder that sent the bundle.
-    merged_builder_bips: u64,
+    merged_builder_bps: u64,
     /// Base points allocated to the winning builder.
-    winning_builder_bips: u64,
+    winning_builder_bps: u64,
 }
 
 impl Default for DistributionConfig {
     fn default() -> Self {
-        let relay_bips = Self::TOTAL_BIPS / 4;
-        let merged_builder_bips = Self::TOTAL_BIPS / 4;
-        let winning_builder_bips = Self::TOTAL_BIPS / 4;
+        let relay_bps = Self::TOTAL_BPS / 4;
+        let merged_builder_bps = Self::TOTAL_BPS / 4;
+        let winning_builder_bps = Self::TOTAL_BPS / 4;
 
-        Self { relay_bips, merged_builder_bips, winning_builder_bips }
+        Self { relay_bps, merged_builder_bps, winning_builder_bps }
     }
 }
 
 impl DistributionConfig {
-    const TOTAL_BIPS: u64 = 10000;
+    const TOTAL_BPS: u64 = 10000;
 
     pub(crate) fn validate(&self) {
         assert!(
-            self.relay_bips + self.winning_builder_bips + self.merged_builder_bips < Self::TOTAL_BIPS,
+            self.relay_bps + self.winning_builder_bps + self.merged_builder_bps < Self::TOTAL_BPS,
             "invalid distribution config, sum of bips exceeds total bips"
         );
     }
 
     pub(crate) fn split(&self, bips: u64, revenue: U256) -> U256 {
-        (U256::from(bips) * revenue) / U256::from(Self::TOTAL_BIPS)
+        (U256::from(bips) * revenue) / U256::from(Self::TOTAL_BPS)
     }
 
     pub(crate) fn relay_split(&self, revenue: U256) -> U256 {
-        self.split(self.relay_bips, revenue)
+        self.split(self.relay_bps, revenue)
     }
 
     pub(crate) fn proposer_split(&self, revenue: U256) -> U256 {
-        let proposer_bips = Self::TOTAL_BIPS - self.relay_bips - self.merged_builder_bips - self.winning_builder_bips;
+        let proposer_bips = Self::TOTAL_BPS - self.relay_bps - self.merged_builder_bps - self.winning_builder_bps;
         self.split(proposer_bips, revenue)
     }
 
     pub(crate) fn builder_split(&self, revenue: U256) -> U256 {
-        self.split(self.merged_builder_bips, revenue)
+        self.split(self.merged_builder_bps, revenue)
     }
 }
 
