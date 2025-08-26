@@ -9,6 +9,7 @@ use alloy_rpc_types_engine::{
 };
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{SolCall, sol};
 use reth_ethereum::{
     Block, EthPrimitives,
     chainspec::EthChainSpec,
@@ -210,7 +211,10 @@ impl BlockMergingApi {
         Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
         Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
     {
-        let calldata = encode_disperse_eth_calldata(updated_revenues);
+        let calldata = encode_disperse_eth_calldata(
+            updated_revenues.keys().copied().collect(),
+            updated_revenues.values().copied().collect(),
+        );
 
         // Get the chain ID from the configured provider
         let chain_id = self.validation.provider.chain_spec().chain_id();
@@ -317,38 +321,11 @@ pub(crate) fn recover_transactions(
 }
 
 /// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
-pub(crate) fn encode_disperse_eth_calldata<'a, I, It>(input: I) -> Vec<u8>
-where
-    I: IntoIterator<Item = (&'a Address, &'a U256), IntoIter = It>,
-    It: ExactSizeIterator<Item = I::Item> + Clone,
-{
-    let iter = input.into_iter();
-    let len = iter.len();
-    let mut calldata = Vec::with_capacity(4 + 64 + len * 32 * 2);
-    // selector for "disperseEther(address[],uint256[])"
-    calldata.extend_from_slice(&[0xe6, 0x3d, 0x38, 0xed]);
-    // Offset for recipients from start of calldata (without counting selector)
-    // 32 bytes for each offset = 64
-    let recipients_offset: [u8; 32] = U256::from(64).to_be_bytes();
-    calldata.extend_from_slice(&recipients_offset);
-    // Offset for values from start of calldata (without counting selector)
-    // 32 bytes for each offset + 32 bytes for recipients length + 32 bytes for each recipient
-    let values_offset: [u8; 32] = (U256::from(64 + 32 + len * 32)).to_be_bytes();
-    calldata.extend_from_slice(&values_offset);
-
-    let revenues_length: [u8; 32] = U256::from(len).to_be_bytes();
-    calldata.extend_from_slice(&revenues_length);
-
-    calldata.extend(iter.clone().flat_map(|(recipient, _)| {
-        let mut arr = [0_u8; 32];
-        arr[12..].copy_from_slice(recipient.as_slice());
-        arr
-    }));
-
-    calldata.extend_from_slice(&revenues_length);
-
-    calldata.extend(iter.flat_map(|(_, value)| value.to_be_bytes::<32>()));
-    calldata
+pub(crate) fn encode_disperse_eth_calldata(recipients: Vec<Address>, values: Vec<U256>) -> Vec<u8> {
+    sol! {
+        function disperseEther(address[] recipients, uint256[] values) external payable;
+    }
+    disperseEtherCall { recipients, values }.abi_encode()
 }
 
 /// Computes revenue distribution, splitting merged block revenue to the multiple participants.
@@ -802,7 +779,10 @@ mod tests {
             (Address::left_padding_from(&[3]), U256::from(7)),
         ];
         // This map is for turning tuple references into references of tuples
-        let actual = encode_disperse_eth_calldata(input.iter().map(|(a, v)| (a, v)));
+        let actual = encode_disperse_eth_calldata(
+            input.iter().map(|(a, _)| *a).collect(),
+            input.iter().map(|(_, v)| *v).collect(),
+        );
         assert_eq!(actual, expected);
     }
 }
