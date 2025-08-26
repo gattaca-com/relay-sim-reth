@@ -71,6 +71,13 @@ impl Default for DistributionConfig {
 }
 
 impl DistributionConfig {
+    pub(crate) fn validate(&self) {
+        assert!(
+            self.relay_bips + self.winning_builder_bips + self.builder_bips < self.total_bips,
+            "invalid distribution config, sum of bips exceeds total bips"
+        );
+    }
+
     pub(crate) fn split(&self, bips: u64, revenue: U256) -> U256 {
         (U256::from(bips) * revenue) / U256::from(self.total_bips)
     }

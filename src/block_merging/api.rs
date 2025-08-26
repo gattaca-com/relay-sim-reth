@@ -30,17 +30,24 @@ pub(crate) struct BlockMergingApi {
 impl BlockMergingApi {
     /// Create a new instance of the [`BlockMergingApi`]
     pub fn new(validation: ValidationApi, config: BlockMergingConfig) -> Self {
-        let BlockMergingConfig { .. } = config;
+        let BlockMergingConfig {
+            relay_fee_recipient,
+            distribution_contract,
+            distribution_config,
+            validate_merged_blocks,
+            merger_private_key,
+        } = config;
 
-        let merger_signer = config.merger_private_key.parse().expect("Failed to parse merger private key");
+        let merger_signer = merger_private_key.parse().expect("Failed to parse merger private key");
+        distribution_config.validate();
 
         let inner = Arc::new(BlockMergingApiInner {
             validation,
-            relay_fee_recipient: config.relay_fee_recipient,
+            relay_fee_recipient,
             merger_signer,
-            distribution_contract: config.distribution_contract,
-            distribution_config: config.distribution_config,
-            validate_merged_blocks: config.validate_merged_blocks,
+            distribution_contract,
+            distribution_config,
+            validate_merged_blocks,
         });
 
         Self { inner }
