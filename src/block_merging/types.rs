@@ -75,7 +75,7 @@ impl DistributionConfig {
     pub(crate) fn validate(&self) {
         assert!(
             self.relay_bps + self.winning_builder_bps + self.merged_builder_bps < Self::TOTAL_BPS,
-            "invalid distribution config, sum of bips exceeds total bips"
+            "invalid distribution config, sum of bps exceeds 10000"
         );
     }
 
