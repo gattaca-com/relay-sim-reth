@@ -1,10 +1,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use alloy_consensus::{
-    BlockHeader, EMPTY_OMMER_ROOT_HASH, Header, SignableTransaction, Transaction, TxEip1559, TxReceipt,
-    proofs::{self, ordered_trie_root_with_encoder},
-};
-use alloy_eips::{Decodable2718, Encodable2718, eip4895::Withdrawals, eip7685::RequestsOrHash, merge::BEACON_NONCE};
+use alloy_consensus::{BlockHeader, SignableTransaction, Transaction, TxEip1559};
+use alloy_eips::{Decodable2718, Encodable2718, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV4};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV2,
@@ -13,14 +10,14 @@ use alloy_rpc_types_engine::{
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use reth_ethereum::{
-    Block, BlockBody,
-    chainspec::EthChainSpec as _,
+    Block, EthPrimitives,
+    chainspec::EthChainSpec,
     evm::{
         EthEvmConfig,
         primitives::{
             Evm, EvmEnvFor, EvmError,
-            block::{BlockExecutionError, BlockExecutorFor},
-            execute::ExecutorTx,
+            block::{BlockExecutionError, BlockExecutor},
+            execute::BlockBuilder as RethBlockBuilder,
         },
         revm::database::StateProviderDatabase,
     },
@@ -29,10 +26,10 @@ use reth_ethereum::{
     storage::{StateProvider, StateProviderFactory},
 };
 use reth_node_builder::{Block as _, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, PayloadValidator};
-use reth_primitives::{EthereumHardforks, Recovered, RecoveredBlock, logs_bloom};
+use reth_primitives::Recovered;
 use revm::{
-    Database, DatabaseCommit, DatabaseRef,
-    database::{CacheDB, State, states::bundle_state::BundleRetention},
+    DatabaseCommit, DatabaseRef,
+    database::{CacheDB, State},
 };
 use revm_primitives::{Address, B256, U256, alloy_primitives::TxHash};
 use tracing::info;
@@ -46,7 +43,7 @@ use crate::{
             RecoveredTx, SignedTx,
         },
     },
-    common::RethProvider,
+    common::CachedRethDb,
 };
 
 mod api;
@@ -120,9 +117,10 @@ impl BlockMergingApi {
 
             let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
             let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
-            let block_executor = evm_config.create_executor(evm, ctx);
 
-            let mut builder = BlockBuilder::new(evm_config, evm_env, block_executor, gas_limit);
+            let block_builder = evm_config.create_block_builder(evm, &parent_header, ctx);
+
+            let mut builder = BlockBuilder::new(evm_config, evm_env, block_builder, gas_limit);
 
             builder.execute_base_block(transactions)?;
 
@@ -149,13 +147,8 @@ impl BlockMergingApi {
                 proposer_value,
             )?;
 
-            let built_block = builder.finish(
-                &validation.provider.chain_spec(),
-                &state_provider,
-                new_block_attrs.withdrawals,
-                parent_header,
-                header,
-            )?;
+            let built_block = builder.finish(&state_provider)?;
+            let proposer_value = U256::ZERO;
 
             let response = BlockMergeResponseV1 {
                 execution_payload: built_block.execution_payload,
@@ -201,9 +194,9 @@ impl BlockMergingApi {
         Ok(response)
     }
 
-    fn append_payment_txs<'a, 'b, BE, DB>(
+    fn append_payment_txs<'a, BB, Ex, Ev>(
         &self,
-        builder: &mut BlockBuilder<'b, BE, DB>,
+        builder: &mut BlockBuilder<'a, BB>,
         updated_revenues: &HashMap<Address, U256>,
         distributed_value: U256,
         distribution_gas_limit: u64,
@@ -213,11 +206,9 @@ impl BlockMergingApi {
         proposer_value: U256,
     ) -> Result<(), BlockMergingApiError>
     where
-        BE: BlockExecutorFor<'b, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
-        DB: Database + DatabaseRef + core::fmt::Debug + 'b,
-        <DB as Database>::Error: Send + Sync + 'static,
-        <DB as DatabaseRef>::Error: Send + Sync + 'static,
-        BlockMergingApiError: From<<DB as DatabaseRef>::Error>,
+        BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
+        Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
+        Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
     {
         let calldata = encode_disperse_eth_calldata(updated_revenues);
 
@@ -400,10 +391,10 @@ pub(crate) fn prepare_revenues(
     (proposer_value, distributed_value, updated_revenues)
 }
 
-struct BlockBuilder<'a, BE, DB> {
+struct BlockBuilder<'a, BB> {
     evm_config: &'a EthEvmConfig,
     evm_env: EvmEnvFor<EthEvmConfig>,
-    block_executor: BE,
+    block_builder: BB,
 
     gas_used: u64,
     gas_limit: u64,
@@ -411,25 +402,21 @@ struct BlockBuilder<'a, BE, DB> {
     tx_hashes: HashSet<TxHash>,
     appended_blob_order_indices: Vec<(usize, usize)>,
     blob_versioned_hashes: Vec<B256>,
-
-    _phantom: std::marker::PhantomData<&'a DB>,
 }
 
-impl<'a, BE, DB> BlockBuilder<'a, BE, DB>
+impl<'a, 'b, BB, Ex, Ev> BlockBuilder<'a, BB>
 where
-    BE: BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
-    DB: Database + DatabaseRef + core::fmt::Debug + 'a,
-    <DB as Database>::Error: Send + Sync + 'static,
-    <DB as DatabaseRef>::Error: Send + Sync + 'static,
+    BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
+    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'b,
+    Ev: Evm<DB = &'b mut CachedRethDb<'b>> + 'b,
 {
-    fn new(evm_config: &'a EthEvmConfig, evm_env: EvmEnvFor<EthEvmConfig>, block_executor: BE, gas_limit: u64) -> Self {
+    fn new(evm_config: &'a EthEvmConfig, evm_env: EvmEnvFor<EthEvmConfig>, block_builder: BB, gas_limit: u64) -> Self {
         Self {
             evm_config,
             evm_env,
-            block_executor,
+            block_builder,
             gas_used: 0,
             gas_limit,
-            _phantom: Default::default(),
             transactions: Default::default(),
             tx_hashes: Default::default(),
             appended_blob_order_indices: Default::default(),
@@ -438,7 +425,7 @@ where
     }
 
     fn execute_base_block(&mut self, txs: Vec<SignedTx>) -> Result<(), BlockExecutionError> {
-        self.block_executor.apply_pre_execution_changes()?;
+        self.block_builder.apply_pre_execution_changes()?;
 
         self.transactions = Vec::with_capacity(txs.len());
 
@@ -448,9 +435,9 @@ where
         // Insert the transactions from the unmerged block
         for tx in txs {
             let tx: RecoveredTx = tx.try_into_recovered().expect("signature is valid");
-            self.gas_used += self.block_executor.execute_transaction(tx.as_executable())?;
+            // TODO: avoid clone
+            self.gas_used += self.block_builder.execute_transaction(tx.clone())?;
 
-            self.transactions.push(tx.clone());
             self.tx_hashes.insert(*tx.tx_hash());
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
                 self.blob_versioned_hashes.extend(versioned_hashes);
@@ -460,15 +447,19 @@ where
         Ok(())
     }
 
-    fn get_state(&self) -> &State<DB> {
-        self.block_executor.evm().db()
+    fn get_state<'c>(&'c self) -> &'c CachedRethDb<'b> {
+        self.block_builder.executor().evm().db()
     }
 
     fn was_already_applied(&self, tx_hash: &TxHash) -> bool {
         self.tx_hashes.contains(tx_hash)
     }
 
-    fn simulate_order(&self, order: &MergeableOrder, txs: &[(usize, RecoveredTx)]) -> SimulationResult<&State<DB>> {
+    fn simulate_order<'c>(
+        &'c self,
+        order: &MergeableOrder,
+        txs: &[(usize, RecoveredTx)],
+    ) -> SimulationResult<&'c CachedRethDb<'b>> {
         let reverting_txs = order.reverting_txs();
         let dropping_txs = order.dropping_txs();
         let mut result =
@@ -491,9 +482,8 @@ where
         tx: RecoveredTx,
     ) -> Result<bool, BlockExecutionError> {
         let mut is_valid = false;
-        self.gas_used += self
-            .block_executor
-            .execute_transaction_with_result_closure(tx.as_executable(), |r| is_valid = r.is_success())?;
+        self.gas_used +=
+            self.block_builder.execute_transaction_with_result_closure(tx.clone(), |r| is_valid = r.is_success())?;
 
         self.transactions.push(tx.clone());
         self.tx_hashes.insert(*tx.tx_hash());
@@ -511,28 +501,21 @@ where
         self.append_transaction(0, 0, tx)
     }
 
-    fn finish(
-        self,
-        chain_spec: &<RethProvider as ChainSpecProvider>::ChainSpec,
-        state_provider: &dyn StateProvider,
-        withdrawals_opt: Option<Withdrawals>,
-        parent_header: reth_primitives::SealedHeader,
-        old_header: Header,
-    ) -> Result<BuiltBlock, BlockMergingApiError> {
-        let block_executor = self.block_executor;
-        let recovered_txs = self.transactions;
+    fn finish(self, state_provider: &dyn StateProvider) -> Result<BuiltBlock, BlockMergingApiError> {
         let appended_blob_order_indices = self.appended_blob_order_indices;
         let blob_versioned_hashes = self.blob_versioned_hashes;
 
-        let (execution_payload, execution_requests) = assemble_block(
-            chain_spec,
-            block_executor,
-            state_provider,
-            recovered_txs,
-            withdrawals_opt,
-            parent_header,
-            old_header,
-        )?;
+        let outcome = self.block_builder.finish(state_provider)?;
+        let execution_requests =
+            outcome.execution_result.requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
+
+        let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
+        let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
+        let block = outcome.block.into_block().into_ethereum_block();
+
+        let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
+
+        let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
 
         let result =
             BuiltBlock { execution_payload, execution_requests, appended_blob_order_indices, blob_versioned_hashes };
@@ -609,17 +592,15 @@ struct ScoredOrder<'a> {
     recovered_txs: Vec<(usize, RecoveredTx)>,
 }
 
-fn score_orders<'a, 'b, BE, DB>(
-    builder: &mut BlockBuilder<'b, BE, DB>,
+fn score_orders<'a, 'b, 'c, BB, Ex, Ev>(
+    builder: &mut BlockBuilder<'a, BB>,
     beneficiary: Address,
-    mergeable_orders: &'a [MergeableOrderWithOrigin],
-) -> Result<ScoredOrders<'a>, BlockMergingApiError>
+    mergeable_orders: &'c [MergeableOrderWithOrigin],
+) -> Result<ScoredOrders<'c>, BlockMergingApiError>
 where
-    BE: BlockExecutorFor<'b, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
-    DB: Database + DatabaseRef + core::fmt::Debug + 'b,
-    <DB as Database>::Error: Send + Sync + 'static,
-    <DB as DatabaseRef>::Error: Send + Sync + 'static,
-    BlockMergingApiError: From<<DB as DatabaseRef>::Error>,
+    BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
+    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'b,
+    Ev: Evm<DB = &'b mut CachedRethDb<'b>> + 'b,
 {
     let initial_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
@@ -655,17 +636,15 @@ where
     })
 }
 
-fn append_greedily_until_gas_limit<'a, 'b, BE, DB>(
-    builder: &mut BlockBuilder<'b, BE, DB>,
+fn append_greedily_until_gas_limit<'a, 'b, 'c, BB, Ex, Ev>(
+    builder: &mut BlockBuilder<'a, BB>,
     beneficiary: Address,
-    scored_orders: ScoredOrders<'a>,
+    scored_orders: ScoredOrders<'c>,
 ) -> Result<HashMap<Address, U256>, BlockMergingApiError>
 where
-    BE: BlockExecutorFor<'b, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
-    DB: Database + DatabaseRef + core::fmt::Debug + 'b,
-    <DB as Database>::Error: Send + Sync + 'static,
-    <DB as DatabaseRef>::Error: Send + Sync + 'static,
-    BlockMergingApiError: From<<DB as DatabaseRef>::Error>,
+    BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
+    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'b,
+    Ev: Evm<DB = &'b mut CachedRethDb<'b>> + 'b,
 {
     let mut revenues = HashMap::new();
 
@@ -787,112 +766,6 @@ where
         should_be_included: included_txs,
         resulting_state: evm.into_db(),
     }
-}
-
-fn assemble_block<'a, DB>(
-    chain_spec: &<RethProvider as ChainSpecProvider>::ChainSpec,
-    block_executor: impl BlockExecutorFor<'a, <EthEvmConfig as ConfigureEvm>::BlockExecutorFactory, DB>,
-    state_provider: &dyn StateProvider,
-    recovered_txs: Vec<RecoveredTx>,
-    withdrawals_opt: Option<Withdrawals>,
-    parent_header: reth_primitives::SealedHeader,
-    old_header: Header,
-) -> Result<(ExecutionPayloadV3, ExecutionRequestsV4), BlockMergingApiError>
-where
-    DB: Database + core::fmt::Debug + 'a,
-    DB::Error: Send + Sync + 'static,
-{
-    // This part was taken from `reth_evm::execute::BasicBlockBuilder::finish()`.
-    // Using the `BlockBuilder` trait erases the DB type and makes transaction
-    // simulation or value estimation impossible, so we have to re-implement
-    // the block building ourselves.
-    let (evm, result) = block_executor.finish()?;
-    let (db, evm_env) = evm.finish();
-
-    // merge all transitions into bundle state
-    db.merge_transitions(BundleRetention::Reverts);
-
-    // calculate the state root
-    let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
-    let (state_root, _trie_updates) =
-        state_provider.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;
-
-    let (transactions, senders): (Vec<_>, Vec<_>) = recovered_txs.into_iter().map(|tx| tx.into_parts()).unzip();
-
-    // Taken from `reth_evm_ethereum::build::EthBlockAssembler::assemble_block()`.
-    // The function receives an unbuildable `BlockAssemblerInput`, due to being
-    // marked as non-exhaustive and having no constructors.
-    let timestamp = evm_env.block_env.timestamp.saturating_to();
-
-    let transactions_root = proofs::calculate_transaction_root(&transactions);
-
-    // Had to inline this manually due to generics
-    // let receipts_root = Receipt::calculate_receipt_root_no_memo(result.receipts);
-    let receipts_root = ordered_trie_root_with_encoder(&result.receipts, |r, buf| r.with_bloom_ref().encode_2718(buf));
-    let logs_bloom = logs_bloom(result.receipts.iter().flat_map(|r| r.logs()));
-
-    let withdrawals =
-        chain_spec.is_shanghai_active_at_timestamp(timestamp).then(|| withdrawals_opt.unwrap_or_default());
-
-    let withdrawals_root = withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
-    let requests_hash = chain_spec.is_prague_active_at_timestamp(timestamp).then(|| result.requests.requests_hash());
-
-    let mut excess_blob_gas = None;
-    let mut blob_gas_used = None;
-
-    // only determine cancun fields when active
-    if chain_spec.is_cancun_active_at_timestamp(timestamp) {
-        blob_gas_used = Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-        excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_header.timestamp()) {
-            parent_header.maybe_next_block_excess_blob_gas(chain_spec.blob_params_at_timestamp(timestamp))
-        } else {
-            // for the first post-fork block, both parent.blob_gas_used and
-            // parent.excess_blob_gas are evaluated as 0
-            Some(alloy_eips::eip7840::BlobParams::cancun().next_block_excess_blob_gas(0, 0))
-        };
-    }
-
-    let header = Header {
-        parent_hash: old_header.parent_hash(),
-        ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        beneficiary: evm_env.block_env.beneficiary,
-        state_root,
-        transactions_root,
-        receipts_root,
-        withdrawals_root,
-        logs_bloom,
-        timestamp,
-        mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
-        nonce: BEACON_NONCE.into(),
-        base_fee_per_gas: Some(evm_env.block_env.basefee),
-        number: evm_env.block_env.number.saturating_to(),
-        gas_limit: evm_env.block_env.gas_limit,
-        difficulty: evm_env.block_env.difficulty,
-        gas_used: result.gas_used,
-        extra_data: old_header.extra_data().clone(),
-        parent_beacon_block_root: old_header.parent_beacon_block_root(),
-        blob_gas_used,
-        excess_blob_gas,
-        requests_hash,
-    };
-
-    let block = Block { header, body: BlockBody { transactions, ommers: Default::default(), withdrawals } };
-
-    // Continuation from `BasicBlockBuilder::finish`
-    let recovered_block = RecoveredBlock::new_unhashed(block, senders);
-
-    // Assemble into the correct types
-    let blob_gas_used = recovered_block.blob_gas_used.unwrap_or(0);
-    let excess_blob_gas = recovered_block.excess_blob_gas.unwrap_or(0);
-    let block = recovered_block.into_block().into_ethereum_block();
-
-    let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
-
-    let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
-    let execution_requests: ExecutionRequestsV4 =
-        result.requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
-
-    Ok((execution_payload, execution_requests))
 }
 
 #[cfg(test)]
