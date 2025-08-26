@@ -43,43 +43,44 @@ impl Default for BlockMergingConfig {
 }
 
 /// Configuration for revenue distribution among different parties.
+/// The total basis points is 10000, which means each participant
+/// will be paid `revenue * x / 10000`.
+///
+/// This config does not have an explicit proposer allocation.
+/// It is assumed it will be the remaining bips not allocated
+/// to other parties.
 #[derive(Debug, Serialize, Eq, PartialEq, Deserialize, Clone)]
 pub(crate) struct DistributionConfig {
-    /// Total number of base points to distribute.
-    /// Each participant will be paid `revenue * x / total_bips`.
-    total_bips: u64,
     /// Base points allocated to the relay.
     relay_bips: u64,
-    /// Base points allocated to the proposer.
-    proposer_bips: u64,
-    /// Base points allocated to the builder.
-    builder_bips: u64,
+    /// Base points allocated to the builder that sent the bundle.
+    merged_builder_bips: u64,
     /// Base points allocated to the winning builder.
     winning_builder_bips: u64,
 }
 
 impl Default for DistributionConfig {
     fn default() -> Self {
-        let total_bips = 10000;
-        let relay_bips = total_bips / 4;
-        let proposer_bips = total_bips / 4;
-        let builder_bips = total_bips / 4;
-        let winning_builder_bips = total_bips / 4;
+        let relay_bips = Self::TOTAL_BIPS / 4;
+        let merged_builder_bips = Self::TOTAL_BIPS / 4;
+        let winning_builder_bips = Self::TOTAL_BIPS / 4;
 
-        Self { total_bips, relay_bips, proposer_bips, builder_bips, winning_builder_bips }
+        Self { relay_bips, merged_builder_bips, winning_builder_bips }
     }
 }
 
 impl DistributionConfig {
+    const TOTAL_BIPS: u64 = 10000;
+
     pub(crate) fn validate(&self) {
         assert!(
-            self.relay_bips + self.winning_builder_bips + self.builder_bips < self.total_bips,
+            self.relay_bips + self.winning_builder_bips + self.merged_builder_bips < Self::TOTAL_BIPS,
             "invalid distribution config, sum of bips exceeds total bips"
         );
     }
 
     pub(crate) fn split(&self, bips: u64, revenue: U256) -> U256 {
-        (U256::from(bips) * revenue) / U256::from(self.total_bips)
+        (U256::from(bips) * revenue) / U256::from(Self::TOTAL_BIPS)
     }
 
     pub(crate) fn relay_split(&self, revenue: U256) -> U256 {
@@ -87,11 +88,12 @@ impl DistributionConfig {
     }
 
     pub(crate) fn proposer_split(&self, revenue: U256) -> U256 {
-        self.split(self.proposer_bips, revenue)
+        let proposer_bips = Self::TOTAL_BIPS - self.relay_bips - self.merged_builder_bips - self.winning_builder_bips;
+        self.split(proposer_bips, revenue)
     }
 
     pub(crate) fn builder_split(&self, revenue: U256) -> U256 {
-        self.split(self.builder_bips, revenue)
+        self.split(self.merged_builder_bips, revenue)
     }
 }
 
