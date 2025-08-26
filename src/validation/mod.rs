@@ -1,7 +1,7 @@
 mod error;
 mod types;
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, fmt::Debug, sync::Arc, time::Duration};
 
 use alloy_consensus::{BlockHeader, EnvKzgSettings, Transaction, TxReceipt};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
@@ -246,7 +246,7 @@ impl ValidationApi {
         inclusion_list: &InclusionList,
     ) -> Result<(), ValidationApiError>
     where
-        DB: Database,
+        DB: Database + Debug,
         <DB as revm::Database>::Error: Send + Sync + 'static,
     {
         // nothing to do if no inclusion‐list entries
