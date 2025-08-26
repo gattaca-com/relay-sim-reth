@@ -4,7 +4,7 @@ mod inclusion;
 mod state_recorder;
 mod validation;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use reth_chain_state::CanonStateSubscriptions;
@@ -114,13 +114,16 @@ struct CliExt {
     pub enable_block_merging_ext: bool,
 
     #[arg(long)]
-    pub merger_private_key: String,
+    /// Path to a file with a mapping `builder coinbase -> collateral signer`.
+    /// The base block coinbase will accrue fees and disperse from its
+    /// collateral address
+    pub builder_collateral_map_path: PathBuf,
 
     #[arg(long)]
     pub relay_fee_recipient: Address,
 
     #[arg(long)]
-    pub distribution_contract: Address,
+    pub disperse_address: Address,
 
     #[arg(long)]
     pub validate_merged_blocks: bool,
@@ -128,11 +131,15 @@ struct CliExt {
 
 impl From<CliExt> for BlockMergingConfig {
     fn from(cli: CliExt) -> Self {
+        let builder_collateral_path = std::fs::read_to_string(cli.builder_collateral_map_path)
+            .expect("Failed to read builder collateral map from file");
+        let builder_collateral_map =
+            serde_json::from_str(&builder_collateral_path).expect("Failed to parse builder collateral map");
         BlockMergingConfig {
-            merger_private_key: cli.merger_private_key,
+            builder_collateral_map,
             relay_fee_recipient: cli.relay_fee_recipient,
             distribution_config: Default::default(),
-            distribution_contract: cli.distribution_contract,
+            disperse_address: cli.disperse_address,
             validate_merged_blocks: cli.validate_merged_blocks,
         }
     }

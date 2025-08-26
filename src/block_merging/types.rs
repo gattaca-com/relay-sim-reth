@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use bytes::Bytes;
@@ -6,37 +8,41 @@ use reth_node_builder::ConfigureEvm;
 use reth_primitives::{NodePrimitives, Recovered};
 use revm_primitives::{Address, U256, address};
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
 
 pub(crate) type SignedTx = <<EthEvmConfig as ConfigureEvm>::Primitives as NodePrimitives>::SignedTx;
 pub(crate) type RecoveredTx = Recovered<SignedTx>;
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct BlockMergingConfig {
-    /// Private key to use for merging blocks.
-    /// The address of this key will be used for signing the revenue
-    /// distribution and proposer payment transactions.
-    pub merger_private_key: String,
-    /// The address to send relay revenue to.
+    /// Builder coinbase -> collateral signer. The base block coinbase will accrue fees and disperse from its
+    /// collateral address
+    pub builder_collateral_map: HashMap<Address, PrivateKeySigner>,
+    /// Address for the relay's share of fees
     pub relay_fee_recipient: Address,
     /// Configuration for revenue distribution.
     pub distribution_config: DistributionConfig,
-    /// The address of the contract used to distribute rewards.
+    /// Address of disperse contract.
     /// It must have a `disperseEther(address[],uint256[])` function.
-    pub distribution_contract: Address,
+    pub disperse_address: Address,
     /// Whether to validate merged blocks or not
     pub validate_merged_blocks: bool,
 }
 
+#[serde_as]
+#[derive(Debug, Clone, Deserialize)]
+/// Wrapper over [`alloy_signer_local::PrivateKeySigner`], that implements [`serde::Deserialize`]
+pub(crate) struct PrivateKeySigner(#[serde_as(as = "DisplayFromStr")] pub(crate) alloy_signer_local::PrivateKeySigner);
+
 impl Default for BlockMergingConfig {
     fn default() -> Self {
         Self {
-            merger_private_key: String::from("0x0000000000000000000000000000000000000000000000000000000000000000"),
+            builder_collateral_map: HashMap::new(),
             relay_fee_recipient: address!("0x0000000000000000000000000000000000000000"),
             distribution_config: DistributionConfig::default(),
             // Address of `Disperse.app` contract
             // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
-            distribution_contract: address!("0xD152f549545093347A162Dce210e7293f1452150"),
+            disperse_address: address!("0xD152f549545093347A162Dce210e7293f1452150"),
             validate_merged_blocks: true,
         }
     }

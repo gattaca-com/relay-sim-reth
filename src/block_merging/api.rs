@@ -1,6 +1,5 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use jsonrpsee::{proc_macros::rpc, types::ErrorObject};
 use reth_ethereum::node::core::rpc::result::internal_rpc_err;
@@ -8,7 +7,9 @@ use revm_primitives::Address;
 use tokio::sync::oneshot;
 
 use crate::{
-    block_merging::types::{BlockMergeRequestV1, BlockMergeResponseV1, BlockMergingConfig, DistributionConfig},
+    block_merging::types::{
+        BlockMergeRequestV1, BlockMergeResponseV1, BlockMergingConfig, DistributionConfig, PrivateKeySigner,
+    },
     validation::ValidationApi,
 };
 
@@ -32,20 +33,19 @@ impl BlockMergingApi {
     pub fn new(validation: ValidationApi, config: BlockMergingConfig) -> Self {
         let BlockMergingConfig {
             relay_fee_recipient,
-            distribution_contract,
+            disperse_address,
             distribution_config,
             validate_merged_blocks,
-            merger_private_key,
+            builder_collateral_map,
         } = config;
 
-        let merger_signer = merger_private_key.parse().expect("Failed to parse merger private key");
         distribution_config.validate();
 
         let inner = Arc::new(BlockMergingApiInner {
             validation,
             relay_fee_recipient,
-            merger_signer,
-            distribution_contract,
+            builder_collateral_map,
+            disperse_address,
             distribution_config,
             validate_merged_blocks,
         });
@@ -59,12 +59,12 @@ pub(crate) struct BlockMergingApiInner {
     pub(crate) validation: ValidationApi,
     /// The address to send relay revenue to.
     pub(crate) relay_fee_recipient: Address,
-    /// The signer to use for merging blocks. It will be used for signing the
-    /// revenue distribution and proposer payment transactions.
-    pub(crate) merger_signer: PrivateKeySigner,
-    /// The address of the contract used to distribute rewards.
+    /// Builder coinbase -> collateral signer. The base block coinbase will accrue fees and disperse from its
+    /// collateral address
+    pub(crate) builder_collateral_map: HashMap<Address, PrivateKeySigner>,
+    /// Address of disperse contract.
     /// It must have a `disperseEther(address[],uint256[])` function.
-    pub(crate) distribution_contract: Address,
+    pub(crate) disperse_address: Address,
     /// Configuration for revenue distribution.
     pub(crate) distribution_config: DistributionConfig,
     /// Whether to validate merged blocks or not

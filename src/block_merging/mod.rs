@@ -70,6 +70,11 @@ impl BlockMergingApi {
         let relay_fee_recipient = self.relay_fee_recipient;
         let beneficiary = header.beneficiary;
 
+        // check we have collateral for this builder
+        let Some(types::PrivateKeySigner(signer)) = self.builder_collateral_map.get(&beneficiary).as_ref() else {
+            return Err(BlockMergingApiError::ExecutionRequests);
+        };
+
         // Check that block has proposer payment, otherwise reject it.
         // Also remove proposer payment, we'll later add our own
         let Some(payment_tx) = transactions.pop() else {
@@ -139,6 +144,7 @@ impl BlockMergingApi {
 
             self.append_payment_txs(
                 &mut builder,
+                signer,
                 &updated_revenues,
                 distributed_value,
                 max_distribution_gas,
@@ -198,6 +204,7 @@ impl BlockMergingApi {
     fn append_payment_txs<'a, BB, Ex, Ev>(
         &self,
         builder: &mut BlockBuilder<'a, BB>,
+        signer: &PrivateKeySigner,
         updated_revenues: &HashMap<Address, U256>,
         distributed_value: U256,
         distribution_gas_limit: u64,
@@ -220,7 +227,6 @@ impl BlockMergingApi {
         let chain_id = self.validation.provider.chain_spec().chain_id();
 
         // Get the chain ID from the configured provider
-        let signer = &self.merger_signer;
         let signer_address = signer.address();
 
         let nonce = builder.get_state().basic_ref(signer_address)?.map_or(0, |info| info.nonce) + 1;
@@ -232,13 +238,13 @@ impl BlockMergingApi {
             gas_limit: distribution_gas_limit,
             max_fee_per_gas: block_base_fee_per_gas,
             max_priority_fee_per_gas: 0,
-            to: self.distribution_contract.into(),
+            to: self.disperse_address.into(),
             value: distributed_value,
             access_list: Default::default(),
             input: calldata.into(),
         };
 
-        let signed_disperse_tx = sign_transaction(&self.merger_signer, disperse_tx)?;
+        let signed_disperse_tx = sign_transaction(signer, disperse_tx)?;
 
         // Execute the disperse transaction
         let is_valid = builder.append_payment_transaction(signed_disperse_tx)?;
@@ -260,7 +266,7 @@ impl BlockMergingApi {
             input: Default::default(),
         };
 
-        let signed_proposer_payment_tx = sign_transaction(&self.merger_signer, proposer_payment_tx)?;
+        let signed_proposer_payment_tx = sign_transaction(signer, proposer_payment_tx)?;
 
         let is_valid = builder.append_payment_transaction(signed_proposer_payment_tx)?;
 
