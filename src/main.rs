@@ -113,10 +113,10 @@ struct CliExt {
     #[arg(long, default_value_t = true)]
     pub enable_block_merging_ext: bool,
 
-    #[arg(long)]
     /// Path to a file with a mapping `builder coinbase -> collateral signer`.
     /// The base block coinbase will accrue fees and disperse from its
     /// collateral address
+    #[arg(long)]
     pub builder_collateral_map_path: PathBuf,
 
     #[arg(long)]
