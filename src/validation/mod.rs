@@ -1,5 +1,4 @@
 pub(crate) mod error;
-pub(crate) mod types;
 
 use std::{collections::HashSet, fmt::Debug, sync::Arc, time::Duration};
 
@@ -43,11 +42,9 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
+    common::{RethConsensus, RethProvider},
     inclusion::types::InclusionList,
-    validation::{
-        error::{GetParentError, ValidationApiError},
-        types::{RethConsensus, RethProvider},
-    },
+    validation::error::{GetParentError, ValidationApiError},
 };
 
 /// The type that implements the `validation` rpc namespace trait

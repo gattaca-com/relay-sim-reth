@@ -1,4 +1,5 @@
 mod block_merging;
+mod common;
 mod inclusion;
 mod state_recorder;
 mod validation;

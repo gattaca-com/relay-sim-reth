@@ -46,7 +46,7 @@ use crate::{
             RecoveredTx, SignedTx,
         },
     },
-    validation::types::RethProvider,
+    common::RethProvider,
 };
 
 mod api;
