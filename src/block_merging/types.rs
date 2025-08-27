@@ -6,7 +6,7 @@ use bytes::Bytes;
 use reth_ethereum::evm::EthEvmConfig;
 use reth_node_builder::ConfigureEvm;
 use reth_primitives::{NodePrimitives, Recovered};
-use revm_primitives::{Address, U256, address};
+use revm_primitives::{Address, B256, U256, address};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 
@@ -181,9 +181,8 @@ pub struct BlockMergeResponseV1 {
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     pub execution_requests: ExecutionRequestsV4,
-    /// Indices for orders that contains blobs.
-    /// The second value is the index of the tx inside the bundle.
-    pub appended_blob_order_indices: Vec<(usize, usize)>,
+    /// Versioned hashes of the appended blob transactions.
+    pub appended_blobs: Vec<B256>,
     /// Total value for the proposer
     pub proposer_value: U256,
 }

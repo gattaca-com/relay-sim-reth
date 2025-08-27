@@ -160,7 +160,7 @@ impl BlockMergingApi {
             let response = BlockMergeResponseV1 {
                 execution_payload: built_block.execution_payload,
                 execution_requests: built_block.execution_requests,
-                appended_blob_order_indices: built_block.appended_blob_order_indices,
+                appended_blobs: built_block.appended_blob_versioned_hashes,
                 proposer_value,
             };
             (response, built_block.blob_versioned_hashes, request_cache)
@@ -247,7 +247,7 @@ impl BlockMergingApi {
         let signed_disperse_tx = sign_transaction(signer, disperse_tx)?;
 
         // Execute the disperse transaction
-        let is_valid = builder.append_payment_transaction(signed_disperse_tx)?;
+        let is_valid = builder.append_transaction(signed_disperse_tx)?;
 
         if !is_valid {
             return Err(BlockMergingApiError::RevenueAllocationReverted);
@@ -268,7 +268,7 @@ impl BlockMergingApi {
 
         let signed_proposer_payment_tx = sign_transaction(signer, proposer_payment_tx)?;
 
-        let is_valid = builder.append_payment_transaction(signed_proposer_payment_tx)?;
+        let is_valid = builder.append_transaction(signed_proposer_payment_tx)?;
 
         if !is_valid {
             return Err(BlockMergingApiError::ProposerPaymentReverted);
@@ -383,8 +383,9 @@ struct BlockBuilder<'a, BB> {
     gas_limit: u64,
     transactions: Vec<RecoveredTx>,
     tx_hashes: HashSet<TxHash>,
-    appended_blob_order_indices: Vec<(usize, usize)>,
+
     blob_versioned_hashes: Vec<B256>,
+    number_of_blobs_in_base_block: usize,
 }
 
 impl<'a, 'b, BB, Ex, Ev> BlockBuilder<'a, BB>
@@ -402,8 +403,8 @@ where
             gas_limit,
             transactions: Default::default(),
             tx_hashes: Default::default(),
-            appended_blob_order_indices: Default::default(),
             blob_versioned_hashes: Default::default(),
+            number_of_blobs_in_base_block: 0,
         }
     }
 
@@ -423,6 +424,7 @@ where
 
             self.tx_hashes.insert(*tx.tx_hash());
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
+                self.number_of_blobs_in_base_block += 1;
                 self.blob_versioned_hashes.extend(versioned_hashes);
             }
         }
@@ -458,12 +460,7 @@ where
         recover_transactions(order, &self.tx_hashes)
     }
 
-    fn append_transaction(
-        &mut self,
-        order_index: usize,
-        tx_index: usize,
-        tx: RecoveredTx,
-    ) -> Result<bool, BlockExecutionError> {
+    fn append_transaction(&mut self, tx: RecoveredTx) -> Result<bool, BlockExecutionError> {
         let mut is_valid = false;
         self.gas_used +=
             self.block_builder.execute_transaction_with_result_closure(tx.clone(), |r| is_valid = r.is_success())?;
@@ -473,19 +470,13 @@ where
         // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
         // Also store the versioned hash for validation
         if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-            self.appended_blob_order_indices.push((order_index, tx_index));
             self.blob_versioned_hashes.extend(versioned_hashes);
         }
         Ok(is_valid)
     }
 
-    fn append_payment_transaction(&mut self, tx: RecoveredTx) -> Result<bool, BlockExecutionError> {
-        // First two parameters are only used for blob txs, which does not include payment txs
-        self.append_transaction(0, 0, tx)
-    }
-
     fn finish(self, state_provider: &dyn StateProvider) -> Result<BuiltBlock, BlockMergingApiError> {
-        let appended_blob_order_indices = self.appended_blob_order_indices;
+        let number_of_blobs_in_base_block = self.number_of_blobs_in_base_block;
         let blob_versioned_hashes = self.blob_versioned_hashes;
 
         let outcome = self.block_builder.finish(state_provider)?;
@@ -500,8 +491,9 @@ where
 
         let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
 
+        let appended_blob_versioned_hashes = blob_versioned_hashes[number_of_blobs_in_base_block..].to_vec();
         let result =
-            BuiltBlock { execution_payload, execution_requests, appended_blob_order_indices, blob_versioned_hashes };
+            BuiltBlock { execution_payload, execution_requests, blob_versioned_hashes, appended_blob_versioned_hashes };
         Ok(result)
     }
 }
@@ -522,8 +514,10 @@ impl<DB> SimulationResult<DB> {
 struct BuiltBlock {
     execution_payload: ExecutionPayloadV3,
     execution_requests: ExecutionRequestsV4,
-    appended_blob_order_indices: Vec<(usize, usize)>,
+    /// Versioned hashes for the whole block
     blob_versioned_hashes: Vec<B256>,
+    /// Versioned hashes for only the appended blobs
+    appended_blob_versioned_hashes: Vec<B256>,
 }
 
 /// Keeps a list of recovered transactions per bundle, and an index by score
@@ -672,8 +666,8 @@ where
 
         let mut total_value = U256::ZERO;
 
-        for (i, tx) in txs.into_iter().filter(|(i, _tx)| should_be_included[*i]) {
-            builder.append_transaction(scored_order.original_index, i, tx)?;
+        for (_i, tx) in txs.into_iter().filter(|(i, _tx)| should_be_included[*i]) {
+            builder.append_transaction(tx)?;
         }
         // Consider any balance changes on the beneficiary as tx value
         let new_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
