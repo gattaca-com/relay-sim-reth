@@ -10,6 +10,7 @@ use alloy_rpc_types_engine::{
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, sol};
+use bytes::Bytes;
 use reth_ethereum::{
     Block, EthPrimitives,
     chainspec::EthChainSpec,
@@ -39,10 +40,7 @@ pub(crate) use crate::block_merging::api::{BlockMergingApi, BlockMergingApiServe
 use crate::{
     block_merging::{
         error::BlockMergingApiError,
-        types::{
-            BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder, MergeableOrderWithOrigin,
-            RecoveredTx, SignedTx,
-        },
+        types::{BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder, RecoveredTx, SignedTx},
     },
     common::CachedRethDb,
 };
@@ -292,7 +290,7 @@ fn sign_transaction(signer: &PrivateKeySigner, tx: TxEip1559) -> Result<Recovere
 
 /// Recovers transactions from a bundle
 pub(crate) fn recover_transactions(
-    order: &MergeableOrder,
+    order: &MergeableOrder<Bytes>,
     applied_txs: &HashSet<TxHash>,
 ) -> Option<Vec<(usize, RecoveredTx)>> {
     order
@@ -442,7 +440,7 @@ where
 
     fn simulate_order<'c>(
         &'c self,
-        order: &MergeableOrder,
+        order: &MergeableOrder<Bytes>,
         txs: &[(usize, RecoveredTx)],
     ) -> SimulationResult<&'c CachedRethDb<'b>> {
         let reverting_txs = order.reverting_txs();
@@ -456,7 +454,7 @@ where
         result
     }
 
-    fn recover_transactions(&self, order: &MergeableOrder) -> Option<Vec<(usize, RecoveredTx)>> {
+    fn recover_transactions(&self, order: &MergeableOrder<Bytes>) -> Option<Vec<(usize, RecoveredTx)>> {
         recover_transactions(order, &self.tx_hashes)
     }
 
@@ -522,7 +520,7 @@ struct BuiltBlock {
 
 /// Keeps a list of recovered transactions per bundle, and an index by score
 struct ScoredOrders<'a> {
-    original_orders: &'a [MergeableOrderWithOrigin],
+    original_orders: &'a [MergeableOrder<Bytes>],
     scored_orders: Vec<(usize, Vec<(usize, RecoveredTx)>)>,
     orders_by_score: BinaryHeap<(U256, usize)>,
 }
@@ -532,12 +530,9 @@ impl<'a> ScoredOrders<'a> {
     /// The scoring function receives a reference to an order and may return a
     /// score and a list of recovered transactions, or [`None`] if the order should
     /// be discarded.
-    fn from_orders_with_scorer<F, Error>(
-        original_orders: &'a [MergeableOrderWithOrigin],
-        scorer: F,
-    ) -> Result<Self, Error>
+    fn from_orders_with_scorer<F, Error>(original_orders: &'a [MergeableOrder<Bytes>], scorer: F) -> Result<Self, Error>
     where
-        F: Fn(&MergeableOrderWithOrigin) -> Result<Option<(U256, Vec<(usize, RecoveredTx)>)>, Error>,
+        F: Fn(&MergeableOrder<Bytes>) -> Result<Option<(U256, Vec<(usize, RecoveredTx)>)>, Error>,
     {
         let mut scored_orders = Vec::with_capacity(original_orders.len());
         let mut orders_by_score = BinaryHeap::with_capacity(original_orders.len());
@@ -565,14 +560,14 @@ impl<'a> ScoredOrders<'a> {
 
 struct ScoredOrder<'a> {
     original_index: usize,
-    mergeable_order: &'a MergeableOrderWithOrigin,
+    mergeable_order: &'a MergeableOrder<Bytes>,
     recovered_txs: Vec<(usize, RecoveredTx)>,
 }
 
 fn score_orders<'a, 'b, 'c, BB, Ex, Ev>(
     builder: &mut BlockBuilder<'a, BB>,
     beneficiary: Address,
-    mergeable_orders: &'c [MergeableOrderWithOrigin],
+    mergeable_orders: &'c [MergeableOrder<Bytes>],
 ) -> Result<ScoredOrders<'c>, BlockMergingApiError>
 where
     BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
@@ -581,8 +576,7 @@ where
 {
     let initial_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
-    ScoredOrders::from_orders_with_scorer(mergeable_orders, |order_with_origin| -> Result<_, BlockMergingApiError> {
-        let order = &order_with_origin.order;
+    ScoredOrders::from_orders_with_scorer(mergeable_orders, |order| -> Result<_, BlockMergingApiError> {
         // The mergeable transactions should come from already validated payloads
         // But in case decoding fails, we just skip the bundle
         let Some(txs) = builder.recover_transactions(order) else {
@@ -629,8 +623,8 @@ where
 
     // Append transactions by score until we run out of space
     for scored_order in scored_orders.iter_by_score() {
-        let order = &scored_order.mergeable_order.order;
-        let origin = scored_order.mergeable_order.origin;
+        let order = &scored_order.mergeable_order;
+        let origin = *scored_order.mergeable_order.origin();
         let dropping_txs = order.dropping_txs();
 
         // Check for already applied transactions and try to drop them

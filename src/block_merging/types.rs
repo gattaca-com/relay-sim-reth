@@ -110,6 +110,7 @@ pub(crate) struct MergeableTransaction<Tx> {
     pub transaction: Tx,
     /// Txs that may revert.
     pub can_revert: bool,
+    /// Address of the builder that submitted this transaction.
     pub origin: Address,
 }
 
@@ -122,14 +123,8 @@ pub(crate) struct MergeableBundle<Tx> {
     pub reverting_txs: Vec<usize>,
     /// Txs that are allowed to be omitted, but not revert.
     pub dropping_txs: Vec<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct MergeableOrderWithOrigin<Tx> {
-    /// Address of the builder that submitted this order.
+    /// Address of the builder that submitted this bundle.
     pub origin: Address,
-    /// Mergeable order.
-    pub order: MergeableOrder<Tx>,
 }
 
 /// Represents one or more transactions to be appended into a block atomically.
@@ -162,6 +157,13 @@ impl<Tx> MergeableOrder<Tx> {
             MergeableOrder::Bundle(bundle) => &bundle.dropping_txs,
         }
     }
+
+    pub(crate) fn origin(&self) -> &Address {
+        match self {
+            MergeableOrder::Tx(tx) => &tx.origin,
+            MergeableOrder::Bundle(bundle) => &bundle.origin,
+        }
+    }
 }
 
 #[serde_as]
@@ -173,7 +175,7 @@ pub struct BlockMergeRequestV1 {
     pub proposer_fee_recipient: Address,
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
-    pub merging_data: Vec<MergeableOrderWithOrigin>,
+    pub merging_data: Vec<MergeableOrder<Bytes>>,
 }
 
 #[serde_as]
