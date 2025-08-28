@@ -222,7 +222,7 @@ impl BlockMergingApi {
         }
 
         let (proposer_value, distributed_value, updated_revenues) =
-            prepare_revenues(&self.distribution_config, revenues, relay_fee_recipient, original_value, beneficiary);
+            prepare_revenues(&self.distribution_config, revenues, relay_fee_recipient, beneficiary);
 
         let proposer_delta = proposer_value.saturating_sub(original_value);
         if proposer_delta.is_zero() {
@@ -357,7 +357,6 @@ pub(crate) fn prepare_revenues(
     distribution_config: &DistributionConfig,
     revenues: HashMap<Address, U256>,
     relay_fee_recipient: Address,
-    original_block_value: U256,
     block_beneficiary: Address,
 ) -> (U256, U256, HashMap<Address, U256>) {
     let mut updated_revenues = HashMap::with_capacity(revenues.len());
@@ -385,9 +384,7 @@ pub(crate) fn prepare_revenues(
     // Just in case, we remove the beneficiary address from the distribution and update the total
     distributed_value -= updated_revenues.remove(&block_beneficiary).unwrap_or(U256::ZERO);
 
-    let proposer_value = original_block_value + proposer_added_value;
-
-    (proposer_value, distributed_value, updated_revenues)
+    (proposer_added_value, distributed_value, updated_revenues)
 }
 
 struct BlockBuilder<BB> {
