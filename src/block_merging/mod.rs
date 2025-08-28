@@ -514,7 +514,7 @@ where
 
         // Append the bundle
 
-        // TODO: avoid re-execution
+        // We can't avoid re-execution here due to the BlockBuilder API
         for (_i, tx) in order.into_transactions().into_iter().enumerate().filter(|(i, _tx)| should_be_included[*i]) {
             builder.append_transaction(tx)?;
         }
