@@ -382,7 +382,6 @@ struct BlockBuilder<BB> {
 
     gas_used: u64,
     gas_limit: u64,
-    transactions: Vec<RecoveredTx>,
     tx_hashes: HashSet<TxHash>,
 
     blob_versioned_hashes: Vec<B256>,
@@ -402,7 +401,6 @@ where
             block_builder,
             gas_used: 0,
             gas_limit,
-            transactions: Default::default(),
             tx_hashes: Default::default(),
             blob_versioned_hashes: Default::default(),
             number_of_blobs_in_base_block: 0,
@@ -414,8 +412,6 @@ where
         txs: impl ExactSizeIterator<Item = RecoveredTx>,
     ) -> Result<(), BlockExecutionError> {
         self.block_builder.apply_pre_execution_changes()?;
-
-        self.transactions = Vec::with_capacity(txs.len());
 
         // Keep track of already applied txs, to discard duplicates
         self.tx_hashes = HashSet::with_capacity(txs.len());
@@ -469,18 +465,17 @@ where
     }
 
     fn append_transaction(&mut self, tx: RecoveredTx) -> Result<bool, BlockExecutionError> {
-        let mut is_valid = false;
+        let mut is_success = false;
         self.gas_used +=
-            self.block_builder.execute_transaction_with_result_closure(tx.clone(), |r| is_valid = r.is_success())?;
+            self.block_builder.execute_transaction_with_result_closure(tx.clone(), |r| is_success = r.is_success())?;
 
-        self.transactions.push(tx.clone());
         self.tx_hashes.insert(*tx.tx_hash());
         // If tx has blobs, store the order index and tx sub-index to add the blobs to the payload
         // Also store the versioned hash for validation
         if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
             self.blob_versioned_hashes.extend(versioned_hashes);
         }
-        Ok(is_valid)
+        Ok(is_success)
     }
 
     fn finish(self, state_provider: &dyn StateProvider) -> Result<BuiltBlock, BlockMergingApiError> {
