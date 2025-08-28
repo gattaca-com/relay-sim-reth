@@ -223,14 +223,17 @@ pub(crate) struct SimulatedOrder {
 }
 
 #[derive(Debug, thiserror::Error)]
-// TODO
 pub(crate) enum SimulationError {
-    #[error("invalid transaction index in bundle")]
-    Foo,
     #[error("tx decode error: {_0}")]
     Provider(#[from] ProviderError),
     #[error("gas used exceeds allotted block limit")]
     OutOfBlockGas,
+    #[error("duplicate transaction in bundle")]
+    DuplicateTransaction,
+    #[error("transaction {_0} reverted and is not allowed to revert")]
+    TransactionReverted(usize),
+    #[error("transaction {_0} is invalid and can't be dropped")]
+    InvalidTransaction(usize),
 }
 
 #[serde_as]

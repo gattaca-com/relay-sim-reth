@@ -428,8 +428,7 @@ where
             .any(|(i, tx)| self.was_already_applied(tx.tx_hash()) && dropping_txs.contains(&i));
 
         if any_duplicate_undroppable_txs {
-            // TODO
-            return Err(SimulationError::Foo);
+            return Err(SimulationError::DuplicateTransaction);
         }
 
         let simulated_order = simulate_order(&self.evm_config, self.get_state(), self.evm_env.clone(), order)?;
@@ -565,8 +564,7 @@ where
                         // Tx should be dropped
                         included_txs[i] = false;
                     } else {
-                        // TODO
-                        return Err(SimulationError::Foo);
+                        return Err(SimulationError::TransactionReverted(i));
                     }
                 }
                 gas_used += result.result.gas_used();
@@ -579,9 +577,8 @@ where
                     // The transaction might have been invalidated by another one, so we drop it
                     included_txs[i] = false;
                 } else {
-                    // The error isn't transaction-related, so we just drop this bundle
-                    // TODO
-                    return Err(SimulationError::Foo);
+                    // The error isn't transaction-related or tx can't be dropped, so we just drop this bundle
+                    return Err(SimulationError::InvalidTransaction(i));
                 }
             }
         };
