@@ -396,14 +396,14 @@ where
         // Insert the transactions from the unmerged block
         for tx in txs {
             let tx: RecoveredTx = tx.try_into_recovered().expect("signature is valid");
-            // TODO: avoid clone
-            self.gas_used += self.block_builder.execute_transaction(tx.clone())?;
 
             self.tx_hashes.insert(*tx.tx_hash());
+
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
                 self.number_of_blobs_in_base_block += 1;
                 self.blob_versioned_hashes.extend(versioned_hashes);
             }
+            self.gas_used += self.block_builder.execute_transaction(tx)?;
         }
 
         Ok(())
