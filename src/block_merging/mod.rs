@@ -224,6 +224,7 @@ impl BlockMergingApi {
         Ok((response, built_block.blob_versioned_hashes, request_cache))
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn append_payment_txs<'a, BB, Ex, Ev>(
         &self,
         builder: &mut BlockBuilder<BB>,
