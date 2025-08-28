@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use alloy_consensus::{BlockHeader, SignableTransaction, Transaction, TxEip1559};
 use alloy_eips::{Decodable2718, Encodable2718, eip7685::RequestsOrHash};
@@ -10,7 +10,6 @@ use alloy_rpc_types_engine::{
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, sol};
-use bytes::Bytes;
 use reth_ethereum::{
     Block, EthPrimitives,
     chainspec::EthChainSpec,
@@ -26,6 +25,10 @@ use reth_ethereum::{
     primitives::SignedTransaction,
     provider::ChainSpecProvider,
     storage::{StateProvider, StateProviderFactory},
+    trie::{
+        iter::{IntoParallelIterator, ParallelIterator},
+        slice::ParallelSliceMut,
+    },
 };
 use reth_node_builder::{Block as _, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, PayloadValidator};
 use reth_primitives::Recovered;
@@ -40,7 +43,10 @@ pub(crate) use crate::block_merging::api::{BlockMergingApi, BlockMergingApiServe
 use crate::{
     block_merging::{
         error::BlockMergingApiError,
-        types::{BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrder, RecoveredTx, SignedTx},
+        types::{
+            BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrderRecovered, RecoveredTx,
+            SignedTx, SimulatedOrder, SimulationError,
+        },
     },
     common::CachedRethDb,
 };
@@ -124,13 +130,20 @@ impl BlockMergingApi {
 
             let block_builder = evm_config.create_block_builder(evm, &parent_header, ctx);
 
-            let mut builder = BlockBuilder::new(evm_config, evm_env, block_builder, gas_limit);
+            let mut builder = BlockBuilder::new(evm_config.clone(), evm_env, block_builder, gas_limit);
 
             builder.execute_base_block(transactions)?;
 
-            let scored_orders = score_orders(&mut builder, beneficiary, &request.merging_data)?;
+            let recovered_orders: Vec<MergeableOrderRecovered> =
+                request.merging_data.into_par_iter().filter_map(|order| order.recover().ok()).collect();
 
-            let revenues = append_greedily_until_gas_limit(&mut builder, beneficiary, scored_orders)?;
+            let mut simulated_orders: Vec<SimulatedOrder> =
+                recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
+
+            // Sort orders by revenue, in descending order
+            simulated_orders.par_sort_unstable_by(|o1, o2| o1.builder_payment.cmp(&o2.builder_payment).reverse());
+
+            let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
 
             let (proposer_value, distributed_value, updated_revenues) = prepare_revenues(
                 &self.distribution_config,
@@ -201,7 +214,7 @@ impl BlockMergingApi {
 
     fn append_payment_txs<'a, BB, Ex, Ev>(
         &self,
-        builder: &mut BlockBuilder<'a, BB>,
+        builder: &mut BlockBuilder<BB>,
         signer: &PrivateKeySigner,
         updated_revenues: &HashMap<Address, U256>,
         distributed_value: U256,
@@ -288,42 +301,6 @@ fn sign_transaction(signer: &PrivateKeySigner, tx: TxEip1559) -> Result<Recovere
     Ok(recovered_signed_tx)
 }
 
-/// Recovers transactions from a bundle
-pub(crate) fn recover_transactions(
-    order: &MergeableOrder<Bytes>,
-    applied_txs: &HashSet<TxHash>,
-) -> Option<Vec<(usize, RecoveredTx)>> {
-    order
-        .transactions()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, b)| {
-            let mut buf = b.as_ref();
-            let Ok(tx) = <SignedTx as Decodable2718>::decode_2718(&mut buf) else {
-                return Some(Err(()));
-            };
-            if !buf.is_empty() {
-                return Some(Err(()));
-            }
-            // Check if it was already applied
-            if !applied_txs.contains(tx.tx_hash()) {
-                if order.dropping_txs().contains(&i) {
-                    // If the transaction was already applied and can be dropped, we drop it
-                    return None;
-                } else {
-                    // If it can't be dropped, we return an error
-                    return Some(Err(()));
-                }
-            }
-            let Ok(recovered) = tx.try_into_recovered() else {
-                return Some(Err(()));
-            };
-            Some(Ok((i, recovered)))
-        })
-        .collect::<Result<_, _>>()
-        .ok()
-}
-
 /// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
 pub(crate) fn encode_disperse_eth_calldata(recipients: Vec<Address>, values: Vec<U256>) -> Vec<u8> {
     sol! {
@@ -372,8 +349,8 @@ pub(crate) fn prepare_revenues(
     (proposer_value, distributed_value, updated_revenues)
 }
 
-struct BlockBuilder<'a, BB> {
-    evm_config: &'a EthEvmConfig,
+struct BlockBuilder<BB> {
+    evm_config: EthEvmConfig,
     evm_env: EvmEnvFor<EthEvmConfig>,
     block_builder: BB,
 
@@ -386,13 +363,13 @@ struct BlockBuilder<'a, BB> {
     number_of_blobs_in_base_block: usize,
 }
 
-impl<'a, 'b, BB, Ex, Ev> BlockBuilder<'a, BB>
+impl<'a, BB, Ex, Ev> BlockBuilder<BB>
 where
     BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
-    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'b,
-    Ev: Evm<DB = &'b mut CachedRethDb<'b>> + 'b,
+    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
+    Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
 {
-    fn new(evm_config: &'a EthEvmConfig, evm_env: EvmEnvFor<EthEvmConfig>, block_builder: BB, gas_limit: u64) -> Self {
+    fn new(evm_config: EthEvmConfig, evm_env: EvmEnvFor<EthEvmConfig>, block_builder: BB, gas_limit: u64) -> Self {
         Self {
             evm_config,
             evm_env,
@@ -430,7 +407,7 @@ where
         Ok(())
     }
 
-    fn get_state<'c>(&'c self) -> &'c CachedRethDb<'b> {
+    fn get_state<'b>(&'b self) -> &'b CachedRethDb<'a> {
         self.block_builder.executor().evm().db()
     }
 
@@ -438,24 +415,27 @@ where
         self.tx_hashes.contains(tx_hash)
     }
 
-    fn simulate_order<'c>(
-        &'c self,
-        order: &MergeableOrder<Bytes>,
-        txs: &[(usize, RecoveredTx)],
-    ) -> SimulationResult<&'c CachedRethDb<'b>> {
-        let reverting_txs = order.reverting_txs();
+    fn simulate_order(&self, order: MergeableOrderRecovered) -> Result<SimulatedOrder, SimulationError> {
         let dropping_txs = order.dropping_txs();
-        let mut result =
-            simulate_order(self.evm_config, self.get_state(), self.evm_env.clone(), reverting_txs, dropping_txs, txs);
-        // If we go past gas limit, return an invalid result
-        if self.gas_used + result.gas_used > self.gas_limit {
-            result.is_valid = false;
-        }
-        result
-    }
 
-    fn recover_transactions(&self, order: &MergeableOrder<Bytes>) -> Option<Vec<(usize, RecoveredTx)>> {
-        recover_transactions(order, &self.tx_hashes)
+        // Check for undroppable duplicate transactions
+        let any_duplicate_undroppable_txs = order
+            .transactions()
+            .iter()
+            .enumerate()
+            .any(|(i, tx)| self.was_already_applied(tx.tx_hash()) && dropping_txs.contains(&i));
+
+        if any_duplicate_undroppable_txs {
+            // TODO
+            return Err(SimulationError::Foo);
+        }
+
+        let simulated_order = simulate_order(&self.evm_config, self.get_state(), self.evm_env.clone(), order)?;
+        // If we go past gas limit, return an invalid result
+        if self.gas_used + simulated_order.gas_used > self.gas_limit {
+            return Err(SimulationError::OutOfBlockGas);
+        }
+        Ok(simulated_order)
     }
 
     fn append_transaction(&mut self, tx: RecoveredTx) -> Result<bool, BlockExecutionError> {
@@ -496,19 +476,6 @@ where
     }
 }
 
-struct SimulationResult<DB> {
-    is_valid: bool,
-    gas_used: u64,
-    should_be_included: Vec<bool>,
-    resulting_state: CacheDB<DB>,
-}
-
-impl<DB> SimulationResult<DB> {
-    fn new_invalid(resulting_state: CacheDB<DB>) -> Self {
-        Self { is_valid: false, gas_used: 0, should_be_included: vec![], resulting_state }
-    }
-}
-
 struct BuiltBlock {
     execution_payload: ExecutionPayloadV3,
     execution_requests: ExecutionRequestsV4,
@@ -518,161 +485,42 @@ struct BuiltBlock {
     appended_blob_versioned_hashes: Vec<B256>,
 }
 
-/// Keeps a list of recovered transactions per bundle, and an index by score
-struct ScoredOrders<'a> {
-    original_orders: &'a [MergeableOrder<Bytes>],
-    scored_orders: Vec<(usize, Vec<(usize, RecoveredTx)>)>,
-    orders_by_score: BinaryHeap<(U256, usize)>,
-}
-
-impl<'a> ScoredOrders<'a> {
-    /// Creates an ordered index for `original_orders` using the `scorer` function.
-    /// The scoring function receives a reference to an order and may return a
-    /// score and a list of recovered transactions, or [`None`] if the order should
-    /// be discarded.
-    fn from_orders_with_scorer<F, Error>(original_orders: &'a [MergeableOrder<Bytes>], scorer: F) -> Result<Self, Error>
-    where
-        F: Fn(&MergeableOrder<Bytes>) -> Result<Option<(U256, Vec<(usize, RecoveredTx)>)>, Error>,
-    {
-        let mut scored_orders = Vec::with_capacity(original_orders.len());
-        let mut orders_by_score = BinaryHeap::with_capacity(original_orders.len());
-        for (i, order) in original_orders.iter().enumerate() {
-            if let Some((score, recovered_txs)) = scorer(order)? {
-                orders_by_score.push((score, scored_orders.len()));
-                scored_orders.push((i, recovered_txs));
-            }
-        }
-        Ok(Self { original_orders, scored_orders, orders_by_score })
-    }
-
-    /// Returns an iterator over the scored orders by score, in descending order.
-    fn iter_by_score(mut self) -> impl Iterator<Item = ScoredOrder<'a>> {
-        std::iter::from_fn(move || {
-            let (_score, scored_orders_index) = self.orders_by_score.pop()?;
-            // NOTE: this `take` won't cause problems because indices to this array are
-            // unique across the score index
-            let (original_index, txs) = std::mem::take(&mut self.scored_orders[scored_orders_index]);
-            let mergeable_order = &self.original_orders[original_index];
-            Some(ScoredOrder { original_index, mergeable_order, recovered_txs: txs })
-        })
-    }
-}
-
-struct ScoredOrder<'a> {
-    original_index: usize,
-    mergeable_order: &'a MergeableOrder<Bytes>,
-    recovered_txs: Vec<(usize, RecoveredTx)>,
-}
-
-fn score_orders<'a, 'b, 'c, BB, Ex, Ev>(
-    builder: &mut BlockBuilder<'a, BB>,
-    beneficiary: Address,
-    mergeable_orders: &'c [MergeableOrder<Bytes>],
-) -> Result<ScoredOrders<'c>, BlockMergingApiError>
-where
-    BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
-    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'b,
-    Ev: Evm<DB = &'b mut CachedRethDb<'b>> + 'b,
-{
-    let initial_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
-
-    ScoredOrders::from_orders_with_scorer(mergeable_orders, |order| -> Result<_, BlockMergingApiError> {
-        // The mergeable transactions should come from already validated payloads
-        // But in case decoding fails, we just skip the bundle
-        let Some(txs) = builder.recover_transactions(order) else {
-            return Ok(None);
-        };
-
-        let simulation_result = builder.simulate_order(order, &txs);
-        let bundle_is_valid = simulation_result.is_valid;
-        let cached_db = simulation_result.resulting_state;
-
-        if !bundle_is_valid {
-            return Ok(None);
-        }
-
-        // Consider any balance changes on the beneficiary as tx value
-        let new_balance = cached_db.basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
-
-        let total_value = new_balance.saturating_sub(initial_balance);
-
-        // If the total value is zero, discard the bundle
-        if total_value.is_zero() {
-            return Ok(None);
-        }
-        // Use the tx's value as its score
-        // We could use other heuristics here
-        let score = total_value;
-        Ok(Some((score, txs)))
-    })
-}
-
-fn append_greedily_until_gas_limit<'a, 'b, 'c, BB, Ex, Ev>(
-    builder: &mut BlockBuilder<'a, BB>,
-    beneficiary: Address,
-    scored_orders: ScoredOrders<'c>,
+fn append_greedily_until_gas_limit<'a, BB, Ex, Ev>(
+    builder: &mut BlockBuilder<BB>,
+    simulated_orders: Vec<SimulatedOrder>,
 ) -> Result<HashMap<Address, U256>, BlockMergingApiError>
 where
     BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
-    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'b,
-    Ev: Evm<DB = &'b mut CachedRethDb<'b>> + 'b,
+    Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
+    Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
 {
     let mut revenues = HashMap::new();
 
-    let mut current_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
-
     // Append transactions by score until we run out of space
-    for scored_order in scored_orders.iter_by_score() {
-        let order = &scored_order.mergeable_order;
-        let origin = *scored_order.mergeable_order.origin();
-        let dropping_txs = order.dropping_txs();
+    for simulated_order in simulated_orders {
+        let order = simulated_order.order;
+        let origin = *order.origin();
 
-        // Check for already applied transactions and try to drop them
-        let filtered_txs = scored_order
-            .recovered_txs
-            .into_iter()
-            .filter_map(|(i, tx)| {
-                if !builder.was_already_applied(tx.tx_hash()) {
-                    Some(Ok((i, tx)))
-                } else if dropping_txs.contains(&i) {
-                    None
-                } else {
-                    Some(Err(()))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>();
-
-        // Discard the bundle if any duplicates couldn't be dropped
-        let Ok(txs) = filtered_txs else {
+        let Ok(simulated_order) = builder.simulate_order(order) else {
             continue;
         };
 
-        let result = builder.simulate_order(order, &txs);
+        let SimulatedOrder { order, should_be_included, builder_payment, .. } = simulated_order;
 
-        let bundle_is_valid = result.is_valid;
-        let should_be_included = result.should_be_included;
-
-        if !bundle_is_valid {
+        // Skip any orders without revenue
+        if builder_payment.is_zero() {
             continue;
         }
 
-        // Execute the transaction bundle
+        // Append the bundle
 
-        let mut total_value = U256::ZERO;
-
-        for (_i, tx) in txs.into_iter().filter(|(i, _tx)| should_be_included[*i]) {
+        // TODO: avoid re-execution
+        for (_i, tx) in order.into_transactions().into_iter().enumerate().filter(|(i, _tx)| should_be_included[*i]) {
             builder.append_transaction(tx)?;
         }
-        // Consider any balance changes on the beneficiary as tx value
-        let new_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
-
-        total_value += new_balance.saturating_sub(current_balance);
-        current_balance = new_balance;
 
         // Update the revenue for the bundle's origin
-        if !total_value.is_zero() {
-            revenues.entry(origin).and_modify(|v| *v += total_value).or_insert(total_value);
-        }
+        revenues.entry(origin).and_modify(|v| *v += builder_payment).or_insert(builder_payment);
     }
     Ok(revenues)
 }
@@ -684,25 +532,28 @@ fn simulate_order<DBRef>(
     evm_config: &EthEvmConfig,
     db_ref: DBRef,
     evm_env: EvmEnvFor<EthEvmConfig>,
-    reverting_txs: &[usize],
-    dropping_txs: &[usize],
-    txs: &[(usize, RecoveredTx)],
-) -> SimulationResult<DBRef>
+    order: MergeableOrderRecovered,
+) -> Result<SimulatedOrder, SimulationError>
 where
     DBRef: DatabaseRef + core::fmt::Debug,
     DBRef::Error: Send + Sync + 'static,
+    SimulationError: From<DBRef::Error>,
 {
     // Wrap current state in cache to avoid mutating it
     let cached_db = CacheDB::new(db_ref);
     // Create a new EVM with the pre-state
     let mut evm = evm_config.evm_with_env(cached_db, evm_env);
+    let initial_balance = evm.db().basic_ref(evm.block.beneficiary)?.map_or(U256::ZERO, |info| info.balance);
 
-    let mut gas_used_in_bundle = 0;
-    let mut included_txs = vec![true; txs.last().map(|(i, _)| *i + 1).unwrap_or(0)];
+    let txs = order.transactions();
+    let reverting_txs = order.reverting_txs();
+    let dropping_txs = order.dropping_txs();
+
+    let mut gas_used = 0;
+    let mut included_txs = vec![true; txs.len()];
 
     // Check the bundle can be included in the block
-    for (i, tx) in txs {
-        let i = *i;
+    for (i, tx) in txs.iter().enumerate() {
         match evm.transact(tx) {
             Ok(result) => {
                 // If tx reverted and is not allowed to
@@ -712,10 +563,11 @@ where
                         // Tx should be dropped
                         included_txs[i] = false;
                     } else {
-                        return SimulationResult::new_invalid(evm.into_db());
+                        // TODO
+                        return Err(SimulationError::Foo);
                     }
                 }
-                gas_used_in_bundle += result.result.gas_used();
+                gas_used += result.result.gas_used();
                 // Apply the state changes to the simulated state
                 // Note that this only commits to the cache wrapper, not the underlying database
                 evm.db_mut().commit(result.state);
@@ -726,17 +578,15 @@ where
                     included_txs[i] = false;
                 } else {
                     // The error isn't transaction-related, so we just drop this bundle
-                    return SimulationResult::new_invalid(evm.into_db());
+                    // TODO
+                    return Err(SimulationError::Foo);
                 }
             }
         };
     }
-    SimulationResult {
-        is_valid: true,
-        gas_used: gas_used_in_bundle,
-        should_be_included: included_txs,
-        resulting_state: evm.into_db(),
-    }
+    let final_balance = evm.db().basic_ref(evm.block.beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+    let builder_payment = final_balance.saturating_sub(initial_balance);
+    Ok(SimulatedOrder { order, gas_used, should_be_included: included_txs, builder_payment })
 }
 
 #[cfg(test)]

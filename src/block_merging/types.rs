@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
+use alloy_eips::{Decodable2718, eip2718::Eip2718Error};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use bytes::Bytes;
-use reth_ethereum::evm::EthEvmConfig;
+use reth_ethereum::{evm::EthEvmConfig, primitives::SignedTransaction, provider::ProviderError};
 use reth_node_builder::ConfigureEvm;
 use reth_primitives::{NodePrimitives, Recovered};
 use revm_primitives::{Address, B256, U256, address};
@@ -127,6 +128,9 @@ pub(crate) struct MergeableBundle<Tx> {
     pub origin: Address,
 }
 
+pub(crate) type MergeableOrderBytes = MergeableOrder<Bytes>;
+pub(crate) type MergeableOrderRecovered = MergeableOrder<Recovered<SignedTx>>;
+
 /// Represents one or more transactions to be appended into a block atomically.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -140,6 +144,13 @@ impl<Tx> MergeableOrder<Tx> {
         match self {
             MergeableOrder::Tx(tx) => std::slice::from_ref(&tx.transaction),
             MergeableOrder::Bundle(bundle) => &bundle.transactions,
+        }
+    }
+
+    pub(crate) fn into_transactions(self) -> Vec<Tx> {
+        match self {
+            MergeableOrder::Tx(tx) => vec![tx.transaction],
+            MergeableOrder::Bundle(bundle) => bundle.transactions,
         }
     }
 
@@ -164,6 +175,62 @@ impl<Tx> MergeableOrder<Tx> {
             MergeableOrder::Bundle(bundle) => &bundle.origin,
         }
     }
+}
+
+impl MergeableOrderBytes {
+    pub(crate) fn recover(self) -> Result<MergeableOrderRecovered, RecoverError> {
+        match self {
+            MergeableOrder::Tx(tx) => {
+                let transaction = recover_transaction(&tx.transaction)?;
+                let MergeableTransaction { can_revert, origin, .. } = tx;
+                Ok(MergeableOrder::Tx(MergeableTransaction { transaction, can_revert, origin }))
+            }
+            MergeableOrder::Bundle(bundle) => {
+                let transactions = bundle.transactions.iter().map(recover_transaction).collect::<Result<_, _>>()?;
+                let MergeableBundle { reverting_txs, dropping_txs, origin, .. } = bundle;
+                Ok(MergeableOrder::Bundle(MergeableBundle { transactions, reverting_txs, dropping_txs, origin }))
+            }
+        }
+    }
+}
+
+fn recover_transaction(tx_bytes: &Bytes) -> Result<Recovered<SignedTx>, RecoverError> {
+    let mut buf = tx_bytes.as_ref();
+    let tx = <SignedTx as Decodable2718>::decode_2718(&mut buf)?;
+    // If buffer was not fully consumed, the transaction is invalid.
+    if !buf.is_empty() {
+        return Err(RecoverError::TrailingData);
+    }
+    let recovered = tx.try_into_recovered().map_err(|_| RecoverError::InvalidSignature)?;
+    Ok(recovered)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecoverError {
+    #[error("decode error: {_0}")]
+    Decode(#[from] Eip2718Error),
+    #[error("transaction has trailing data")]
+    TrailingData,
+    #[error("invalid signature")]
+    InvalidSignature,
+}
+
+pub(crate) struct SimulatedOrder {
+    pub(crate) order: MergeableOrderRecovered,
+    pub(crate) gas_used: u64,
+    pub(crate) should_be_included: Vec<bool>,
+    pub(crate) builder_payment: U256,
+}
+
+#[derive(Debug, thiserror::Error)]
+// TODO
+pub(crate) enum SimulationError {
+    #[error("invalid transaction index in bundle")]
+    Foo,
+    #[error("tx decode error: {_0}")]
+    Provider(#[from] ProviderError),
+    #[error("gas used exceeds allotted block limit")]
+    OutOfBlockGas,
 }
 
 #[serde_as]
