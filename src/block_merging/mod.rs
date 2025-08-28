@@ -30,7 +30,7 @@ use reth_ethereum::{
     },
 };
 use reth_node_builder::{Block as _, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, PayloadValidator};
-use reth_primitives::Recovered;
+use reth_primitives::{GotExpected, Recovered};
 use revm::{
     DatabaseCommit, DatabaseRef,
     database::{CacheDB, State},
@@ -204,7 +204,22 @@ impl BlockMergingApi {
         // Sort orders by revenue, in descending order
         simulated_orders.par_sort_unstable_by(|o1, o2| o1.builder_payment.cmp(&o2.builder_payment).reverse());
 
+        let initial_builder_balance =
+            builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+
         let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
+
+        let final_builder_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+
+        let total_revenue: U256 = revenues.values().sum();
+        let builder_balance_delta = final_builder_balance.saturating_sub(initial_builder_balance);
+
+        if total_revenue != builder_balance_delta {
+            return Err(BlockMergingApiError::BuilderBalanceDeltaMismatch(GotExpected {
+                expected: total_revenue,
+                got: builder_balance_delta,
+            }));
+        }
 
         let (proposer_value, distributed_value, updated_revenues) =
             prepare_revenues(&self.distribution_config, revenues, relay_fee_recipient, original_value, beneficiary);

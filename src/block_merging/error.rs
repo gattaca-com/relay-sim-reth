@@ -5,6 +5,8 @@ use reth_ethereum::{
     provider::ProviderError,
 };
 use reth_node_builder::NewPayloadError;
+use reth_primitives::GotExpected;
+use revm_primitives::U256;
 
 use crate::validation::error::{GetParentError, ValidationApiError};
 
@@ -27,6 +29,8 @@ pub(crate) enum BlockMergingApiError {
     MissingProposerPayment,
     #[error("could not verify proposer payment tx")]
     InvalidProposerPayment,
+    #[error("proposer payment delta mismatch: {_0}")]
+    BuilderBalanceDeltaMismatch(GotExpected<U256>),
     #[error("proposer payment delta is zero")]
     ZeroProposerDelta,
     #[error("revenue allocation tx reverted")]
@@ -52,6 +56,7 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             | BlockMergingApiError::ProposerPaymentReverted
             | BlockMergingApiError::ExecutionRequests
             | BlockMergingApiError::ZeroProposerDelta
+            | BlockMergingApiError::BuilderBalanceDeltaMismatch(_)
             | BlockMergingApiError::Provider(_) => internal_rpc_err(error.to_string()),
 
             BlockMergingApiError::Execution(err) => match err {
