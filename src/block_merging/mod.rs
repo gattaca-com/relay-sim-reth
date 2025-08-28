@@ -20,7 +20,7 @@ use reth_ethereum::{
             block::{BlockExecutionError, BlockExecutor},
             execute::BlockBuilder as RethBlockBuilder,
         },
-        revm::database::StateProviderDatabase,
+        revm::{cached::CachedReads, database::StateProviderDatabase},
     },
     primitives::SignedTransaction,
     provider::ChainSpecProvider,
@@ -44,8 +44,8 @@ use crate::{
     block_merging::{
         error::BlockMergingApiError,
         types::{
-            BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrderRecovered, RecoveredTx,
-            SignedTx, SimulatedOrder, SimulationError,
+            BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrderBytes,
+            MergeableOrderRecovered, RecoveredTx, SignedTx, SimulatedOrder, SimulationError,
         },
     },
     common::CachedRethDb,
@@ -58,19 +58,72 @@ pub(crate) mod types;
 impl BlockMergingApi {
     /// Core logic for appending additional transactions to a block.
     async fn merge_block_v1(&self, request: BlockMergeRequestV1) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
+        let block: Block = request.execution_payload.try_into_block().map_err(NewPayloadError::Eth)?;
+
+        let proposer_fee_recipient = request.proposer_fee_recipient;
+        let gas_limit = block.gas_limit;
+        let parent_beacon_block_root = block.parent_beacon_block_root().unwrap();
+
+        // The `merge_block` function is to avoid a lifetime leak that causes this
+        // async fn to not be Send, which is required for spawning it.
+        let (response, blob_versioned_hashes, request_cache) =
+            self.merge_block(request.original_value, proposer_fee_recipient, block, request.merging_data).await?;
+
+        let parent_hash = response.execution_payload.payload_inner.payload_inner.parent_hash;
+
+        self.validation.update_cached_reads(parent_hash, request_cache).await;
+
+        if self.validate_merged_blocks {
+            let block_hash = response.execution_payload.payload_inner.payload_inner.block_hash;
+            let gas_used = response.execution_payload.payload_inner.payload_inner.gas_used;
+
+            let message = BidTrace {
+                slot: 0, // unused
+                parent_hash,
+                block_hash,
+                builder_pubkey: Default::default(),  // unused
+                proposer_pubkey: Default::default(), // unused
+                proposer_fee_recipient,
+                gas_limit,
+                gas_used,
+                value: response.proposer_value,
+            };
+            let block = self.validation.payload_validator.ensure_well_formed_payload(ExecutionData {
+                payload: ExecutionPayload::V3(response.execution_payload.clone()),
+                sidecar: ExecutionPayloadSidecar::v4(
+                    CancunPayloadFields { parent_beacon_block_root, versioned_hashes: blob_versioned_hashes },
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Requests(response.execution_requests.to_requests()),
+                    },
+                ),
+            })?;
+
+            self.validation.validate_message_against_block(block, message, 0, false, None).await?;
+        }
+
+        Ok(response)
+    }
+
+    /// Merge a block by appending mergeable orders.
+    /// Returns the response with the block, the versioned hashes of the appended blobs,
+    /// and the cached reads used during execution.
+    async fn merge_block(
+        &self,
+        original_value: U256,
+        proposer_fee_recipient: Address,
+        base_block: Block,
+        merging_data: Vec<MergeableOrderBytes>,
+    ) -> Result<(BlockMergeResponseV1, Vec<B256>, CachedReads), BlockMergingApiError> {
         info!(target: "rpc::relay", "Merging block v1");
         let validation = &self.validation;
         let evm_config = &validation.evm_config;
 
-        let block: Block = request.execution_payload.try_into_block().map_err(NewPayloadError::Eth)?;
-
-        let (header, body) = block.split();
+        let (header, body) = base_block.split();
 
         let (withdrawals, mut transactions) = (body.withdrawals, body.transactions);
 
         let block_base_fee_per_gas = header.base_fee_per_gas.unwrap_or_default();
 
-        let proposer_fee_recipient = request.proposer_fee_recipient;
         let relay_fee_recipient = self.relay_fee_recipient;
         let beneficiary = header.beneficiary;
 
@@ -84,7 +137,7 @@ impl BlockMergingApi {
         let Some(payment_tx) = transactions.pop() else {
             return Err(BlockMergingApiError::MissingProposerPayment);
         };
-        if payment_tx.value() != request.original_value || payment_tx.to() != Some(proposer_fee_recipient) {
+        if payment_tx.value() != original_value || payment_tx.to() != Some(proposer_fee_recipient) {
             return Err(BlockMergingApiError::InvalidProposerPayment);
         }
 
@@ -109,109 +162,65 @@ impl BlockMergingApi {
 
         let parent_hash = header.parent_hash;
 
-        // This scope is to avoid the state_db lifetime leaking past an await point.
-        // That leak causes the async fn to not be Send, which is required for spawning it.
-        let (response, blob_versioned_hashes, request_cache) = {
-            let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
+        let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
 
-            let mut request_cache = validation.cached_reads(parent_hash).await;
+        let mut request_cache = validation.cached_reads(parent_hash).await;
 
-            let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
+        let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
 
-            let mut state_db = State::builder().with_database_ref(&cached_db).build();
+        let mut state_db = State::builder().with_database_ref(&cached_db).build();
 
-            let parent_header = validation.get_parent_header(parent_hash)?;
+        let parent_header = validation.get_parent_header(parent_hash)?;
 
-            // Execute the base block
-            let evm_env = evm_config
-                .next_evm_env(&parent_header, &new_block_attrs)
-                .or(Err(BlockMergingApiError::NextEvmEnvFail))?;
+        // Execute the base block
+        let evm_env =
+            evm_config.next_evm_env(&parent_header, &new_block_attrs).or(Err(BlockMergingApiError::NextEvmEnvFail))?;
 
-            let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
-            let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
+        let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
+        let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
 
-            let block_builder = evm_config.create_block_builder(evm, &parent_header, ctx);
+        let block_builder = evm_config.create_block_builder(evm, &parent_header, ctx);
 
-            let mut builder = BlockBuilder::new(evm_config.clone(), evm_env, block_builder, gas_limit);
+        let mut builder = BlockBuilder::new(evm_config.clone(), evm_env, block_builder, gas_limit);
 
-            builder.execute_base_block(transactions)?;
+        builder.execute_base_block(transactions)?;
 
-            let recovered_orders: Vec<MergeableOrderRecovered> =
-                request.merging_data.into_par_iter().filter_map(|order| order.recover().ok()).collect();
+        let recovered_orders: Vec<MergeableOrderRecovered> =
+            merging_data.into_par_iter().filter_map(|order| order.recover().ok()).collect();
 
-            let mut simulated_orders: Vec<SimulatedOrder> =
-                recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
+        let mut simulated_orders: Vec<SimulatedOrder> =
+            recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
 
-            // Sort orders by revenue, in descending order
-            simulated_orders.par_sort_unstable_by(|o1, o2| o1.builder_payment.cmp(&o2.builder_payment).reverse());
+        // Sort orders by revenue, in descending order
+        simulated_orders.par_sort_unstable_by(|o1, o2| o1.builder_payment.cmp(&o2.builder_payment).reverse());
 
-            let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
+        let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
 
-            let (proposer_value, distributed_value, updated_revenues) = prepare_revenues(
-                &self.distribution_config,
-                revenues,
-                relay_fee_recipient,
-                request.original_value,
-                beneficiary,
-            );
+        let (proposer_value, distributed_value, updated_revenues) =
+            prepare_revenues(&self.distribution_config, revenues, relay_fee_recipient, original_value, beneficiary);
 
-            self.append_payment_txs(
-                &mut builder,
-                signer,
-                &updated_revenues,
-                distributed_value,
-                max_distribution_gas,
-                block_base_fee_per_gas.into(),
-                payment_tx.gas_limit(),
-                proposer_fee_recipient,
-                proposer_value,
-            )?;
+        self.append_payment_txs(
+            &mut builder,
+            signer,
+            &updated_revenues,
+            distributed_value,
+            max_distribution_gas,
+            block_base_fee_per_gas.into(),
+            payment_tx.gas_limit(),
+            proposer_fee_recipient,
+            proposer_value,
+        )?;
 
-            let built_block = builder.finish(&state_provider)?;
-            let proposer_value = U256::ZERO;
+        let built_block = builder.finish(&state_provider)?;
+        let proposer_value = U256::ZERO;
 
-            let response = BlockMergeResponseV1 {
-                execution_payload: built_block.execution_payload,
-                execution_requests: built_block.execution_requests,
-                appended_blobs: built_block.appended_blob_versioned_hashes,
-                proposer_value,
-            };
-            (response, built_block.blob_versioned_hashes, request_cache)
+        let response = BlockMergeResponseV1 {
+            execution_payload: built_block.execution_payload,
+            execution_requests: built_block.execution_requests,
+            appended_blobs: built_block.appended_blob_versioned_hashes,
+            proposer_value,
         };
-        let block_hash = response.execution_payload.payload_inner.payload_inner.block_hash;
-
-        self.validation.update_cached_reads(parent_hash, request_cache).await;
-
-        if self.validate_merged_blocks {
-            let gas_used = response.execution_payload.payload_inner.payload_inner.gas_used;
-            let message = BidTrace {
-                slot: 0, // unused
-                parent_hash,
-                block_hash,
-                builder_pubkey: Default::default(),  // unused
-                proposer_pubkey: Default::default(), // unused
-                proposer_fee_recipient,
-                gas_limit: new_block_attrs.gas_limit,
-                gas_used,
-                value: response.proposer_value,
-            };
-            let block = self.validation.payload_validator.ensure_well_formed_payload(ExecutionData {
-                payload: ExecutionPayload::V3(response.execution_payload.clone()),
-                sidecar: ExecutionPayloadSidecar::v4(
-                    CancunPayloadFields {
-                        parent_beacon_block_root: new_block_attrs.parent_beacon_block_root.unwrap(),
-                        versioned_hashes: blob_versioned_hashes,
-                    },
-                    PraguePayloadFields {
-                        requests: RequestsOrHash::Requests(response.execution_requests.to_requests()),
-                    },
-                ),
-            })?;
-
-            self.validation.validate_message_against_block(block, message, 0, false, None).await?;
-        }
-
-        Ok(response)
+        Ok((response, built_block.blob_versioned_hashes, request_cache))
     }
 
     fn append_payment_txs<'a, BB, Ex, Ev>(
