@@ -25,6 +25,8 @@ pub(crate) enum BlockMergingApiError {
     MissingProposerPayment,
     #[error("could not verify proposer payment tx")]
     InvalidProposerPayment,
+    #[error("proposer payment delta is zero")]
+    ZeroProposerDelta,
     #[error("revenue allocation tx reverted")]
     RevenueAllocationReverted,
     #[error("proposer payment tx reverted")]
@@ -47,6 +49,7 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             | BlockMergingApiError::RevenueAllocationReverted
             | BlockMergingApiError::ProposerPaymentReverted
             | BlockMergingApiError::ExecutionRequests
+            | BlockMergingApiError::ZeroProposerDelta
             | BlockMergingApiError::Provider(_) => internal_rpc_err(error.to_string()),
 
             BlockMergingApiError::Execution(err) => match err {

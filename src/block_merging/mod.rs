@@ -120,7 +120,7 @@ impl BlockMergingApi {
 
         let (header, body) = base_block.split();
 
-        let (withdrawals, mut transactions) = (body.withdrawals, body.transactions);
+        let (withdrawals, transactions) = (body.withdrawals, body.transactions);
 
         let block_base_fee_per_gas = header.base_fee_per_gas.unwrap_or_default();
 
@@ -133,13 +133,15 @@ impl BlockMergingApi {
         };
 
         // Check that block has proposer payment, otherwise reject it.
-        // Also remove proposer payment, we'll later add our own
-        let Some(payment_tx) = transactions.pop() else {
+        // We don't remove it from the block, but add another payment transaction at the end.
+        let Some(payment_tx) = transactions.last() else {
             return Err(BlockMergingApiError::MissingProposerPayment);
         };
         if payment_tx.value() != original_value || payment_tx.to() != Some(proposer_fee_recipient) {
             return Err(BlockMergingApiError::InvalidProposerPayment);
         }
+
+        let payment_tx_gas_limit = payment_tx.gas_limit();
 
         // Leave some gas for the final revenue distribution call
         // and the proposer payment.
@@ -147,9 +149,9 @@ impl BlockMergingApi {
         // to 35k if the targets are new accounts.
         // This number leaves us space for ~9 non-empty targets, or ~2 new accounts.
         // TODO: compute dynamically by keeping track of gas cost
-        let max_distribution_gas = 100000;
+        let distribution_gas_limit = 100000;
         // We also leave some gas for the final proposer payment
-        let gas_limit = header.gas_limit - max_distribution_gas - payment_tx.gas_limit();
+        let gas_limit = header.gas_limit - distribution_gas_limit - payment_tx_gas_limit;
 
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp,
@@ -201,16 +203,21 @@ impl BlockMergingApi {
         let (proposer_value, distributed_value, updated_revenues) =
             prepare_revenues(&self.distribution_config, revenues, relay_fee_recipient, original_value, beneficiary);
 
+        let proposer_delta = proposer_value.saturating_sub(original_value);
+        if proposer_delta.is_zero() {
+            return Err(BlockMergingApiError::ZeroProposerDelta);
+        }
+
         self.append_payment_txs(
             &mut builder,
             signer,
             &updated_revenues,
             distributed_value,
-            max_distribution_gas,
+            distribution_gas_limit,
             block_base_fee_per_gas.into(),
-            payment_tx.gas_limit(),
+            payment_tx_gas_limit,
             proposer_fee_recipient,
-            proposer_value,
+            proposer_delta,
         )?;
 
         let built_block = builder.finish(&state_provider)?;
@@ -235,7 +242,7 @@ impl BlockMergingApi {
         block_base_fee_per_gas: u128,
         payment_tx_gas_limit: u64,
         proposer_fee_recipient: Address,
-        proposer_value: U256,
+        proposer_payment_value: U256,
     ) -> Result<(), BlockMergingApiError>
     where
         BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
@@ -285,7 +292,7 @@ impl BlockMergingApi {
             max_fee_per_gas: block_base_fee_per_gas,
             max_priority_fee_per_gas: 0,
             to: proposer_fee_recipient.into(),
-            value: proposer_value,
+            value: proposer_payment_value,
             access_list: Default::default(),
             input: Default::default(),
         };
