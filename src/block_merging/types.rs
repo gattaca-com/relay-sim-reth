@@ -105,18 +105,19 @@ impl DistributionConfig {
 
 /// Represents a single transaction to be appended into a block atomically.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct MergeableTransaction {
+pub(crate) struct MergeableTransaction<Tx> {
     /// Transaction that can be merged into the block.
-    pub transaction: Bytes,
+    pub transaction: Tx,
     /// Txs that may revert.
     pub can_revert: bool,
+    pub origin: Address,
 }
 
 /// Represents a bundle of transactions to be appended into a block atomically.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub(crate) struct MergeableBundle {
+pub(crate) struct MergeableBundle<Tx> {
     /// List of transactions that can be merged into the block.
-    pub transactions: Vec<Bytes>,
+    pub transactions: Vec<Tx>,
     /// Txs that may revert.
     pub reverting_txs: Vec<usize>,
     /// Txs that are allowed to be omitted, but not revert.
@@ -124,23 +125,23 @@ pub(crate) struct MergeableBundle {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct MergeableOrderWithOrigin {
+pub(crate) struct MergeableOrderWithOrigin<Tx> {
     /// Address of the builder that submitted this order.
     pub origin: Address,
     /// Mergeable order.
-    pub order: MergeableOrder,
+    pub order: MergeableOrder<Tx>,
 }
 
 /// Represents one or more transactions to be appended into a block atomically.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
-pub(crate) enum MergeableOrder {
-    Tx(MergeableTransaction),
-    Bundle(MergeableBundle),
+pub(crate) enum MergeableOrder<Tx> {
+    Tx(MergeableTransaction<Tx>),
+    Bundle(MergeableBundle<Tx>),
 }
 
-impl MergeableOrder {
-    pub(crate) fn transactions(&self) -> &[Bytes] {
+impl<Tx> MergeableOrder<Tx> {
+    pub(crate) fn transactions(&self) -> &[Tx] {
         match self {
             MergeableOrder::Tx(tx) => std::slice::from_ref(&tx.transaction),
             MergeableOrder::Bundle(bundle) => &bundle.transactions,
