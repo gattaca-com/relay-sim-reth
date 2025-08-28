@@ -432,7 +432,11 @@ where
         }
 
         let simulated_order = simulate_order(&self.evm_config, self.get_state(), self.evm_env.clone(), order)?;
-        // If we go past gas limit, return an invalid result
+        // Check the order has some revenue
+        if simulated_order.builder_payment.is_zero() {
+            return Err(SimulationError::ZeroBuilderPayment);
+        }
+        // Check we have enough gas to include the order
         if self.gas_used + simulated_order.gas_used > self.gas_limit {
             return Err(SimulationError::OutOfBlockGas);
         }
@@ -508,11 +512,6 @@ where
 
         let SimulatedOrder { order, should_be_included, builder_payment, .. } = simulated_order;
 
-        // Skip any orders without revenue
-        if builder_payment.is_zero() {
-            continue;
-        }
-
         // Append the bundle
 
         // TODO: avoid re-execution
@@ -564,7 +563,7 @@ where
                         // Tx should be dropped
                         included_txs[i] = false;
                     } else {
-                        return Err(SimulationError::TransactionReverted(i));
+                        return Err(SimulationError::RevertNotAllowed(i));
                     }
                 }
                 gas_used += result.result.gas_used();
@@ -578,7 +577,7 @@ where
                     included_txs[i] = false;
                 } else {
                     // The error isn't transaction-related or tx can't be dropped, so we just drop this bundle
-                    return Err(SimulationError::InvalidTransaction(i));
+                    return Err(SimulationError::DropNotAllowed(i));
                 }
             }
         };

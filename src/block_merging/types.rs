@@ -226,14 +226,16 @@ pub(crate) struct SimulatedOrder {
 pub(crate) enum SimulationError {
     #[error("tx decode error: {_0}")]
     Provider(#[from] ProviderError),
+    #[error("zero builder payment")]
+    ZeroBuilderPayment,
     #[error("gas used exceeds allotted block limit")]
     OutOfBlockGas,
     #[error("duplicate transaction in bundle")]
     DuplicateTransaction,
     #[error("transaction {_0} reverted and is not allowed to revert")]
-    TransactionReverted(usize),
+    RevertNotAllowed(usize),
     #[error("transaction {_0} is invalid and can't be dropped")]
-    InvalidTransaction(usize),
+    DropNotAllowed(usize),
 }
 
 #[serde_as]
