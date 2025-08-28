@@ -407,7 +407,7 @@ where
         Ok(())
     }
 
-    fn get_state<'b>(&'b self) -> &'b CachedRethDb<'a> {
+    fn get_state(&self) -> &CachedRethDb<'a> {
         self.block_builder.executor().evm().db()
     }
 
