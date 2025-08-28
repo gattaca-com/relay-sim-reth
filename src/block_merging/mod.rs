@@ -109,6 +109,8 @@ impl BlockMergingApi {
 
         let parent_hash = header.parent_hash;
 
+        // This scope is to avoid the state_db lifetime leaking past an await point.
+        // That leak causes the async fn to not be Send, which is required for spawning it.
         let (response, blob_versioned_hashes, request_cache) = {
             let state_provider = validation.provider.state_by_block_hash(parent_hash)?;
 
