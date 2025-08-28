@@ -22,7 +22,6 @@ use reth_ethereum::{
         },
         revm::{cached::CachedReads, database::StateProviderDatabase},
     },
-    primitives::SignedTransaction,
     provider::ChainSpecProvider,
     storage::{StateProvider, StateProviderFactory},
     trie::{
@@ -118,6 +117,10 @@ impl BlockMergingApi {
         let validation = &self.validation;
         let evm_config = &validation.evm_config;
 
+        // Recover the base block transactions in parallel
+        let (base_block, senders) =
+            base_block.try_into_recovered().map_err(|_| BlockMergingApiError::InvalidSignatureInBaseBlock)?.split();
+
         let (header, body) = base_block.split();
 
         let (withdrawals, transactions) = (body.withdrawals, body.transactions);
@@ -185,7 +188,10 @@ impl BlockMergingApi {
 
         let mut builder = BlockBuilder::new(evm_config.clone(), evm_env, block_builder, gas_limit);
 
-        builder.execute_base_block(transactions)?;
+        // Pair the transactions with the precomputed senders
+        let recovered_txs =
+            transactions.into_iter().zip(senders).map(|(tx, sender)| RecoveredTx::new_unchecked(tx, sender));
+        builder.execute_base_block(recovered_txs)?;
 
         let recovered_orders: Vec<MergeableOrderRecovered> =
             merging_data.into_par_iter().filter_map(|order| order.recover().ok()).collect();
@@ -403,7 +409,10 @@ where
         }
     }
 
-    fn execute_base_block(&mut self, txs: Vec<SignedTx>) -> Result<(), BlockExecutionError> {
+    fn execute_base_block(
+        &mut self,
+        txs: impl ExactSizeIterator<Item = RecoveredTx>,
+    ) -> Result<(), BlockExecutionError> {
         self.block_builder.apply_pre_execution_changes()?;
 
         self.transactions = Vec::with_capacity(txs.len());
@@ -413,8 +422,6 @@ where
 
         // Insert the transactions from the unmerged block
         for tx in txs {
-            let tx: RecoveredTx = tx.try_into_recovered().expect("signature is valid");
-
             self.tx_hashes.insert(*tx.tx_hash());
 
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {

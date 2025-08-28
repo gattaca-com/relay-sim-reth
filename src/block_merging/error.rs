@@ -11,6 +11,8 @@ use crate::validation::error::{GetParentError, ValidationApiError};
 /// Errors thrown by the block merging API.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BlockMergingApiError {
+    #[error("found an invalid signature in base block")]
+    InvalidSignatureInBaseBlock,
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
@@ -40,9 +42,9 @@ pub(crate) enum BlockMergingApiError {
 impl From<BlockMergingApiError> for ErrorObject<'static> {
     fn from(error: BlockMergingApiError) -> Self {
         match error {
-            BlockMergingApiError::MissingProposerPayment | BlockMergingApiError::InvalidProposerPayment => {
-                invalid_params_rpc_err(error.to_string())
-            }
+            BlockMergingApiError::MissingProposerPayment
+            | BlockMergingApiError::InvalidProposerPayment
+            | BlockMergingApiError::InvalidSignatureInBaseBlock => invalid_params_rpc_err(error.to_string()),
 
             BlockMergingApiError::GetParent(_)
             | BlockMergingApiError::NextEvmEnvFail
