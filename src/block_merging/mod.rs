@@ -214,7 +214,6 @@ impl BlockMergingApi {
         )?;
 
         let built_block = builder.finish(&state_provider)?;
-        let proposer_value = U256::ZERO;
 
         let response = BlockMergeResponseV1 {
             execution_payload: built_block.execution_payload,
