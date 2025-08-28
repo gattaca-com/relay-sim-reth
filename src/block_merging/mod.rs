@@ -376,11 +376,17 @@ pub(crate) fn prepare_revenues(
 }
 
 struct BlockBuilder<BB> {
-    evm_config: EthEvmConfig,
-    evm_env: EvmEnvFor<EthEvmConfig>,
     block_builder: BB,
 
+    // We need these to simulate orders
+    evm_config: EthEvmConfig,
+    evm_env: EvmEnvFor<EthEvmConfig>,
+
+    // Block builder keeps track of gas used, but it doesn't expose it
+    // so we need to track it ourselves.
     gas_used: u64,
+    // We use a custom gas limit, lower than the block gas limit,
+    // to leave some gas for the final distribution and proposer payment txs.
     gas_limit: u64,
     tx_hashes: HashSet<TxHash>,
 
