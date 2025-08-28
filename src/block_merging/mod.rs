@@ -188,6 +188,8 @@ impl BlockMergingApi {
         let recovered_orders: Vec<MergeableOrderRecovered> =
             merging_data.into_par_iter().filter_map(|order| order.recover().ok()).collect();
 
+        // TODO: parallelize simulation
+        // For this we need to consolidate `State` and wrap our database in a thread-safe cache.
         let mut simulated_orders: Vec<SimulatedOrder> =
             recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
 
