@@ -247,7 +247,7 @@ pub struct BlockMergeRequestV1 {
     pub proposer_fee_recipient: Address,
     #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
-    pub merging_data: Vec<MergeableOrder<Bytes>>,
+    pub merging_data: Vec<MergeableOrderBytes>,
 }
 
 #[serde_as]
