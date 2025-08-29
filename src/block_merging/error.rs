@@ -6,7 +6,7 @@ use reth_ethereum::{
 };
 use reth_node_builder::NewPayloadError;
 use reth_primitives::GotExpected;
-use revm_primitives::U256;
+use revm_primitives::{Address, U256};
 
 use crate::validation::error::{GetParentError, ValidationApiError};
 
@@ -33,6 +33,10 @@ pub(crate) enum BlockMergingApiError {
     BuilderBalanceDeltaMismatch(GotExpected<U256>),
     #[error("proposer payment delta is zero")]
     ZeroProposerDelta,
+    #[error("signer account is empty: {_0}")]
+    EmptyBuilderSignerAccount(Address),
+    #[error("signer ({address}) does not have enough balance: {current} < {required}")]
+    NoBalanceInBuilderSigner { address: Address, current: U256, required: U256 },
     #[error("revenue allocation tx reverted")]
     RevenueAllocationReverted,
     #[error("proposer payment tx reverted")]
@@ -56,6 +60,8 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             | BlockMergingApiError::ProposerPaymentReverted
             | BlockMergingApiError::ExecutionRequests
             | BlockMergingApiError::ZeroProposerDelta
+            | BlockMergingApiError::EmptyBuilderSignerAccount(_)
+            | BlockMergingApiError::NoBalanceInBuilderSigner { .. }
             | BlockMergingApiError::BuilderBalanceDeltaMismatch(_)
             | BlockMergingApiError::Provider(_) => internal_rpc_err(error.to_string()),
 

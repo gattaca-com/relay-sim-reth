@@ -281,7 +281,19 @@ impl BlockMergingApi {
         // Get the chain ID from the configured provider
         let signer_address = signer.address();
 
-        let nonce = builder.get_state().basic_ref(signer_address)?.map_or(0, |info| info.nonce) + 1;
+        let Some(signer_info) = builder.get_state().basic_ref(signer_address)? else {
+            return Err(BlockMergingApiError::EmptyBuilderSignerAccount(signer_address));
+        };
+        let total_payment_value = distributed_value + proposer_payment_value;
+
+        if signer_info.balance < total_payment_value {
+            return Err(BlockMergingApiError::NoBalanceInBuilderSigner {
+                address: signer_address,
+                current: signer_info.balance,
+                required: total_payment_value,
+            });
+        }
+        let nonce = signer_info.nonce + 1;
 
         let disperse_tx = TxEip1559 {
             chain_id,
