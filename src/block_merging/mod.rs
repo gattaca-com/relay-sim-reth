@@ -203,7 +203,7 @@ impl BlockMergingApi {
             recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
 
         // Sort orders by revenue, in descending order
-        simulated_orders.par_sort_unstable_by(|o1, o2| o1.builder_payment.cmp(&o2.builder_payment).reverse());
+        simulated_orders.par_sort_unstable_by(|o1, o2| o2.builder_payment.cmp(&o1.builder_payment));
 
         let initial_builder_balance =
             builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
