@@ -4,8 +4,8 @@ use alloy_consensus::{BlockHeader, SignableTransaction, Transaction, TxEip1559};
 use alloy_eips::{Decodable2718, Encodable2718, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV4};
 use alloy_rpc_types_engine::{
-    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV2,
-    ExecutionPayloadV3, PraguePayloadFields,
+    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV3,
+    PraguePayloadFields,
 };
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
@@ -516,16 +516,11 @@ where
         let execution_requests =
             outcome.execution_result.requests.try_into().or(Err(BlockMergingApiError::ExecutionRequests))?;
 
-        let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
-        let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
-
         let sealed_block = outcome.block.into_sealed_block();
         let block_hash = sealed_block.hash();
         let block = sealed_block.into_block().into_ethereum_block();
 
-        let payload_inner = ExecutionPayloadV2::from_block_unchecked(block_hash, &block);
-
-        let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
+        let execution_payload = ExecutionPayloadV3::from_block_unchecked(block_hash, &block);
 
         let result =
             BuiltBlock { execution_payload, execution_requests, blob_versioned_hashes, appended_blob_versioned_hashes };
