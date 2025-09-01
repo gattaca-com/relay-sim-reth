@@ -159,7 +159,8 @@ impl BlockMergingApi {
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp,
             suggested_fee_recipient: beneficiary,
-            prev_randao: header.difficulty.to_be_bytes().into(),
+            // mix_hash == prev_randao (source: https://eips.ethereum.org/EIPS/eip-4399)
+            prev_randao: header.mix_hash.into(),
             gas_limit: header.gas_limit,
             parent_beacon_block_root: header.parent_beacon_block_root,
             withdrawals,
