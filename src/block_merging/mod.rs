@@ -299,7 +299,6 @@ impl BlockMergingApi {
         let disperse_tx = TxEip1559 {
             chain_id,
             nonce,
-            // TODO: compute proper gas limit
             gas_limit: distribution_gas_limit,
             max_fee_per_gas: block_base_fee_per_gas,
             max_priority_fee_per_gas: 0,
@@ -312,9 +311,9 @@ impl BlockMergingApi {
         let signed_disperse_tx = sign_transaction(signer, disperse_tx)?;
 
         // Execute the disperse transaction
-        let is_valid = builder.append_transaction(signed_disperse_tx)?;
+        let is_success = builder.append_transaction(signed_disperse_tx)?;
 
-        if !is_valid {
+        if !is_success {
             return Err(BlockMergingApiError::RevenueAllocationReverted);
         }
 
@@ -333,9 +332,9 @@ impl BlockMergingApi {
 
         let signed_proposer_payment_tx = sign_transaction(signer, proposer_payment_tx)?;
 
-        let is_valid = builder.append_transaction(signed_proposer_payment_tx)?;
+        let is_success = builder.append_transaction(signed_proposer_payment_tx)?;
 
-        if !is_valid {
+        if !is_success {
             return Err(BlockMergingApiError::ProposerPaymentReverted);
         }
 
