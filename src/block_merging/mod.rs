@@ -518,9 +518,12 @@ where
 
         let blob_gas_used = outcome.block.blob_gas_used().unwrap_or(0);
         let excess_blob_gas = outcome.block.excess_blob_gas().unwrap_or(0);
-        let block = outcome.block.into_block().into_ethereum_block();
 
-        let payload_inner = ExecutionPayloadV2::from_block_slow(&block);
+        let sealed_block = outcome.block.into_sealed_block();
+        let block_hash = sealed_block.hash();
+        let block = sealed_block.into_block().into_ethereum_block();
+
+        let payload_inner = ExecutionPayloadV2::from_block_unchecked(block_hash, &block);
 
         let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
 
@@ -564,7 +567,7 @@ where
         // Append the bundle
 
         // We can't avoid re-execution here due to the BlockBuilder API
-        for (_i, tx) in order.into_transactions().into_iter().enumerate().filter(|(i, _tx)| should_be_included[*i]) {
+        for (tx, _) in order.into_transactions().into_iter().zip(should_be_included).filter(|(_, sbi)| *sbi) {
             builder.append_transaction(tx)?;
         }
 
