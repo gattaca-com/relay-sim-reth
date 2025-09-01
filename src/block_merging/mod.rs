@@ -407,9 +407,14 @@ struct BlockBuilder<BB> {
     // We use a custom gas limit, lower than the block gas limit,
     // to leave some gas for the final distribution and proposer payment txs.
     gas_limit: u64,
-    tx_hashes: HashSet<TxHash>,
 
+    /// Transaction hashes for the transactions in the block.
+    tx_hashes: HashSet<TxHash>,
+    /// Blob versioned hashes for the transactions in the block, including
+    /// those in [Self::appended_blob_versioned_hashes].
+    /// Used for optional block validation.
     blob_versioned_hashes: Vec<B256>,
+    /// Blob versioned hashes for the transactions that were appended.
     appended_blob_versioned_hashes: Vec<B256>,
 }
 
