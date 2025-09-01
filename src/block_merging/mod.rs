@@ -452,7 +452,7 @@ where
             self.tx_hashes.insert(*tx.tx_hash());
 
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-                self.number_of_blobs_in_base_block += 1;
+                self.number_of_blobs_in_base_block += versioned_hashes.len();
                 self.blob_versioned_hashes.extend(versioned_hashes);
             }
             self.gas_used += self.block_builder.execute_transaction(tx)?;
