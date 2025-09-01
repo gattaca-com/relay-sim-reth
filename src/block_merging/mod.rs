@@ -160,7 +160,7 @@ impl BlockMergingApi {
             timestamp: header.timestamp,
             suggested_fee_recipient: beneficiary,
             // mix_hash == prev_randao (source: https://eips.ethereum.org/EIPS/eip-4399)
-            prev_randao: header.mix_hash.into(),
+            prev_randao: header.mix_hash,
             gas_limit: header.gas_limit,
             parent_beacon_block_root: header.parent_beacon_block_root,
             withdrawals,
