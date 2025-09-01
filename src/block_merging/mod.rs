@@ -271,10 +271,7 @@ impl BlockMergingApi {
         Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
         Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
     {
-        let calldata = encode_disperse_eth_calldata(
-            updated_revenues.keys().copied().collect(),
-            updated_revenues.values().copied().collect(),
-        );
+        let calldata = encode_disperse_eth_calldata(&updated_revenues);
 
         // Get the chain ID from the configured provider
         let chain_id = self.validation.provider.chain_spec().chain_id();
@@ -350,10 +347,13 @@ fn sign_transaction(signer: &PrivateKeySigner, tx: TxEip1559) -> Result<Recovere
 }
 
 /// Encodes a call to `disperseEther(address[],uint256[])` with the given recipients and values.
-pub(crate) fn encode_disperse_eth_calldata(recipients: Vec<Address>, values: Vec<U256>) -> Vec<u8> {
+pub(crate) fn encode_disperse_eth_calldata(value_by_recipient: &HashMap<Address, U256>) -> Vec<u8> {
     sol! {
         function disperseEther(address[] recipients, uint256[] values) external payable;
     }
+
+    let (recipients, values) = value_by_recipient.iter().unzip();
+
     disperseEtherCall { recipients, values }.abi_encode()
 }
 
