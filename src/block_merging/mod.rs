@@ -207,6 +207,7 @@ impl BlockMergingApi {
 
         let initial_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
+        // Simulate orders until we run out of block gas
         let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
 
         let final_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
@@ -214,6 +215,7 @@ impl BlockMergingApi {
         let total_revenue: U256 = revenues.values().sum();
         let builder_balance_delta = final_builder_balance.saturating_sub(initial_builder_balance);
 
+        // Sanity check the sum of revenues is equal to the builder balance delta
         if total_revenue != builder_balance_delta {
             return Err(BlockMergingApiError::BuilderBalanceDeltaMismatch(GotExpected {
                 expected: total_revenue,
@@ -221,11 +223,10 @@ impl BlockMergingApi {
             }));
         }
 
-        let (proposer_value, distributed_value, updated_revenues) =
+        let (proposer_added_value, distributed_value, updated_revenues) =
             prepare_revenues(&self.distribution_config, revenues, relay_fee_recipient, beneficiary);
 
-        let proposer_delta = proposer_value.saturating_sub(original_value);
-        if proposer_delta.is_zero() {
+        if proposer_added_value.is_zero() {
             return Err(BlockMergingApiError::ZeroProposerDelta);
         }
 
@@ -238,7 +239,7 @@ impl BlockMergingApi {
             block_base_fee_per_gas.into(),
             payment_tx_gas_limit,
             proposer_fee_recipient,
-            proposer_delta,
+            proposer_added_value,
         )?;
 
         let built_block = builder.finish(&state_provider)?;
@@ -247,7 +248,7 @@ impl BlockMergingApi {
             execution_payload: built_block.execution_payload,
             execution_requests: built_block.execution_requests,
             appended_blobs: built_block.appended_blob_versioned_hashes,
-            proposer_value,
+            proposer_value: proposer_added_value + original_value,
         };
         Ok((response, built_block.blob_versioned_hashes, request_cache))
     }
