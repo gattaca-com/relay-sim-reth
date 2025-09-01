@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_consensus::{BlockHeader, SignableTransaction, Transaction, TxEip1559};
-use alloy_eips::{Decodable2718, Encodable2718, eip7685::RequestsOrHash};
+use alloy_eips::eip7685::RequestsOrHash;
 use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV4};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV3,
@@ -344,12 +344,7 @@ impl BlockMergingApi {
 
 fn sign_transaction(signer: &PrivateKeySigner, tx: TxEip1559) -> Result<RecoveredTx, BlockMergingApiError> {
     let signature = signer.sign_hash_sync(&tx.signature_hash()).expect("signer is local and private key is valid");
-    let signed_tx = tx.into_signed(signature);
-
-    // We encode and decode the transaction to turn it into the same SignedTx type expected by the type bounds
-    let mut buf = vec![];
-    signed_tx.encode_2718(&mut buf);
-    let signed_tx = SignedTx::decode_2718(&mut buf.as_slice()).expect("we just encoded it with encode_2718");
+    let signed_tx: SignedTx = tx.into_signed(signature).into();
     let recovered_signed_tx = Recovered::new_unchecked(signed_tx, signer.address());
     Ok(recovered_signed_tx)
 }
