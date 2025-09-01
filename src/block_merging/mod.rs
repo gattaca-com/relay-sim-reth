@@ -416,7 +416,7 @@ struct BlockBuilder<BB> {
     tx_hashes: HashSet<TxHash>,
 
     blob_versioned_hashes: Vec<B256>,
-    number_of_blobs_in_base_block: usize,
+    appended_blob_versioned_hashes: Vec<B256>,
 }
 
 impl<'a, BB, Ex, Ev> BlockBuilder<BB>
@@ -434,7 +434,7 @@ where
             gas_limit,
             tx_hashes: Default::default(),
             blob_versioned_hashes: Default::default(),
-            number_of_blobs_in_base_block: 0,
+            appended_blob_versioned_hashes: Default::default(),
         }
     }
 
@@ -452,7 +452,6 @@ where
             self.tx_hashes.insert(*tx.tx_hash());
 
             if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
-                self.number_of_blobs_in_base_block += versioned_hashes.len();
                 self.blob_versioned_hashes.extend(versioned_hashes);
             }
             self.gas_used += self.block_builder.execute_transaction(tx)?;
@@ -505,13 +504,14 @@ where
         // Also store the versioned hash for validation
         if let Some(versioned_hashes) = tx.blob_versioned_hashes() {
             self.blob_versioned_hashes.extend(versioned_hashes);
+            self.appended_blob_versioned_hashes.extend(versioned_hashes);
         }
         Ok(is_success)
     }
 
     fn finish(self, state_provider: &dyn StateProvider) -> Result<BuiltBlock, BlockMergingApiError> {
-        let number_of_blobs_in_base_block = self.number_of_blobs_in_base_block;
         let blob_versioned_hashes = self.blob_versioned_hashes;
+        let appended_blob_versioned_hashes = self.appended_blob_versioned_hashes;
 
         let outcome = self.block_builder.finish(state_provider)?;
         let execution_requests =
@@ -525,7 +525,6 @@ where
 
         let execution_payload = ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas };
 
-        let appended_blob_versioned_hashes = blob_versioned_hashes[number_of_blobs_in_base_block..].to_vec();
         let result =
             BuiltBlock { execution_payload, execution_requests, blob_versioned_hashes, appended_blob_versioned_hashes };
         Ok(result)
