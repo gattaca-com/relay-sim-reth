@@ -130,9 +130,9 @@ impl BlockMergingApi {
         let relay_fee_recipient = self.relay_fee_recipient;
         let beneficiary = header.beneficiary;
 
-        // check we have collateral for this builder
+        // Check we have collateral for this builder
         let Some(types::PrivateKeySigner(signer)) = self.builder_collateral_map.get(&beneficiary).as_ref() else {
-            return Err(BlockMergingApiError::ExecutionRequests);
+            return Err(BlockMergingApiError::NoSignerForBuilder(beneficiary));
         };
 
         // Check that block has proposer payment, otherwise reject it.

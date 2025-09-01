@@ -25,6 +25,8 @@ pub(crate) enum BlockMergingApiError {
     NextEvmEnvFail,
     #[error("failed to decode execution requests")]
     ExecutionRequests,
+    #[error("no signer found for builder: {_0}")]
+    NoSignerForBuilder(Address),
     #[error("could not find a proposer payment tx")]
     MissingProposerPayment,
     #[error("could not verify proposer payment tx")]
@@ -52,6 +54,7 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
         match error {
             BlockMergingApiError::MissingProposerPayment
             | BlockMergingApiError::InvalidProposerPayment
+            | BlockMergingApiError::NoSignerForBuilder(_)
             | BlockMergingApiError::InvalidSignatureInBaseBlock => invalid_params_rpc_err(error.to_string()),
 
             BlockMergingApiError::GetParent(_)
