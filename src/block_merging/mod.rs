@@ -205,12 +205,11 @@ impl BlockMergingApi {
         // Sort orders by revenue, in descending order
         simulated_orders.par_sort_unstable_by(|o1, o2| o2.builder_payment.cmp(&o1.builder_payment));
 
-        let initial_builder_balance =
-            builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+        let initial_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
         let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
 
-        let final_builder_balance = builder.get_state().basic_ref(beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+        let final_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
         let total_revenue: U256 = revenues.values().sum();
         let builder_balance_delta = final_builder_balance.saturating_sub(initial_builder_balance);
@@ -594,7 +593,7 @@ where
     let cached_db = CacheDB::new(db_ref);
     // Create a new EVM with the pre-state
     let mut evm = evm_config.evm_with_env(cached_db, evm_env);
-    let initial_balance = evm.db().basic_ref(evm.block.beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+    let initial_balance = get_balance_or_zero(evm.db(), evm.block.beneficiary)?;
 
     let txs = order.transactions();
     let reverting_txs = order.reverting_txs();
@@ -633,7 +632,11 @@ where
             }
         };
     }
-    let final_balance = evm.db().basic_ref(evm.block.beneficiary)?.map_or(U256::ZERO, |info| info.balance);
+    let final_balance = get_balance_or_zero(evm.db(), evm.block.beneficiary)?;
     let builder_payment = final_balance.saturating_sub(initial_balance);
     Ok(SimulatedOrder { order, gas_used, should_be_included: included_txs, builder_payment })
+}
+
+fn get_balance_or_zero<DB: DatabaseRef>(db: DB, address: Address) -> Result<U256, <DB as DatabaseRef>::Error> {
+    Ok(db.basic_ref(address)?.map_or(U256::ZERO, |info| info.balance))
 }
