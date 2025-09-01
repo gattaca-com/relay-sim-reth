@@ -605,21 +605,21 @@ where
     for (i, tx) in txs.iter().enumerate() {
         match evm.transact(tx) {
             Ok(result) => {
-                // If tx reverted and is not allowed to
-                if !result.result.is_success() && !reverting_txs.contains(&i) {
-                    // We check if we can drop it instead, else we discard this bundle
+                if result.result.is_success() || reverting_txs.contains(&i) {
+                    gas_used += result.result.gas_used();
+                    // Apply the state changes to the simulated state
+                    // Note that this only commits to the cache wrapper, not the underlying database
+                    evm.db_mut().commit(result.state);
+                } else {
+                    // If tx reverted and is not allowed to, we check if it
+                    // can be dropped instead, else we discard this bundle.
                     if dropping_txs.contains(&i) {
                         // Tx should be dropped
                         included_txs[i] = false;
-                        continue;
                     } else {
                         return Err(SimulationError::RevertNotAllowed(i));
                     }
                 }
-                gas_used += result.result.gas_used();
-                // Apply the state changes to the simulated state
-                // Note that this only commits to the cache wrapper, not the underlying database
-                evm.db_mut().commit(result.state);
             }
             Err(e) => {
                 if e.is_invalid_tx_err() && (dropping_txs.contains(&i) || reverting_txs.contains(&i)) {
