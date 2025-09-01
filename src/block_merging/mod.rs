@@ -611,6 +611,7 @@ where
                     if dropping_txs.contains(&i) {
                         // Tx should be dropped
                         included_txs[i] = false;
+                        continue;
                     } else {
                         return Err(SimulationError::RevertNotAllowed(i));
                     }
