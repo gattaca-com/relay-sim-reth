@@ -363,11 +363,11 @@ pub(crate) fn prepare_revenues(
     let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
     let total_revenue: U256 = revenues.values().sum();
-    if total_revenue < estimated_payment_cost {
+    if total_revenue <= estimated_payment_cost {
         return Err(BlockMergingApiError::ZeroMergedBlockRevenue);
     }
     // Subtract the payment cost from the revenue
-    let expected_revenue = total_revenue.saturating_sub(estimated_payment_cost);
+    let expected_revenue = total_revenue - estimated_payment_cost;
 
     // Compute the proposer revenue from the total revenue, to avoid rounding errors
     let proposer_revenue = distribution_config.proposer_split(expected_revenue);
