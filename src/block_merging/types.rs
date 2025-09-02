@@ -7,7 +7,7 @@ use bytes::Bytes;
 use reth_ethereum::{evm::EthEvmConfig, primitives::SignedTransaction, provider::ProviderError};
 use reth_node_builder::ConfigureEvm;
 use reth_primitives::{NodePrimitives, Recovered};
-use revm_primitives::{Address, B256, U256, address};
+use revm_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 
@@ -34,20 +34,6 @@ pub(crate) struct BlockMergingConfig {
 #[derive(Debug, Clone, Deserialize)]
 /// Wrapper over [`alloy_signer_local::PrivateKeySigner`], that implements [`serde::Deserialize`]
 pub(crate) struct PrivateKeySigner(#[serde_as(as = "DisplayFromStr")] pub(crate) alloy_signer_local::PrivateKeySigner);
-
-impl Default for BlockMergingConfig {
-    fn default() -> Self {
-        Self {
-            builder_collateral_map: HashMap::new(),
-            relay_fee_recipient: address!("0x0000000000000000000000000000000000000000"),
-            distribution_config: DistributionConfig::default(),
-            // Address of `Disperse.app` contract
-            // https://etherscan.io/address/0xd152f549545093347a162dce210e7293f1452150
-            disperse_address: address!("0xD152f549545093347A162Dce210e7293f1452150"),
-            validate_merged_blocks: true,
-        }
-    }
-}
 
 /// Configuration for revenue distribution among different parties.
 /// The total basis points is 10000, which means each participant
