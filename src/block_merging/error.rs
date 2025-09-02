@@ -43,6 +43,8 @@ pub(crate) enum BlockMergingApiError {
     RevenueAllocationReverted,
     #[error("proposer payment tx reverted")]
     ProposerPaymentReverted,
+    #[error("reached blob limit")]
+    BlobLimitReached,
     #[error("validation: {0}")]
     Validation(#[from] ValidationApiError),
     #[error("could not find parent block: {_0}")]
@@ -61,6 +63,7 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             | BlockMergingApiError::InvalidSignatureInBaseBlock => invalid_params_rpc_err(error.to_string()),
 
             BlockMergingApiError::GetParent(_)
+            | BlockMergingApiError::BlobLimitReached
             | BlockMergingApiError::NextEvmEnvFail
             | BlockMergingApiError::RevenueAllocationReverted
             | BlockMergingApiError::ProposerPaymentReverted

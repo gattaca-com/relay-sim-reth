@@ -274,7 +274,7 @@ impl BlockMergingApi {
         Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
         Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
     {
-        let calldata = encode_disperse_eth_calldata(&updated_revenues);
+        let calldata = encode_disperse_eth_calldata(updated_revenues);
 
         // Get the chain ID from the configured provider
         let chain_id = self.validation.provider.chain_spec().chain_id();
@@ -505,8 +505,13 @@ where
         Ok(simulated_order)
     }
 
-    fn append_transaction(&mut self, tx: RecoveredTx) -> Result<bool, BlockExecutionError> {
+    fn append_transaction(&mut self, tx: RecoveredTx) -> Result<bool, BlockMergingApiError> {
         let mut is_success = false;
+        let blobs_available = self.blob_params.max_blob_count - self.blob_versioned_hashes.len() as u64;
+        // NOTE: we check this because the block builder doesn't seem to do it
+        if tx.blob_count().unwrap_or(0) > blobs_available {
+            return Err(BlockMergingApiError::BlobLimitReached);
+        }
         self.gas_used +=
             self.block_builder.execute_transaction_with_result_closure(tx.clone(), |r| is_success = r.is_success())?;
 
