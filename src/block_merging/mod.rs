@@ -378,7 +378,7 @@ pub(crate) fn prepare_revenues(
         let relay_revenue = distribution_config.relay_split(revenue);
         updated_revenues.entry(relay_fee_recipient).and_modify(|v| *v += relay_revenue).or_insert(relay_revenue);
 
-        let builder_revenue = distribution_config.builder_split(revenue);
+        let builder_revenue = distribution_config.merged_builder_split(revenue);
         updated_revenues.entry(origin).and_modify(|v| *v += builder_revenue).or_insert(builder_revenue);
 
         // Add both to the total value to be distributed

@@ -85,7 +85,7 @@ impl DistributionConfig {
         self.split(proposer_bips, revenue)
     }
 
-    pub(crate) fn builder_split(&self, revenue: U256) -> U256 {
+    pub(crate) fn merged_builder_split(&self, revenue: U256) -> U256 {
         self.split(self.merged_builder_bps, revenue)
     }
 }
