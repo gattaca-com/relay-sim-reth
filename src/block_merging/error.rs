@@ -33,8 +33,10 @@ pub(crate) enum BlockMergingApiError {
     InvalidProposerPayment,
     #[error("proposer payment delta mismatch: {_0}")]
     BuilderBalanceDeltaMismatch(GotExpected<U256>),
-    #[error("proposer payment delta is zero")]
-    ZeroProposerDelta,
+    #[error("no expected revenue from merged block")]
+    ZeroMergedBlockRevenue,
+    #[error("no expected revenue for winning builder")]
+    ZeroRevenueForWinningBuilder,
     #[error("signer account is empty: {_0}")]
     EmptyBuilderSignerAccount(Address),
     #[error("signer ({address}) does not have enough balance: {current} < {required}")]
@@ -65,7 +67,8 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             | BlockMergingApiError::NextEvmEnvFail
             | BlockMergingApiError::RevenueAllocationReverted
             | BlockMergingApiError::ExecutionRequests
-            | BlockMergingApiError::ZeroProposerDelta
+            | BlockMergingApiError::ZeroRevenueForWinningBuilder
+            | BlockMergingApiError::ZeroMergedBlockRevenue
             | BlockMergingApiError::EmptyBuilderSignerAccount(_)
             | BlockMergingApiError::NoBalanceInBuilderSigner { .. }
             | BlockMergingApiError::BuilderBalanceDeltaMismatch(_)

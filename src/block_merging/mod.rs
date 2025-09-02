@@ -35,7 +35,10 @@ use revm::{
     DatabaseCommit, DatabaseRef,
     database::{CacheDB, State},
 };
-use revm_primitives::{Address, B256, U256, alloy_primitives::TxHash};
+use revm_primitives::{
+    Address, B256, U256,
+    alloy_primitives::{TxHash, U512},
+};
 use tracing::info;
 
 pub(crate) use crate::block_merging::api::{BlockMergingApi, BlockMergingApiServer};
@@ -226,17 +229,26 @@ impl BlockMergingApi {
             }));
         }
 
+        let estimated_payment_cost =
+            U256::from(block_base_fee_per_gas).saturating_mul(U256::from(distribution_gas_limit));
+
         let updated_revenues = prepare_revenues(
             &self.distribution_config,
             revenues,
+            estimated_payment_cost,
             proposer_fee_recipient,
             relay_fee_recipient,
             beneficiary,
-        );
+        )?;
         let proposer_added_value = updated_revenues.get(&proposer_fee_recipient).cloned().unwrap_or_default();
 
-        if proposer_added_value.is_zero() {
-            return Err(BlockMergingApiError::ZeroProposerDelta);
+        let winning_builder_revenue =
+            total_revenue.saturating_sub(updated_revenues.values().sum()).saturating_sub(estimated_payment_cost);
+
+        // Sanity check. The winning builder gets something.
+        // This is already indirectly checked in `prepare_revenues`.
+        if winning_builder_revenue.is_zero() {
+            return Err(BlockMergingApiError::ZeroRevenueForWinningBuilder);
         }
 
         self.append_payment_txs(
@@ -343,36 +355,43 @@ pub(crate) fn encode_disperse_eth_calldata(value_by_recipient: &HashMap<Address,
 pub(crate) fn prepare_revenues(
     distribution_config: &DistributionConfig,
     revenues: HashMap<Address, U256>,
+    estimated_payment_cost: U256,
     proposer_fee_recipient: Address,
     relay_fee_recipient: Address,
     block_beneficiary: Address,
-) -> HashMap<Address, U256> {
+) -> Result<HashMap<Address, U256>, BlockMergingApiError> {
     let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
     let total_revenue: U256 = revenues.values().sum();
+    if total_revenue < estimated_payment_cost {
+        return Err(BlockMergingApiError::ZeroMergedBlockRevenue);
+    }
+    // Subtract the payment cost from the revenue
+    let expected_revenue = total_revenue.saturating_sub(estimated_payment_cost);
 
     // Compute the proposer revenue from the total revenue, to avoid rounding errors
-    let proposer_revenue = distribution_config.proposer_split(total_revenue);
+    let proposer_revenue = distribution_config.proposer_split(expected_revenue);
     updated_revenues.entry(proposer_fee_recipient).and_modify(|v| *v += proposer_revenue).or_insert(proposer_revenue);
 
     // Compute the relay revenue from the total revenue, to avoid rounding errors
-    let relay_revenue = distribution_config.relay_split(total_revenue);
+    let relay_revenue = distribution_config.relay_split(expected_revenue);
     updated_revenues.entry(relay_fee_recipient).and_modify(|v| *v += relay_revenue).or_insert(relay_revenue);
 
     // We assume the winning builder controls the beneficiary address, receiving
     // any undistributed revenue, and so don't allocate to it explicitly.
 
     // We divide the revenue among the different bundle origins.
-    for (origin, revenue) in revenues {
-        // Compute the revenue for the bundle origin
-        let builder_revenue = distribution_config.merged_builder_split(revenue);
+    for (origin, origin_revenue) in revenues {
+        // Update the revenue, subtracting part of the payment cost
+        let actualized_revenue = (origin_revenue.widening_mul(expected_revenue) / U512::from(total_revenue)).to();
+        let builder_revenue = distribution_config.merged_builder_split(actualized_revenue);
         updated_revenues.entry(origin).and_modify(|v| *v += builder_revenue).or_insert(builder_revenue);
     }
 
-    // Just in case, we remove the beneficiary address from the distribution and update the total
+    // Just in case, we remove the beneficiary address from the distribution
     updated_revenues.remove(&block_beneficiary).unwrap_or(U256::ZERO);
 
-    updated_revenues
+    Ok(updated_revenues)
 }
 
 struct BlockBuilder<BB> {
@@ -681,10 +700,12 @@ mod tests {
         let updated_revenues = prepare_revenues(
             &distribution_config,
             revenues,
+            U256::ZERO,
             proposer_fee_recipient,
             relay_fee_recipient,
             winning_builder_fee_recipient,
-        );
+        )
+        .unwrap();
 
         // Check total for relay + proposer + builders
         assert_eq!(updated_revenues.values().sum::<U256>(), 30000);
@@ -722,10 +743,12 @@ mod tests {
         let updated_revenues = prepare_revenues(
             &distribution_config,
             revenues,
+            U256::ZERO,
             proposer_fee_recipient,
             relay_fee_recipient,
             winning_builder_fee_recipient,
-        );
+        )
+        .unwrap();
 
         // Check total for relay + proposer + builders
         assert_eq!(updated_revenues.values().sum::<U256>(), 8);
