@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_consensus::{BlockHeader, SignableTransaction, Transaction, TxEip1559};
-use alloy_eips::eip7685::RequestsOrHash;
+use alloy_eips::{eip7685::RequestsOrHash, eip7840::BlobParams};
 use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV4};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV3,
@@ -403,6 +403,7 @@ struct BlockBuilder<BB> {
     // We need these to simulate orders
     evm_config: EthEvmConfig,
     evm_env: EvmEnvFor<EthEvmConfig>,
+    blob_params: BlobParams,
 
     // Block builder keeps track of gas used, but it doesn't expose it
     // so we need to track it ourselves.
@@ -428,10 +429,13 @@ where
     Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
 {
     fn new(evm_config: EthEvmConfig, evm_env: EvmEnvFor<EthEvmConfig>, block_builder: BB, gas_limit: u64) -> Self {
+        let timestamp: u64 = evm_env.block_env.timestamp.try_into().expect("all unix timestamps fit in an u64");
+        let blob_params = evm_config.chain_spec().blob_params_at_timestamp(timestamp).expect("we are past Cancun");
         Self {
+            block_builder,
             evm_config,
             evm_env,
-            block_builder,
+            blob_params,
             gas_used: 0,
             gas_limit,
             tx_hashes: Default::default(),
@@ -484,7 +488,12 @@ where
             return Err(SimulationError::DuplicateTransaction);
         }
 
-        let simulated_order = simulate_order(&self.evm_config, self.get_state(), self.evm_env.clone(), order)?;
+        let available_gas = self.gas_limit - self.gas_used;
+        let available_blobs = self.blob_params.max_blob_count - self.blob_versioned_hashes.len() as u64;
+
+        let evm_env = self.evm_env.clone();
+        let state = self.get_state();
+        let simulated_order = simulate_order(&self.evm_config, state, evm_env, order, available_gas, available_blobs)?;
         // Check the order has some revenue
         if simulated_order.builder_payment.is_zero() {
             return Err(SimulationError::ZeroBuilderPayment);
@@ -583,6 +592,8 @@ fn simulate_order<DBRef>(
     db_ref: DBRef,
     evm_env: EvmEnvFor<EthEvmConfig>,
     order: MergeableOrderRecovered,
+    available_gas: u64,
+    available_blobs: u64,
 ) -> Result<SimulatedOrder, SimulationError>
 where
     DBRef: DatabaseRef + core::fmt::Debug,
@@ -600,14 +611,33 @@ where
     let dropping_txs = order.dropping_txs();
 
     let mut gas_used = 0;
+    let mut blobs_added = 0;
     let mut included_txs = vec![true; txs.len()];
 
     // Check the bundle can be included in the block
     for (i, tx) in txs.iter().enumerate() {
+        // If tx takes too much gas, try to drop it or fail
+        if tx.gas_limit() > (available_gas - gas_used) {
+            if dropping_txs.contains(&i) {
+                included_txs[i] = false;
+                continue;
+            }
+            return Err(SimulationError::OutOfBlockGas);
+        }
+        // If tx exceeds blob limit, try to drop it or fail
+        if tx.blob_count().unwrap_or(0) > (available_blobs - blobs_added) {
+            if dropping_txs.contains(&i) {
+                included_txs[i] = false;
+                continue;
+            }
+            return Err(SimulationError::OutOfBlockBlobs);
+        }
+        // Execute transaction
         match evm.transact(tx) {
             Ok(result) => {
                 if result.result.is_success() || reverting_txs.contains(&i) {
                     gas_used += result.result.gas_used();
+                    blobs_added += tx.blob_count().unwrap_or(0);
                     // Apply the state changes to the simulated state
                     // Note that this only commits to the cache wrapper, not the underlying database
                     evm.db_mut().commit(result.state);

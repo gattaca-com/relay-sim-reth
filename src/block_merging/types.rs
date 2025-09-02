@@ -216,6 +216,8 @@ pub(crate) enum SimulationError {
     ZeroBuilderPayment,
     #[error("gas used exceeds allotted block limit")]
     OutOfBlockGas,
+    #[error("blobs used exceed allotted block limit")]
+    OutOfBlockBlobs,
     #[error("duplicate transaction in bundle")]
     DuplicateTransaction,
     #[error("transaction {_0} reverted and is not allowed to revert")]
