@@ -45,11 +45,11 @@ pub(crate) struct PrivateKeySigner(#[serde_as(as = "DisplayFromStr")] pub(crate)
 #[derive(Debug, Serialize, Eq, PartialEq, Deserialize, Clone)]
 pub(crate) struct DistributionConfig {
     /// Base points allocated to the relay.
-    relay_bps: u64,
+    pub(crate) relay_bps: u64,
     /// Base points allocated to the builder that sent the bundle.
-    merged_builder_bps: u64,
+    pub(crate) merged_builder_bps: u64,
     /// Base points allocated to the winning builder.
-    winning_builder_bps: u64,
+    pub(crate) winning_builder_bps: u64,
 }
 
 impl Default for DistributionConfig {

@@ -678,3 +678,80 @@ where
 fn get_balance_or_zero<DB: DatabaseRef>(db: DB, address: Address) -> Result<U256, <DB as DatabaseRef>::Error> {
     Ok(db.basic_ref(address)?.map_or(U256::ZERO, |info| info.balance))
 }
+
+#[cfg(test)]
+mod tests {
+    use revm_primitives::address;
+
+    use super::*;
+
+    #[test]
+    fn test_prepare_revenues() {
+        let distribution_config =
+            DistributionConfig { relay_bps: 2500, merged_builder_bps: 2500, winning_builder_bps: 2500 };
+        let winning_builder_fee_recipient = address!("0x0000000000000000000000000000000000000001");
+        let relay_fee_recipient = address!("0x0000000000000000000000000000000000000002");
+
+        let addresses = vec![
+            address!("0x0000000000000000000000000000000000000006"),
+            address!("0x0000000000000000000000000000000000000007"),
+        ];
+        let values = vec![U256::from(10000), U256::from(30000)];
+
+        let revenues = HashMap::from_iter(addresses.iter().cloned().zip(values.iter().cloned()));
+        let (proposer_added_value, total_distributed_value, updated_revenues) =
+            prepare_revenues(&distribution_config, revenues, relay_fee_recipient, winning_builder_fee_recipient);
+
+        // Check total for relay + builders
+        assert_eq!(total_distributed_value, 20000);
+
+        // Check relay got 1/4 the total sum
+        assert_eq!(updated_revenues[&relay_fee_recipient], 10000);
+
+        // Check each merging builder got 1/4 their contribution
+        assert_eq!(updated_revenues[&addresses[0]], 2500);
+        assert_eq!(updated_revenues[&addresses[1]], 7500);
+
+        // Check proposer value is 1/4 the total sum
+        assert_eq!(proposer_added_value, 10000);
+
+        // Check winning builder didn't get anything assigned,
+        // since anything not allocated goes to them anyways
+        assert!(!updated_revenues.contains_key(&winning_builder_fee_recipient));
+    }
+
+    #[test]
+    fn test_prepare_revenues_with_small_values() {
+        let distribution_config =
+            DistributionConfig { relay_bps: 2500, merged_builder_bps: 2500, winning_builder_bps: 2500 };
+        let winning_builder_fee_recipient = address!("0x0000000000000000000000000000000000000001");
+        let relay_fee_recipient = address!("0x0000000000000000000000000000000000000002");
+
+        let addresses = vec![
+            address!("0x0000000000000000000000000000000000000006"),
+            address!("0x0000000000000000000000000000000000000007"),
+        ];
+        let values = vec![U256::from(7), U256::from(5)];
+
+        let revenues = HashMap::from_iter(addresses.iter().cloned().zip(values.iter().cloned()));
+        let (proposer_added_value, total_distributed_value, updated_revenues) =
+            prepare_revenues(&distribution_config, revenues, relay_fee_recipient, winning_builder_fee_recipient);
+
+        // Check total (differs due to rounding errors)
+        assert_eq!(total_distributed_value, 5);
+
+        // Check proposer delta is 1/4 the total sum
+        assert_eq!(proposer_added_value, 3);
+
+        // Check relay got 1/4 the total sum
+        assert_eq!(updated_revenues[&relay_fee_recipient], 3);
+
+        // Check each merging builder got 1/4 their contribution
+        assert_eq!(updated_revenues[&addresses[0]], 1);
+        assert_eq!(updated_revenues[&addresses[1]], 1);
+
+        // Check winning builder didn't get anything assigned,
+        // since anything not allocated goes to them anyways
+        assert!(!updated_revenues.contains_key(&winning_builder_fee_recipient));
+    }
+}
