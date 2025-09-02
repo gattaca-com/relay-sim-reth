@@ -247,3 +247,37 @@ pub struct BlockMergeResponseV1 {
     /// Total value for the proposer
     pub proposer_value: U256,
 }
+
+#[cfg(test)]
+mod tests {
+    use revm_primitives::address;
+
+    use super::*;
+
+    #[test]
+    fn serde_builder_collateral_map() {
+        let json = include_str!("../../builders.json.example");
+        let deserialized_map: HashMap<Address, PrivateKeySigner> = serde_json::from_str(json).unwrap();
+
+        // We compare with the address of each private key in the builder collateral map
+        let expected_private_key_addresses = HashMap::from([
+            (
+                address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"), // anvil address 0
+                address!("0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"), // anvil address 5
+            ),
+            (
+                address!("0x70997970C51812dc3A010C7d01b50e0d17dc79C8"), // anvil address 1
+                address!("0x976EA74026E726554dB657fA54763abd0C3a0aa9"), // anvil address 6
+            ),
+            (
+                address!("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"), // anvil address 2
+                address!("0x14dC79964da2C08b23698B3D3cc7Ca32193d9955"), // anvil address 7
+            ),
+        ]);
+
+        for (address, expected_address) in expected_private_key_addresses {
+            let private_key = deserialized_map.get(&address).expect(&format!("address {address} is missing"));
+            assert_eq!(private_key.0.address(), expected_address);
+        }
+    }
+}
