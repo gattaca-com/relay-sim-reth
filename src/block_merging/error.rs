@@ -47,6 +47,8 @@ pub(crate) enum BlockMergingApiError {
     Validation(#[from] ValidationApiError),
     #[error("could not find parent block: {_0}")]
     GetParent(#[from] GetParentError),
+    #[error("not enough gas for payment: {_0}")]
+    NotEnoughGasForPayment(u64),
 }
 
 impl From<BlockMergingApiError> for ErrorObject<'static> {
@@ -55,6 +57,7 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             BlockMergingApiError::MissingProposerPayment
             | BlockMergingApiError::InvalidProposerPayment
             | BlockMergingApiError::NoSignerForBuilder(_)
+            | BlockMergingApiError::NotEnoughGasForPayment(_)
             | BlockMergingApiError::InvalidSignatureInBaseBlock => invalid_params_rpc_err(error.to_string()),
 
             BlockMergingApiError::GetParent(_)

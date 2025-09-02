@@ -154,7 +154,10 @@ impl BlockMergingApi {
         // TODO: compute dynamically by keeping track of gas cost
         let distribution_gas_limit = 100000;
         // We also leave some gas for the final proposer payment
-        let gas_limit = header.gas_limit - distribution_gas_limit - payment_tx_gas_limit;
+        let gas_limit = header
+            .gas_limit
+            .checked_sub(distribution_gas_limit + payment_tx_gas_limit)
+            .ok_or(BlockMergingApiError::NotEnoughGasForPayment(header.gas_limit))?;
 
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp,
