@@ -41,8 +41,6 @@ pub(crate) enum BlockMergingApiError {
     NoBalanceInBuilderSigner { address: Address, current: U256, required: U256 },
     #[error("revenue allocation tx reverted")]
     RevenueAllocationReverted,
-    #[error("proposer payment tx reverted")]
-    ProposerPaymentReverted,
     #[error("reached blob limit")]
     BlobLimitReached,
     #[error("validation: {0}")]
@@ -66,7 +64,6 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             | BlockMergingApiError::BlobLimitReached
             | BlockMergingApiError::NextEvmEnvFail
             | BlockMergingApiError::RevenueAllocationReverted
-            | BlockMergingApiError::ProposerPaymentReverted
             | BlockMergingApiError::ExecutionRequests
             | BlockMergingApiError::ZeroProposerDelta
             | BlockMergingApiError::EmptyBuilderSignerAccount(_)

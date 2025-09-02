@@ -152,11 +152,11 @@ impl BlockMergingApi {
         // to 35k if the targets are new accounts.
         // This number leaves us space for ~9 non-empty targets, or ~2 new accounts.
         // TODO: compute dynamically by keeping track of gas cost
-        let distribution_gas_limit = 100000;
-        // We also leave some gas for the final proposer payment
+        // We also leave some gas for the proposer payment
+        let distribution_gas_limit = 100000 + payment_tx_gas_limit;
         let gas_limit = header
             .gas_limit
-            .checked_sub(distribution_gas_limit + payment_tx_gas_limit)
+            .checked_sub(distribution_gas_limit)
             .ok_or(BlockMergingApiError::NotEnoughGasForPayment(header.gas_limit))?;
 
         let new_block_attrs = NextBlockEnvAttributes {
@@ -226,8 +226,14 @@ impl BlockMergingApi {
             }));
         }
 
-        let (proposer_added_value, distributed_value, updated_revenues) =
-            prepare_revenues(&self.distribution_config, revenues, relay_fee_recipient, beneficiary);
+        let updated_revenues = prepare_revenues(
+            &self.distribution_config,
+            revenues,
+            proposer_fee_recipient,
+            relay_fee_recipient,
+            beneficiary,
+        );
+        let proposer_added_value = updated_revenues.get(&proposer_fee_recipient).cloned().unwrap_or_default();
 
         if proposer_added_value.is_zero() {
             return Err(BlockMergingApiError::ZeroProposerDelta);
@@ -237,12 +243,8 @@ impl BlockMergingApi {
             &mut builder,
             signer,
             &updated_revenues,
-            distributed_value,
             distribution_gas_limit,
             block_base_fee_per_gas.into(),
-            payment_tx_gas_limit,
-            proposer_fee_recipient,
-            proposer_added_value,
         )?;
 
         let built_block = builder.finish(&state_provider)?;
@@ -256,24 +258,20 @@ impl BlockMergingApi {
         Ok((response, built_block.blob_versioned_hashes, request_cache))
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn append_payment_txs<'a, BB, Ex, Ev>(
         &self,
         builder: &mut BlockBuilder<BB>,
         signer: &PrivateKeySigner,
         updated_revenues: &HashMap<Address, U256>,
-        distributed_value: U256,
         distribution_gas_limit: u64,
         block_base_fee_per_gas: u128,
-        payment_tx_gas_limit: u64,
-        proposer_fee_recipient: Address,
-        proposer_payment_value: U256,
     ) -> Result<(), BlockMergingApiError>
     where
         BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
         Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
         Ev: Evm<DB = &'a mut CachedRethDb<'a>> + 'a,
     {
+        let distributed_value: U256 = updated_revenues.values().sum();
         let calldata = encode_disperse_eth_calldata(updated_revenues);
 
         // Get the chain ID from the configured provider
@@ -285,13 +283,13 @@ impl BlockMergingApi {
         let Some(signer_info) = builder.get_state().basic_ref(signer_address)? else {
             return Err(BlockMergingApiError::EmptyBuilderSignerAccount(signer_address));
         };
-        let total_payment_value = distributed_value + proposer_payment_value;
 
-        if signer_info.balance < total_payment_value {
+        // Check there's enough balance for the payment.
+        if signer_info.balance < distributed_value {
             return Err(BlockMergingApiError::NoBalanceInBuilderSigner {
                 address: signer_address,
                 current: signer_info.balance,
-                required: total_payment_value,
+                required: distributed_value,
             });
         }
         let nonce = signer_info.nonce + 1;
@@ -315,27 +313,6 @@ impl BlockMergingApi {
 
         if !is_success {
             return Err(BlockMergingApiError::RevenueAllocationReverted);
-        }
-
-        // Add proposer payment tx
-        let proposer_payment_tx = TxEip1559 {
-            chain_id,
-            nonce: nonce + 1,
-            gas_limit: payment_tx_gas_limit,
-            max_fee_per_gas: block_base_fee_per_gas,
-            max_priority_fee_per_gas: 0,
-            to: proposer_fee_recipient.into(),
-            value: proposer_payment_value,
-            access_list: Default::default(),
-            input: Default::default(),
-        };
-
-        let signed_proposer_payment_tx = sign_transaction(signer, proposer_payment_tx)?;
-
-        let is_success = builder.append_transaction(signed_proposer_payment_tx)?;
-
-        if !is_success {
-            return Err(BlockMergingApiError::ProposerPaymentReverted);
         }
 
         Ok(())
@@ -366,22 +343,21 @@ pub(crate) fn encode_disperse_eth_calldata(value_by_recipient: &HashMap<Address,
 pub(crate) fn prepare_revenues(
     distribution_config: &DistributionConfig,
     revenues: HashMap<Address, U256>,
+    proposer_fee_recipient: Address,
     relay_fee_recipient: Address,
     block_beneficiary: Address,
-) -> (U256, U256, HashMap<Address, U256>) {
+) -> HashMap<Address, U256> {
     let mut updated_revenues = HashMap::with_capacity(revenues.len());
-
-    let mut distributed_value = U256::ZERO;
 
     let total_revenue: U256 = revenues.values().sum();
 
     // Compute the proposer revenue from the total revenue, to avoid rounding errors
-    let proposer_added_value = distribution_config.proposer_split(total_revenue);
+    let proposer_revenue = distribution_config.proposer_split(total_revenue);
+    updated_revenues.entry(proposer_fee_recipient).and_modify(|v| *v += proposer_revenue).or_insert(proposer_revenue);
 
     // Compute the relay revenue from the total revenue, to avoid rounding errors
     let relay_revenue = distribution_config.relay_split(total_revenue);
     updated_revenues.entry(relay_fee_recipient).and_modify(|v| *v += relay_revenue).or_insert(relay_revenue);
-    distributed_value += relay_revenue;
 
     // We assume the winning builder controls the beneficiary address, receiving
     // any undistributed revenue, and so don't allocate to it explicitly.
@@ -391,15 +367,12 @@ pub(crate) fn prepare_revenues(
         // Compute the revenue for the bundle origin
         let builder_revenue = distribution_config.merged_builder_split(revenue);
         updated_revenues.entry(origin).and_modify(|v| *v += builder_revenue).or_insert(builder_revenue);
-
-        // and add it to the total value to be distributed
-        distributed_value += builder_revenue;
     }
 
     // Just in case, we remove the beneficiary address from the distribution and update the total
-    distributed_value -= updated_revenues.remove(&block_beneficiary).unwrap_or(U256::ZERO);
+    updated_revenues.remove(&block_beneficiary).unwrap_or(U256::ZERO);
 
-    (proposer_added_value, distributed_value, updated_revenues)
+    updated_revenues
 }
 
 struct BlockBuilder<BB> {
@@ -696,6 +669,7 @@ mod tests {
             DistributionConfig { relay_bps: 2500, merged_builder_bps: 2500, winning_builder_bps: 2500 };
         let winning_builder_fee_recipient = address!("0x0000000000000000000000000000000000000001");
         let relay_fee_recipient = address!("0x0000000000000000000000000000000000000002");
+        let proposer_fee_recipient = address!("0x0000000000000000000000000000000000000003");
 
         let addresses = vec![
             address!("0x0000000000000000000000000000000000000006"),
@@ -704,11 +678,16 @@ mod tests {
         let values = vec![U256::from(10000), U256::from(30000)];
 
         let revenues = HashMap::from_iter(addresses.iter().cloned().zip(values.iter().cloned()));
-        let (proposer_added_value, total_distributed_value, updated_revenues) =
-            prepare_revenues(&distribution_config, revenues, relay_fee_recipient, winning_builder_fee_recipient);
+        let updated_revenues = prepare_revenues(
+            &distribution_config,
+            revenues,
+            proposer_fee_recipient,
+            relay_fee_recipient,
+            winning_builder_fee_recipient,
+        );
 
-        // Check total for relay + builders
-        assert_eq!(total_distributed_value, 20000);
+        // Check total for relay + proposer + builders
+        assert_eq!(updated_revenues.values().sum::<U256>(), 30000);
 
         // Check relay got 1/4 the total sum
         assert_eq!(updated_revenues[&relay_fee_recipient], 10000);
@@ -718,7 +697,7 @@ mod tests {
         assert_eq!(updated_revenues[&addresses[1]], 7500);
 
         // Check proposer value is 1/4 the total sum
-        assert_eq!(proposer_added_value, 10000);
+        assert_eq!(updated_revenues[&proposer_fee_recipient], 10000);
 
         // Check winning builder didn't get anything assigned,
         // since anything not allocated goes to them anyways
@@ -731,6 +710,7 @@ mod tests {
             DistributionConfig { relay_bps: 2500, merged_builder_bps: 2500, winning_builder_bps: 2500 };
         let winning_builder_fee_recipient = address!("0x0000000000000000000000000000000000000001");
         let relay_fee_recipient = address!("0x0000000000000000000000000000000000000002");
+        let proposer_fee_recipient = address!("0x0000000000000000000000000000000000000003");
 
         let addresses = vec![
             address!("0x0000000000000000000000000000000000000006"),
@@ -739,21 +719,26 @@ mod tests {
         let values = vec![U256::from(7), U256::from(5)];
 
         let revenues = HashMap::from_iter(addresses.iter().cloned().zip(values.iter().cloned()));
-        let (proposer_added_value, total_distributed_value, updated_revenues) =
-            prepare_revenues(&distribution_config, revenues, relay_fee_recipient, winning_builder_fee_recipient);
+        let updated_revenues = prepare_revenues(
+            &distribution_config,
+            revenues,
+            proposer_fee_recipient,
+            relay_fee_recipient,
+            winning_builder_fee_recipient,
+        );
 
-        // Check total (differs due to rounding errors)
-        assert_eq!(total_distributed_value, 5);
+        // Check total for relay + proposer + builders
+        assert_eq!(updated_revenues.values().sum::<U256>(), 8);
 
         // Check proposer delta is 1/4 the total sum
-        assert_eq!(proposer_added_value, 3);
-
-        // Check relay got 1/4 the total sum
-        assert_eq!(updated_revenues[&relay_fee_recipient], 3);
+        assert_eq!(updated_revenues[&proposer_fee_recipient], 3);
 
         // Check each merging builder got 1/4 their contribution
         assert_eq!(updated_revenues[&addresses[0]], 1);
         assert_eq!(updated_revenues[&addresses[1]], 1);
+
+        // Check relay got 1/4 the total sum
+        assert_eq!(updated_revenues[&relay_fee_recipient], 3);
 
         // Check winning builder didn't get anything assigned,
         // since anything not allocated goes to them anyways
