@@ -372,23 +372,28 @@ pub(crate) fn prepare_revenues(
     let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
     let mut distributed_value = U256::ZERO;
-    let mut proposer_added_value = U256::ZERO;
 
-    // We divide the revenue among the winning builder, proposer, flow origin, and the relay.
-    // We assume the winning builder controls the beneficiary address, and so it will receive any undistributed revenue.
+    let total_revenue: U256 = revenues.values().sum();
+
+    // Compute the proposer revenue from the total revenue, to avoid rounding errors
+    let proposer_added_value = distribution_config.proposer_split(total_revenue);
+
+    // Compute the relay revenue from the total revenue, to avoid rounding errors
+    let relay_revenue = distribution_config.relay_split(total_revenue);
+    updated_revenues.entry(relay_fee_recipient).and_modify(|v| *v += relay_revenue).or_insert(relay_revenue);
+    distributed_value += relay_revenue;
+
+    // We assume the winning builder controls the beneficiary address, receiving
+    // any undistributed revenue, and so don't allocate to it explicitly.
+
+    // We divide the revenue among the different bundle origins.
     for (origin, revenue) in revenues {
-        // Compute the revenue for the relay and bundle origin
-        let relay_revenue = distribution_config.relay_split(revenue);
-        updated_revenues.entry(relay_fee_recipient).and_modify(|v| *v += relay_revenue).or_insert(relay_revenue);
-
+        // Compute the revenue for the bundle origin
         let builder_revenue = distribution_config.merged_builder_split(revenue);
         updated_revenues.entry(origin).and_modify(|v| *v += builder_revenue).or_insert(builder_revenue);
 
-        // Add both to the total value to be distributed
-        distributed_value += builder_revenue + relay_revenue;
-
-        // Add proposer revenue to the proposer added value
-        proposer_added_value += distribution_config.proposer_split(revenue);
+        // and add it to the total value to be distributed
+        distributed_value += builder_revenue;
     }
 
     // Just in case, we remove the beneficiary address from the distribution and update the total
