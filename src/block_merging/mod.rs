@@ -621,26 +621,28 @@ where
 
     // Check the bundle can be included in the block
     for (i, tx) in txs.iter().enumerate() {
+        let can_be_dropped = dropping_txs.contains(&i);
+        let can_revert = reverting_txs.contains(&i);
         // If tx takes too much gas, try to drop it or fail
         if tx.gas_limit() > (available_gas - gas_used) {
-            if dropping_txs.contains(&i) {
-                included_txs[i] = false;
-                continue;
+            if !can_be_dropped {
+                return Err(SimulationError::OutOfBlockGas);
             }
-            return Err(SimulationError::OutOfBlockGas);
+            included_txs[i] = false;
+            continue;
         }
         // If tx exceeds blob limit, try to drop it or fail
         if tx.blob_count().unwrap_or(0) > (available_blobs - blobs_added) {
-            if dropping_txs.contains(&i) {
-                included_txs[i] = false;
-                continue;
+            if !can_be_dropped {
+                return Err(SimulationError::OutOfBlockBlobs);
             }
-            return Err(SimulationError::OutOfBlockBlobs);
+            included_txs[i] = false;
+            continue;
         }
         // Execute transaction
         match evm.transact(tx) {
             Ok(result) => {
-                if result.result.is_success() || reverting_txs.contains(&i) {
+                if result.result.is_success() || can_revert {
                     gas_used += result.result.gas_used();
                     blobs_added += tx.blob_count().unwrap_or(0);
                     // Apply the state changes to the simulated state
@@ -649,7 +651,7 @@ where
                 } else {
                     // If tx reverted and is not allowed to, we check if it
                     // can be dropped instead, else we discard this bundle.
-                    if dropping_txs.contains(&i) {
+                    if can_be_dropped {
                         // Tx should be dropped
                         included_txs[i] = false;
                     } else {
@@ -658,7 +660,7 @@ where
                 }
             }
             Err(e) => {
-                if e.is_invalid_tx_err() && (dropping_txs.contains(&i) || reverting_txs.contains(&i)) {
+                if e.is_invalid_tx_err() && (can_be_dropped || can_revert) {
                     // The transaction might have been invalidated by another one, so we drop it
                     included_txs[i] = false;
                 } else {
