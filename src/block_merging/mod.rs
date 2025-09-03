@@ -146,14 +146,15 @@ impl BlockMergingApi {
 
         let payment_tx_gas_limit = payment_tx.gas_limit();
 
+        // TODO: compute dynamically by keeping track of gas cost
         // Leave some gas for the final revenue distribution call
         // and the proposer payment.
         // The gas cost should be 10k per target, but could jump
         // to 35k if the targets are new accounts.
         // This number leaves us space for ~9 non-empty targets, or ~2 new accounts.
-        // TODO: compute dynamically by keeping track of gas cost
-        // We also leave some gas for the proposer payment
-        let distribution_gas_limit = 100000 + payment_tx_gas_limit;
+        // We also leave some extra gas for the proposer payment, ignoring the
+        // intrinsic tx gas cost, since that's already covered.
+        let distribution_gas_limit = 100000 + payment_tx_gas_limit - 21000;
         let gas_limit = header
             .gas_limit
             .checked_sub(distribution_gas_limit)
