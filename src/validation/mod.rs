@@ -412,7 +412,7 @@ impl ValidationApi {
     }
 
     /// Core logic for validating the builder submission v3
-    async fn validate_builder_submission_v3(
+    async fn _validate_builder_submission_v3(
         &self,
         request: BuilderBlockValidationRequestV3,
     ) -> Result<(), ValidationApiError> {
@@ -429,7 +429,7 @@ impl ValidationApi {
     }
 
     /// Core logic for validating the builder submission v4
-    async fn validate_builder_submission_v4(
+    async fn _validate_builder_submission_v4(
         &self,
         request: ExtendedValidationRequestV4,
     ) -> Result<(), ValidationApiError> {
@@ -497,7 +497,7 @@ impl BlockSubmissionValidationApiServer for ValidationApi {
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v3(&this, request).await.map_err(ErrorObject::from);
+            let result = Self::_validate_builder_submission_v3(&this, request).await.map_err(ErrorObject::from);
             let _ = tx.send(result);
         }));
 
@@ -510,7 +510,7 @@ impl BlockSubmissionValidationApiServer for ValidationApi {
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v4(&this, request).await.map_err(ErrorObject::from);
+            let result = Self::_validate_builder_submission_v4(&this, request).await.map_err(ErrorObject::from);
             let _ = tx.send(result);
         }));
 

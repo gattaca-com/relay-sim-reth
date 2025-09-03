@@ -56,7 +56,10 @@ pub(crate) mod types;
 
 impl BlockMergingApi {
     /// Core logic for appending additional transactions to a block.
-    async fn merge_block_v1(&self, request: BlockMergeRequestV1) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
+    async fn _merge_block_v1(
+        &self,
+        request: BlockMergeRequestV1,
+    ) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
         let block: Block = request.execution_payload.try_into_block().map_err(NewPayloadError::Eth)?;
 
         let proposer_fee_recipient = request.proposer_fee_recipient;

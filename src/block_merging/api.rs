@@ -85,7 +85,7 @@ impl BlockMergingApiServer for BlockMergingApi {
         let (tx, rx) = oneshot::channel();
 
         self.validation.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::merge_block_v1(&this, request).await.map_err(ErrorObject::from);
+            let result = Self::_merge_block_v1(&this, request).await.map_err(ErrorObject::from);
             let _ = tx.send(result);
         }));
 
