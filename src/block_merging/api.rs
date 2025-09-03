@@ -13,7 +13,7 @@ use crate::{
     validation::ValidationApi,
 };
 
-/// Block validation rpc interface.
+/// Block merging rpc interface.
 #[rpc(server, namespace = "relay")]
 pub trait BlockMergingApi {
     /// A Request to append mergeable transactions to a block.
