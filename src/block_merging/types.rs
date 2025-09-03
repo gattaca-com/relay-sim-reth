@@ -40,7 +40,7 @@ pub(crate) struct PrivateKeySigner(#[serde_as(as = "DisplayFromStr")] pub(crate)
 /// will be paid `revenue * x / 10000`.
 ///
 /// This config does not have an explicit proposer allocation.
-/// It is assumed it will be the remaining bips not allocated
+/// It is assumed it will be the remaining bps not allocated
 /// to other parties.
 #[derive(Debug, Serialize, Eq, PartialEq, Deserialize, Clone)]
 pub(crate) struct DistributionConfig {
@@ -72,8 +72,8 @@ impl DistributionConfig {
         );
     }
 
-    pub(crate) fn split(&self, bips: u64, revenue: U256) -> U256 {
-        (U256::from(bips) * revenue) / U256::from(Self::TOTAL_BPS)
+    pub(crate) fn split(&self, bps: u64, revenue: U256) -> U256 {
+        (U256::from(bps) * revenue) / U256::from(Self::TOTAL_BPS)
     }
 
     pub(crate) fn relay_split(&self, revenue: U256) -> U256 {
@@ -81,8 +81,8 @@ impl DistributionConfig {
     }
 
     pub(crate) fn proposer_split(&self, revenue: U256) -> U256 {
-        let proposer_bips = Self::TOTAL_BPS - self.relay_bps - self.merged_builder_bps - self.winning_builder_bps;
-        self.split(proposer_bips, revenue)
+        let proposer_bps = Self::TOTAL_BPS - self.relay_bps - self.merged_builder_bps - self.winning_builder_bps;
+        self.split(proposer_bps, revenue)
     }
 
     pub(crate) fn merged_builder_split(&self, revenue: U256) -> U256 {
