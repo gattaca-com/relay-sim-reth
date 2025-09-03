@@ -302,6 +302,10 @@ impl BlockMergingApi {
         let estimated_payment_cost =
             U256::from(block_base_fee_per_gas).saturating_mul(U256::from(distribution_gas_limit));
 
+        if total_revenue <= estimated_payment_cost {
+            return Err(BlockMergingApiError::ZeroMergedBlockRevenue);
+        }
+
         let updated_revenues = prepare_revenues(
             &self.distribution_config,
             revenues,
@@ -309,7 +313,7 @@ impl BlockMergingApi {
             proposer_fee_recipient,
             relay_fee_recipient,
             beneficiary,
-        )?;
+        );
         let proposer_added_value = updated_revenues.get(&proposer_fee_recipient).cloned().unwrap_or_default();
 
         let winning_builder_revenue =
@@ -433,9 +437,12 @@ pub(crate) fn encode_disperse_eth_calldata(value_by_recipient: &HashMap<Address,
     disperseEtherCall { recipients, values }.abi_encode()
 }
 
-/// Computes revenue distribution, splitting merged block revenue to the multiple participants.
-/// Returns the proposer value, the distributed value to other parties, and the
-/// revenue to be distributed to each address.
+/// Computes revenue distribution, splitting merged block revenue
+/// to the multiple participants. This also takes into account the
+/// estimated payment cost, by subtracting it from the revenue.
+///
+/// Returns a map from address to value that should be sent to that
+/// address.
 pub(crate) fn prepare_revenues(
     distribution_config: &DistributionConfig,
     revenues: HashMap<Address, U256>,
@@ -443,13 +450,10 @@ pub(crate) fn prepare_revenues(
     proposer_fee_recipient: Address,
     relay_fee_recipient: Address,
     block_beneficiary: Address,
-) -> Result<HashMap<Address, U256>, BlockMergingApiError> {
+) -> HashMap<Address, U256> {
     let mut updated_revenues = HashMap::with_capacity(revenues.len());
 
     let total_revenue: U256 = revenues.values().sum();
-    if total_revenue <= estimated_payment_cost {
-        return Err(BlockMergingApiError::ZeroMergedBlockRevenue);
-    }
     // Subtract the payment cost from the revenue
     let expected_revenue = total_revenue - estimated_payment_cost;
 
@@ -475,7 +479,7 @@ pub(crate) fn prepare_revenues(
     // Just in case, we remove the beneficiary address from the distribution
     updated_revenues.remove(&block_beneficiary).unwrap_or(U256::ZERO);
 
-    Ok(updated_revenues)
+    updated_revenues
 }
 
 struct BlockBuilder<BB> {
@@ -788,8 +792,7 @@ mod tests {
             proposer_fee_recipient,
             relay_fee_recipient,
             winning_builder_fee_recipient,
-        )
-        .unwrap();
+        );
 
         // Check total for relay + proposer + builders
         assert_eq!(updated_revenues.values().sum::<U256>(), 30000);
@@ -831,8 +834,7 @@ mod tests {
             proposer_fee_recipient,
             relay_fee_recipient,
             winning_builder_fee_recipient,
-        )
-        .unwrap();
+        );
 
         // Check total for relay + proposer + builders
         assert_eq!(updated_revenues.values().sum::<U256>(), 8);
