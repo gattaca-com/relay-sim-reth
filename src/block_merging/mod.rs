@@ -246,9 +246,10 @@ impl BlockMergingApi {
             transactions.into_iter().zip(senders).map(|(tx, sender)| RecoveredTx::new_unchecked(tx, sender));
         builder.execute_base_block(recovered_txs)?;
 
+        let base_block_tx_count = builder.tx_hashes.len();
         debug!(
             target: "rpc::relay::block_merging",
-            tx_count=%builder.tx_hashes.len(),
+            tx_count=%base_block_tx_count,
             gas_used=%builder.gas_used,
             "Finished executing base block",
         );
@@ -282,7 +283,8 @@ impl BlockMergingApi {
         // Simulate orders until we run out of block gas
         let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
 
-        debug!(target: "rpc::relay::block_merging", "Finished appending orders");
+        let number_of_appended_txs = builder.tx_hashes.len() - base_block_tx_count;
+        debug!(target: "rpc::relay::block_merging", %number_of_appended_txs, "Finished appending orders");
 
         let final_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
