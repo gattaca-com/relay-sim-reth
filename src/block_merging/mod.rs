@@ -36,7 +36,7 @@ use revm_primitives::{
     Address, B256, U256,
     alloy_primitives::{TxHash, U512},
 };
-use tracing::info;
+use tracing::{debug, info, trace, warn};
 
 pub(crate) use crate::block_merging::api::{BlockMergingApi, BlockMergingApiServer};
 use crate::{
@@ -60,6 +60,13 @@ impl BlockMergingApi {
         &self,
         request: BlockMergeRequestV1,
     ) -> Result<BlockMergeResponseV1, BlockMergingApiError> {
+        info!(
+            target: "rpc::relay::block_merging",
+            block_hash=%request.execution_payload.payload_inner.payload_inner.block_hash,
+            tx_count=%request.execution_payload.payload_inner.payload_inner.transactions.len(),
+            proposer_value=%request.original_value,
+            "Merging block v1",
+        );
         let block: Block = request.execution_payload.try_into_block().map_err(NewPayloadError::Eth)?;
 
         let proposer_fee_recipient = request.proposer_fee_recipient;
@@ -70,6 +77,15 @@ impl BlockMergingApi {
         // async fn to not be Send, which is required for spawning it.
         let (response, blob_versioned_hashes, request_cache) =
             self.merge_block(request.original_value, proposer_fee_recipient, block, request.merging_data).await?;
+
+        debug!(
+            target: "rpc::relay::block_merging",
+            block_hash=%response.execution_payload.payload_inner.payload_inner.block_hash,
+            tx_count=%response.execution_payload.payload_inner.payload_inner.transactions.len(),
+            proposer_value=%response.proposer_value,
+            appended_blob_count=%response.appended_blobs.len(),
+            "Finished block merging",
+        );
 
         let parent_hash = response.execution_payload.payload_inner.payload_inner.parent_hash;
 
@@ -90,17 +106,24 @@ impl BlockMergingApi {
                 gas_used,
                 value: response.proposer_value,
             };
-            let block = self.validation.payload_validator.ensure_well_formed_payload(ExecutionData {
-                payload: ExecutionPayload::V3(response.execution_payload.clone()),
-                sidecar: ExecutionPayloadSidecar::v4(
-                    CancunPayloadFields { parent_beacon_block_root, versioned_hashes: blob_versioned_hashes },
-                    PraguePayloadFields {
-                        requests: RequestsOrHash::Requests(response.execution_requests.to_requests()),
-                    },
-                ),
-            })?;
+            let block = self
+                .validation
+                .payload_validator
+                .ensure_well_formed_payload(ExecutionData {
+                    payload: ExecutionPayload::V3(response.execution_payload.clone()),
+                    sidecar: ExecutionPayloadSidecar::v4(
+                        CancunPayloadFields { parent_beacon_block_root, versioned_hashes: blob_versioned_hashes },
+                        PraguePayloadFields {
+                            requests: RequestsOrHash::Requests(response.execution_requests.to_requests()),
+                        },
+                    ),
+                })
+                .inspect_err(|e| warn!(%e, "payload is not well formed"))?;
 
-            self.validation.validate_message_against_block(block, message, 0, false, None).await?;
+            self.validation
+                .validate_message_against_block(block, message, 0, false, None)
+                .await
+                .inspect_err(|e| warn!(%e, "message is not valid against block"))?;
         }
 
         Ok(response)
@@ -116,7 +139,6 @@ impl BlockMergingApi {
         base_block: Block,
         merging_data: Vec<MergeableOrderBytes>,
     ) -> Result<(BlockMergeResponseV1, Vec<B256>, CachedReads), BlockMergingApiError> {
-        info!(target: "rpc::relay", "Merging block v1");
         let validation = &self.validation;
 
         // Recover the base block transactions in parallel
@@ -134,6 +156,16 @@ impl BlockMergingApi {
 
         let evm_config = validation.evm_config.clone().with_extra_data(header.extra_data);
 
+        debug!(
+            target: "rpc::relay::block_merging",
+            parent=%header.parent_hash,
+            %beneficiary,
+            gas_limit=%header.gas_limit,
+            gas_used=%header.gas_used,
+            txs=%transactions.len(),
+            "Started block merging",
+        );
+
         // Check we have collateral for this builder
         let Some(types::PrivateKeySigner(signer)) = self.builder_collateral_map.get(&beneficiary).as_ref() else {
             return Err(BlockMergingApiError::NoSignerForBuilder(beneficiary));
@@ -144,6 +176,14 @@ impl BlockMergingApi {
         let Some(payment_tx) = transactions.last() else {
             return Err(BlockMergingApiError::MissingProposerPayment);
         };
+        debug!(
+            target: "rpc::relay::block_merging",
+            to=?payment_tx.to(),
+            value=%payment_tx.value(),
+            tx_hash=%payment_tx.hash(),
+            gas_limit=%payment_tx.gas_limit(),
+            "Got proposer payment",
+        );
         if payment_tx.value() != original_value || payment_tx.to() != Some(proposer_fee_recipient) {
             return Err(BlockMergingApiError::InvalidProposerPayment);
         }
@@ -206,21 +246,43 @@ impl BlockMergingApi {
             transactions.into_iter().zip(senders).map(|(tx, sender)| RecoveredTx::new_unchecked(tx, sender));
         builder.execute_base_block(recovered_txs)?;
 
+        debug!(
+            target: "rpc::relay::block_merging",
+            tx_count=%builder.tx_hashes.len(),
+            gas_used=%builder.gas_used,
+            "Finished executing base block",
+        );
+
         let recovered_orders: Vec<MergeableOrderRecovered> =
             merging_data.into_par_iter().filter_map(|order| order.recover().ok()).collect();
+
+        debug!(
+            target: "rpc::relay::block_merging",
+            count=%recovered_orders.len(),
+            "Finished recovering mergeable orders",
+        );
 
         // TODO: parallelize simulation
         // For this we need to consolidate `State` and wrap our database in a thread-safe cache.
         let mut simulated_orders: Vec<SimulatedOrder> =
             recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
 
+        debug!(
+            target: "rpc::relay::block_merging",
+            count=%simulated_orders.len(),
+            "Finished simulating orders",
+        );
+
         // Sort orders by revenue, in descending order
         simulated_orders.sort_unstable_by(|o1, o2| o2.builder_payment.cmp(&o1.builder_payment));
+        debug!(target: "rpc::relay::block_merging", "Finished sorting orders");
 
         let initial_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
         // Simulate orders until we run out of block gas
         let revenues = append_greedily_until_gas_limit(&mut builder, simulated_orders)?;
+
+        debug!(target: "rpc::relay::block_merging", "Finished appending orders");
 
         let final_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
@@ -251,19 +313,32 @@ impl BlockMergingApi {
         let winning_builder_revenue =
             total_revenue.saturating_sub(updated_revenues.values().sum()).saturating_sub(estimated_payment_cost);
 
+        debug!(
+            target: "rpc::relay::block_merging",
+            %total_revenue,
+            %proposer_added_value,
+            estimated_winning_builder_revenue=%winning_builder_revenue,
+            "Finished processing revenue distribution",
+        );
+
         // Sanity check. The winning builder gets something.
         // This is already indirectly checked in `prepare_revenues`.
         if winning_builder_revenue.is_zero() {
             return Err(BlockMergingApiError::ZeroRevenueForWinningBuilder);
         }
 
-        self.append_payment_txs(
+        self.append_payment_tx(
             &mut builder,
             signer,
             &updated_revenues,
             distribution_gas_limit,
             block_base_fee_per_gas.into(),
         )?;
+
+        debug!(
+            target: "rpc::relay::block_merging",
+            "Finished appending payment tx",
+        );
 
         let built_block = builder.finish(&state_provider)?;
 
@@ -276,7 +351,7 @@ impl BlockMergingApi {
         Ok((response, built_block.blob_versioned_hashes, request_cache))
     }
 
-    fn append_payment_txs<'a, BB, Ex, Ev>(
+    fn append_payment_tx<'a, BB, Ex, Ev>(
         &self,
         builder: &mut BlockBuilder<BB>,
         signer: &PrivateKeySigner,
@@ -323,6 +398,7 @@ impl BlockMergingApi {
             access_list: Default::default(),
             input: calldata.into(),
         };
+        trace!(target: "rpc::relay::block_merging", ?disperse_tx, "Signing payment tx");
 
         let signed_disperse_tx = sign_transaction(signer, disperse_tx)?;
 
