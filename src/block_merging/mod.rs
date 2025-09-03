@@ -451,7 +451,7 @@ pub(crate) fn prepare_revenues(
     relay_fee_recipient: Address,
     block_beneficiary: Address,
 ) -> HashMap<Address, U256> {
-    let mut updated_revenues = HashMap::with_capacity(revenues.len());
+    let mut updated_revenues = HashMap::with_capacity(revenues.len() + 1);
 
     let total_revenue: U256 = revenues.values().sum();
     // Subtract the payment cost from the revenue
