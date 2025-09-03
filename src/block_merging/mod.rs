@@ -24,10 +24,7 @@ use reth_ethereum::{
     },
     provider::ChainSpecProvider,
     storage::{StateProvider, StateProviderFactory},
-    trie::{
-        iter::{IntoParallelIterator, ParallelIterator},
-        slice::ParallelSliceMut,
-    },
+    trie::iter::{IntoParallelIterator, ParallelIterator},
 };
 use reth_node_builder::{Block as _, ConfigureEvm, NewPayloadError, NextBlockEnvAttributes, PayloadValidator};
 use reth_primitives::{GotExpected, Recovered};
@@ -209,7 +206,7 @@ impl BlockMergingApi {
             recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
 
         // Sort orders by revenue, in descending order
-        simulated_orders.par_sort_unstable_by(|o1, o2| o2.builder_payment.cmp(&o1.builder_payment));
+        simulated_orders.sort_unstable_by(|o1, o2| o2.builder_payment.cmp(&o1.builder_payment));
 
         let initial_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
