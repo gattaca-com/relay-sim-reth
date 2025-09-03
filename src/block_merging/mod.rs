@@ -480,7 +480,7 @@ where
             .transactions()
             .iter()
             .enumerate()
-            .any(|(i, tx)| self.was_already_applied(tx.tx_hash()) && dropping_txs.contains(&i));
+            .any(|(i, tx)| self.was_already_applied(tx.tx_hash()) && !dropping_txs.contains(&i));
 
         if any_duplicate_undroppable_txs {
             return Err(SimulationError::DuplicateTransaction);
