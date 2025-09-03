@@ -118,7 +118,6 @@ impl BlockMergingApi {
     ) -> Result<(BlockMergeResponseV1, Vec<B256>, CachedReads), BlockMergingApiError> {
         info!(target: "rpc::relay", "Merging block v1");
         let validation = &self.validation;
-        let evm_config = &validation.evm_config;
 
         // Recover the base block transactions in parallel
         let (base_block, senders) =
@@ -132,6 +131,8 @@ impl BlockMergingApi {
 
         let relay_fee_recipient = self.relay_fee_recipient;
         let beneficiary = header.beneficiary;
+
+        let evm_config = validation.evm_config.clone().with_extra_data(header.extra_data);
 
         // Check we have collateral for this builder
         let Some(types::PrivateKeySigner(signer)) = self.builder_collateral_map.get(&beneficiary).as_ref() else {
