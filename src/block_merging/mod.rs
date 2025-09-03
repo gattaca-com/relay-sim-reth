@@ -158,10 +158,14 @@ impl BlockMergingApi {
         // We also leave some extra gas for the proposer payment, ignoring the
         // intrinsic tx gas cost, since that's already covered.
         let distribution_gas_limit = 100000 + payment_tx_gas_limit - 21000;
-        let gas_limit = header
-            .gas_limit
-            .checked_sub(distribution_gas_limit)
-            .ok_or(BlockMergingApiError::NotEnoughGasForPayment(header.gas_limit))?;
+
+        // Compute gas left in the base block
+        let base_gas_left = header.gas_limit.saturating_sub(header.gas_used);
+        if base_gas_left <= distribution_gas_limit {
+            return Err(BlockMergingApiError::NotEnoughGasForPayment(base_gas_left));
+        }
+        // We already checked this doesn't underflow
+        let gas_limit = header.gas_limit - distribution_gas_limit;
 
         let new_block_attrs = NextBlockEnvAttributes {
             timestamp: header.timestamp,
