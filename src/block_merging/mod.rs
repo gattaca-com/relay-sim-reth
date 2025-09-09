@@ -476,7 +476,7 @@ pub(crate) fn prepare_revenues(
     }
 
     // Just in case, we remove the beneficiary address from the distribution
-    updated_revenues.remove(&block_beneficiary).unwrap_or(U256::ZERO);
+    updated_revenues.remove(&block_beneficiary);
 
     updated_revenues
 }
