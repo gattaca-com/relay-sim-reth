@@ -12,7 +12,7 @@ use revm_primitives::{Address, B256};
 
 /// Errors thrown by the validation API.
 #[derive(Debug, thiserror::Error)]
-pub enum ValidationApiError {
+pub(crate) enum ValidationApiError {
     #[error("block gas limit mismatch: {_0}")]
     GasLimitMismatch(GotExpected<u64>),
     #[error("block gas used mismatch: {_0}")]
@@ -21,12 +21,8 @@ pub enum ValidationApiError {
     ParentHashMismatch(GotExpected<B256>),
     #[error("block hash mismatch: {_0}")]
     BlockHashMismatch(GotExpected<B256>),
-    #[error("missing latest block in database")]
-    MissingLatestBlock,
-    #[error("parent block not found")]
-    MissingParentBlock,
-    #[error("block is too old, outside validation window")]
-    BlockTooOld,
+    #[error("could not find parent block: {_0}")]
+    GetParent(#[from] GetParentError),
     #[error("could not verify proposer payment")]
     ProposerPayment,
     #[error("invalid blobs bundle")]
@@ -43,7 +39,7 @@ pub enum ValidationApiError {
     Execution(#[from] BlockExecutionError),
     #[error(transparent)]
     Payload(#[from] NewPayloadError),
-    #[error("inclusion list not statisfied")]
+    #[error("inclusion list not satisfied")]
     InclusionList,
 }
 
@@ -60,11 +56,9 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             | ValidationApiError::InclusionList
             | ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
-            ValidationApiError::MissingLatestBlock
-            | ValidationApiError::MissingParentBlock
-            | ValidationApiError::BlockTooOld
-            | ValidationApiError::Consensus(_)
-            | ValidationApiError::Provider(_) => internal_rpc_err(error.to_string()),
+            ValidationApiError::GetParent(_) | ValidationApiError::Consensus(_) | ValidationApiError::Provider(_) => {
+                internal_rpc_err(error.to_string())
+            }
             ValidationApiError::Execution(err) => match err {
                 error @ BlockExecutionError::Validation(_) => invalid_params_rpc_err(error.to_string()),
                 error @ BlockExecutionError::Internal(_) => internal_rpc_err(error.to_string()),
@@ -75,4 +69,16 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             },
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GetParentError {
+    #[error("missing latest block in database")]
+    MissingLatestBlock,
+    #[error("parent block not found")]
+    MissingParentBlock,
+    #[error("block is too old, outside validation window")]
+    BlockTooOld,
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
 }

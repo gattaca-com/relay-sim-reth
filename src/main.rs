@@ -1,8 +1,10 @@
+mod block_merging;
+mod common;
 mod inclusion;
 mod state_recorder;
 mod validation;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use reth_chain_state::CanonStateSubscriptions;
@@ -12,10 +14,11 @@ use reth_ethereum::{
     rpc::api::eth::RpcNodeCore,
 };
 use reth_node_builder::FullNodeComponents;
-use revm_primitives::Bytes;
+use revm_primitives::{Address, Bytes};
 use validation::{ValidationApi, ValidationApiConfig};
 
 use crate::{
+    block_merging::{BlockMergingApi, BlockMergingApiServer, types::BlockMergingConfig},
     inclusion::{
         api::{InclusionExt, InclusionExtApiServer},
         inclusion_producer::inclusion_producer,
@@ -54,6 +57,10 @@ fn main() {
                         Box::new(ctx.node().task_executor.clone()),
                         Arc::new(EthereumEngineValidator::new(ctx.config().chain.clone())),
                     );
+                    if args.enable_block_merging_ext {
+                        let block_merging_api = BlockMergingApi::new(validation_api.clone(), args.clone().into());
+                        ctx.modules.merge_configured(block_merging_api.into_rpc())?;
+                    }
 
                     ctx.modules.merge_configured(validation_api.into_rpc())?;
 
@@ -102,4 +109,38 @@ struct CliExt {
 
     #[arg(long, default_value_t = true)]
     pub enable_inclusion_ext: bool,
+
+    #[arg(long, default_value_t = true)]
+    pub enable_block_merging_ext: bool,
+
+    /// Path to a file with a mapping `builder coinbase -> collateral signer`.
+    /// The base block coinbase will accrue fees and disperse from its
+    /// collateral address
+    #[arg(long)]
+    pub builder_collateral_map_path: PathBuf,
+
+    #[arg(long)]
+    pub relay_fee_recipient: Address,
+
+    #[arg(long)]
+    pub disperse_address: Address,
+
+    #[arg(long)]
+    pub validate_merged_blocks: bool,
+}
+
+impl From<CliExt> for BlockMergingConfig {
+    fn from(cli: CliExt) -> Self {
+        let builder_collateral_path = std::fs::read_to_string(cli.builder_collateral_map_path)
+            .expect("Failed to read builder collateral map from file");
+        let builder_collateral_map =
+            serde_json::from_str(&builder_collateral_path).expect("Failed to parse builder collateral map");
+        BlockMergingConfig {
+            builder_collateral_map,
+            relay_fee_recipient: cli.relay_fee_recipient,
+            distribution_config: Default::default(),
+            disperse_address: cli.disperse_address,
+            validate_merged_blocks: cli.validate_merged_blocks,
+        }
+    }
 }

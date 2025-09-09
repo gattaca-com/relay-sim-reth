@@ -1,5 +1,4 @@
-mod error;
-mod types;
+pub(crate) mod error;
 
 use std::{collections::HashSet, fmt::Debug, sync::Arc, time::Duration};
 
@@ -43,11 +42,9 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
+    common::{RethConsensus, RethProvider},
     inclusion::types::InclusionList,
-    validation::{
-        error::ValidationApiError,
-        types::{RethConsensus, RethProvider},
-    },
+    validation::error::{GetParentError, ValidationApiError},
 };
 
 /// The type that implements the `validation` rpc namespace trait
@@ -116,13 +113,13 @@ impl ValidationApi {
     }
 
     /// Returns the cached reads for the given head hash.
-    async fn cached_reads(&self, head: B256) -> CachedReads {
+    pub(crate) async fn cached_reads(&self, head: B256) -> CachedReads {
         let cache = self.inner.cached_state.read().await;
         if cache.0 == head { cache.1.clone() } else { Default::default() }
     }
 
     /// Updates the cached state for the given head hash.
-    async fn update_cached_reads(&self, head: B256, cached_state: CachedReads) {
+    pub(crate) async fn update_cached_reads(&self, head: B256, cached_state: CachedReads) {
         let mut cache = self.inner.cached_state.write().await;
         if cache.0 == head {
             cache.1.extend(cached_state);
@@ -166,22 +163,7 @@ impl ValidationApi {
             }
         }
 
-        let latest_header = self.provider.latest_header()?.ok_or_else(|| ValidationApiError::MissingLatestBlock)?;
-
-        let parent_header = if block.parent_hash() == latest_header.hash() {
-            latest_header
-        } else {
-            // parent is not the latest header so we need to fetch it and ensure it's not too old
-            let parent_header = self
-                .provider
-                .sealed_header_by_hash(block.parent_hash())?
-                .ok_or_else(|| ValidationApiError::MissingParentBlock)?;
-
-            if latest_header.number().saturating_sub(parent_header.number()) > self.validation_window {
-                return Err(ValidationApiError::BlockTooOld);
-            }
-            parent_header
-        };
+        let parent_header = self.get_parent_header(block.parent_hash())?;
 
         self.consensus.validate_header_against_parent(block.sealed_header(), &parent_header)?;
         let parent_header_hash = parent_header.hash();
@@ -315,10 +297,7 @@ impl ValidationApi {
                 expected: header.gas_limit(),
             }))
         } else if header.gas_used() != message.gas_used {
-            return Err(ValidationApiError::GasUsedMismatch(GotExpected {
-                got: message.gas_used,
-                expected: header.gas_used(),
-            }));
+            Err(ValidationApiError::GasUsedMismatch(GotExpected { got: message.gas_used, expected: header.gas_used() }))
         } else {
             Ok(())
         }
@@ -433,7 +412,7 @@ impl ValidationApi {
     }
 
     /// Core logic for validating the builder submission v3
-    async fn validate_builder_submission_v3(
+    async fn _validate_builder_submission_v3(
         &self,
         request: BuilderBlockValidationRequestV3,
     ) -> Result<(), ValidationApiError> {
@@ -450,7 +429,7 @@ impl ValidationApi {
     }
 
     /// Core logic for validating the builder submission v4
-    async fn validate_builder_submission_v4(
+    async fn _validate_builder_submission_v4(
         &self,
         request: ExtendedValidationRequestV4,
     ) -> Result<(), ValidationApiError> {
@@ -477,6 +456,27 @@ impl ValidationApi {
         )
         .await
     }
+
+    pub(crate) fn get_parent_header(
+        &self,
+        parent_hash: B256,
+    ) -> Result<SealedHeaderFor<EthPrimitives>, GetParentError> {
+        let latest_header = self.provider.latest_header()?.ok_or_else(|| GetParentError::MissingLatestBlock)?;
+
+        let parent_header = if parent_hash == latest_header.hash() {
+            latest_header
+        } else {
+            // parent is not the latest header so we need to fetch it and ensure it's not too old
+            let parent_header =
+                self.provider.sealed_header_by_hash(parent_hash)?.ok_or_else(|| GetParentError::MissingParentBlock)?;
+
+            if latest_header.number().saturating_sub(parent_header.number()) > self.validation_window {
+                return Err(GetParentError::BlockTooOld);
+            }
+            parent_header
+        };
+        Ok(parent_header)
+    }
 }
 
 #[async_trait]
@@ -497,7 +497,7 @@ impl BlockSubmissionValidationApiServer for ValidationApi {
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v3(&this, request).await.map_err(ErrorObject::from);
+            let result = Self::_validate_builder_submission_v3(&this, request).await.map_err(ErrorObject::from);
             let _ = tx.send(result);
         }));
 
@@ -510,7 +510,7 @@ impl BlockSubmissionValidationApiServer for ValidationApi {
         let (tx, rx) = oneshot::channel();
 
         self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::validate_builder_submission_v4(&this, request).await.map_err(ErrorObject::from);
+            let result = Self::_validate_builder_submission_v4(&this, request).await.map_err(ErrorObject::from);
             let _ = tx.send(result);
         }));
 
@@ -520,13 +520,13 @@ impl BlockSubmissionValidationApiServer for ValidationApi {
 
 pub struct ValidationApiInner {
     /// The provider that can interact with the chain.
-    provider: RethProvider,
+    pub(crate) provider: RethProvider,
     /// Consensus implementation.
     consensus: Arc<RethConsensus>,
     /// Execution payload validator.
-    payload_validator: Arc<EthereumEngineValidator>,
+    pub(crate) payload_validator: Arc<EthereumEngineValidator>,
     /// Block executor factory.
-    evm_config: reth_ethereum::evm::EthEvmConfig,
+    pub(crate) evm_config: reth_ethereum::evm::EthEvmConfig,
     /// Set of disallowed addresses
     disallow: Arc<DashSet<Address>>,
     /// The maximum block distance - parent to latest - allowed for validation
@@ -537,7 +537,7 @@ pub struct ValidationApiInner {
     /// requests.
     cached_state: RwLock<(B256, CachedReads)>,
     /// Task spawner for blocking operations
-    task_spawner: Box<TaskExecutor>,
+    pub(crate) task_spawner: Box<TaskExecutor>,
     /// Validation metrics
     metrics: ValidationMetrics,
 }
