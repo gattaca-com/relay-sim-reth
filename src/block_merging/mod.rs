@@ -376,7 +376,6 @@ impl BlockMergingApi {
         // Get the chain ID from the configured provider
         let chain_id = self.validation.provider.chain_spec().chain_id();
 
-        // Get the chain ID from the configured provider
         let signer_address = signer.address();
 
         let Some(signer_info) = builder.get_state().basic_ref(signer_address)? else {
