@@ -71,7 +71,7 @@ impl BlockMergingApi {
 
         let proposer_fee_recipient = request.proposer_fee_recipient;
         let gas_limit = block.gas_limit;
-        let parent_beacon_block_root = block.parent_beacon_block_root().unwrap();
+        let parent_beacon_block_root = request.parent_beacon_block_root;
 
         // The `merge_block` function is to avoid a lifetime leak that causes this
         // async fn to not be Send, which is required for spawning it.
