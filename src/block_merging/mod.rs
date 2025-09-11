@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use alloy_consensus::{BlockHeader, SignableTransaction, Transaction, TxEip1559};
+use alloy_consensus::{SignableTransaction, Transaction, TxEip1559};
 use alloy_eips::{eip7685::RequestsOrHash, eip7840::BlobParams};
 use alloy_rpc_types_beacon::{relay::BidTrace, requests::ExecutionRequestsV4};
 use alloy_rpc_types_engine::{
@@ -75,8 +75,15 @@ impl BlockMergingApi {
 
         // The `merge_block` function is to avoid a lifetime leak that causes this
         // async fn to not be Send, which is required for spawning it.
-        let (response, blob_versioned_hashes, request_cache) =
-            self.merge_block(request.original_value, proposer_fee_recipient, block, request.merging_data).await?;
+        let (response, blob_versioned_hashes, request_cache) = self
+            .merge_block(
+                request.original_value,
+                proposer_fee_recipient,
+                block,
+                parent_beacon_block_root,
+                request.merging_data,
+            )
+            .await?;
 
         debug!(
             target: "rpc::relay::block_merging",
@@ -137,6 +144,7 @@ impl BlockMergingApi {
         original_value: U256,
         proposer_fee_recipient: Address,
         base_block: Block,
+        parent_beacon_block_root: B256,
         merging_data: Vec<MergeableOrderBytes>,
     ) -> Result<(BlockMergeResponseV1, Vec<B256>, CachedReads), BlockMergingApiError> {
         let validation = &self.validation;
@@ -214,7 +222,7 @@ impl BlockMergingApi {
             // mix_hash == prev_randao (source: https://eips.ethereum.org/EIPS/eip-4399)
             prev_randao: header.mix_hash,
             gas_limit: header.gas_limit,
-            parent_beacon_block_root: header.parent_beacon_block_root,
+            parent_beacon_block_root: Some(parent_beacon_block_root),
             withdrawals,
         };
 
