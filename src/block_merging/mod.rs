@@ -274,7 +274,15 @@ impl BlockMergingApi {
         // TODO: parallelize simulation
         // For this we need to consolidate `State` and wrap our database in a thread-safe cache.
         let mut simulated_orders: Vec<SimulatedOrder> =
-            recovered_orders.into_iter().filter_map(|order| builder.simulate_order(order).ok()).collect();
+            recovered_orders.into_iter().filter_map(|order| {
+                match builder.simulate_order(order) {
+                    Ok(simulated_order) => Some(simulated_order),
+                    Err(e) => {
+                        debug!(target: "rpc::relay::block_merging", %e, "Error simulating order");
+                        None
+                    }
+                }
+            }).collect();
 
         debug!(
             target: "rpc::relay::block_merging",
