@@ -273,16 +273,16 @@ impl BlockMergingApi {
 
         // TODO: parallelize simulation
         // For this we need to consolidate `State` and wrap our database in a thread-safe cache.
-        let mut simulated_orders: Vec<SimulatedOrder> =
-            recovered_orders.into_iter().filter_map(|order| {
-                match builder.simulate_order(order) {
-                    Ok(simulated_order) => Some(simulated_order),
-                    Err(e) => {
-                        debug!(target: "rpc::relay::block_merging", %e, "Error simulating order");
-                        None
-                    }
+        let mut simulated_orders: Vec<SimulatedOrder> = recovered_orders
+            .into_iter()
+            .filter_map(|order| match builder.simulate_order(order) {
+                Ok(simulated_order) => Some(simulated_order),
+                Err(e) => {
+                    debug!(target: "rpc::relay::block_merging", %e, "Error simulating order");
+                    None
                 }
-            }).collect();
+            })
+            .collect();
 
         debug!(
             target: "rpc::relay::block_merging",
@@ -578,11 +578,14 @@ where
         let dropping_txs = order.dropping_txs();
 
         // Check for undroppable duplicate transactions
-        let any_duplicate_undroppable_txs = order
-            .transactions()
-            .iter()
-            .enumerate()
-            .any(|(i, tx)| self.was_already_applied(tx.tx_hash()) && !dropping_txs.contains(&i));
+        let any_duplicate_undroppable_txs = order.transactions().iter().enumerate().any(|(i, tx)| {
+            let hash = tx.tx_hash();
+            let is_duplicate_undroppable_tx = self.was_already_applied(hash) && !dropping_txs.contains(&i);
+            if is_duplicate_undroppable_tx {
+                debug!(target: "rpc::relay::block_merging", %hash, "Duplicate undroppable transaction");
+            }
+            is_duplicate_undroppable_tx
+        });
 
         if any_duplicate_undroppable_txs {
             return Err(SimulationError::DuplicateTransaction);
