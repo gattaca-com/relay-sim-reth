@@ -411,23 +411,6 @@ impl ValidationApi {
         Ok(versioned_hashes)
     }
 
-    /// Core logic for validating the builder submission v3
-    async fn _validate_builder_submission_v3(
-        &self,
-        request: BuilderBlockValidationRequestV3,
-    ) -> Result<(), ValidationApiError> {
-        let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
-            payload: ExecutionPayload::V3(request.request.execution_payload),
-            sidecar: ExecutionPayloadSidecar::v3(CancunPayloadFields {
-                parent_beacon_block_root: request.parent_beacon_block_root,
-                versioned_hashes: self.validate_blobs_bundle(request.request.blobs_bundle)?,
-            }),
-        })?;
-
-        self.validate_message_against_block(block, request.request.message, request.registered_gas_limit, false, None)
-            .await
-    }
-
     /// Core logic for validating the builder submission v4
     async fn _validate_builder_submission_v4(
         &self,
@@ -492,16 +475,9 @@ impl BlockSubmissionValidationApiServer for ValidationApi {
     }
 
     /// Validates a block submitted to the relay
-    async fn validate_builder_submission_v3(&self, request: BuilderBlockValidationRequestV3) -> RpcResult<()> {
-        let this = self.clone();
-        let (tx, rx) = oneshot::channel();
-
-        self.task_spawner.spawn_blocking(Box::pin(async move {
-            let result = Self::_validate_builder_submission_v3(&this, request).await.map_err(ErrorObject::from);
-            let _ = tx.send(result);
-        }));
-
-        rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
+    async fn validate_builder_submission_v3(&self, _request: BuilderBlockValidationRequestV3) -> RpcResult<()> {
+        warn!(target: "rpc::relay", "Method `relay_validateBuilderSubmissionV3` is not supported");
+        Err(internal_rpc_err("unimplemented"))
     }
 
     /// Validates a block submitted to the relay
