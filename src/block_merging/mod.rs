@@ -406,7 +406,7 @@ impl BlockMergingApi {
                 required: distributed_value,
             });
         }
-        let nonce = signer_info.nonce + 1;
+        let nonce = signer_info.nonce;
 
         let disperse_tx = TxEip1559 {
             chain_id,
