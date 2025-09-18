@@ -249,6 +249,14 @@ pub struct BlockMergeResponseV1 {
     pub appended_blobs: Vec<B256>,
     /// Total value for the proposer
     pub proposer_value: U256,
+    pub builder_inclusions: HashMap<Address, BuilderInclusionResult>,
+}
+
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderInclusionResult {
+    pub revenue: U256,
+    pub tx_count: usize,
 }
 
 #[cfg(test)]
