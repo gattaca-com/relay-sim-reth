@@ -43,7 +43,7 @@ use crate::{
     block_merging::{
         error::BlockMergingApiError,
         types::{
-            BlockMergeRequestV1, BlockMergeResponseV1, DistributionConfig, MergeableOrderBytes,
+            BlockMergeRequestV1, BlockMergeResponseV1, BuilderInclusionResult, DistributionConfig, MergeableOrderBytes,
             MergeableOrderRecovered, RecoveredTx, SignedTx, SimulatedOrder, SimulationError,
         },
     },
@@ -304,7 +304,7 @@ impl BlockMergingApi {
 
         let final_builder_balance = get_balance_or_zero(builder.get_state(), beneficiary)?;
 
-        let total_revenue: U256 = revenues.values().sum();
+        let total_revenue: U256 = revenues.values().map(|v| v.revenue).sum();
         let builder_balance_delta = final_builder_balance.saturating_sub(initial_builder_balance);
 
         // Sanity check the sum of revenues is equal to the builder balance delta
@@ -324,7 +324,7 @@ impl BlockMergingApi {
 
         let updated_revenues = prepare_revenues(
             &self.distribution_config,
-            revenues,
+            &revenues,
             estimated_payment_cost,
             proposer_fee_recipient,
             relay_fee_recipient,
@@ -369,6 +369,7 @@ impl BlockMergingApi {
             execution_requests: built_block.execution_requests,
             appended_blobs: built_block.appended_blob_versioned_hashes,
             proposer_value: proposer_added_value + original_value,
+            builder_inclusions: revenues,
         };
         Ok((response, built_block.blob_versioned_hashes, request_cache))
     }
@@ -460,7 +461,7 @@ pub(crate) fn encode_disperse_eth_calldata(value_by_recipient: &HashMap<Address,
 /// address.
 pub(crate) fn prepare_revenues(
     distribution_config: &DistributionConfig,
-    revenues: HashMap<Address, U256>,
+    revenues: &HashMap<Address, BuilderInclusionResult>,
     estimated_payment_cost: U256,
     proposer_fee_recipient: Address,
     relay_fee_recipient: Address,
@@ -468,7 +469,7 @@ pub(crate) fn prepare_revenues(
 ) -> HashMap<Address, U256> {
     let mut updated_revenues = HashMap::with_capacity(revenues.len() + 1);
 
-    let total_revenue: U256 = revenues.values().sum();
+    let total_revenue: U256 = revenues.values().map(|v| v.revenue).sum();
     // Subtract the payment cost from the revenue
     let expected_revenue = total_revenue - estimated_payment_cost;
 
@@ -486,9 +487,10 @@ pub(crate) fn prepare_revenues(
     // We divide the revenue among the different bundle origins.
     for (origin, origin_revenue) in revenues {
         // Update the revenue, subtracting part of the payment cost
-        let actualized_revenue = (origin_revenue.widening_mul(expected_revenue) / U512::from(total_revenue)).to();
+        let actualized_revenue =
+            (origin_revenue.revenue.widening_mul(expected_revenue) / U512::from(total_revenue)).to();
         let builder_revenue = distribution_config.merged_builder_split(actualized_revenue);
-        updated_revenues.entry(origin).and_modify(|v| *v += builder_revenue).or_insert(builder_revenue);
+        updated_revenues.entry(*origin).and_modify(|v| *v += builder_revenue).or_insert(builder_revenue);
     }
 
     // Just in case, we remove the beneficiary address from the distribution
@@ -660,7 +662,7 @@ struct BuiltBlock {
 fn append_greedily_until_gas_limit<'a, BB, Ex, Ev>(
     builder: &mut BlockBuilder<BB>,
     simulated_orders: Vec<SimulatedOrder>,
-) -> Result<HashMap<Address, U256>, BlockMergingApiError>
+) -> Result<HashMap<Address, BuilderInclusionResult>, BlockMergingApiError>
 where
     BB: RethBlockBuilder<Primitives = EthPrimitives, Executor = Ex>,
     Ex: BlockExecutor<Transaction = SignedTx, Evm = Ev> + 'a,
@@ -687,7 +689,13 @@ where
         }
 
         // Update the revenue for the bundle's origin
-        revenues.entry(origin).and_modify(|v| *v += builder_payment).or_insert(builder_payment);
+        revenues
+            .entry(origin)
+            .and_modify(|v: &mut BuilderInclusionResult| {
+                v.revenue += builder_payment;
+                v.tx_count += 1;
+            })
+            .or_insert(BuilderInclusionResult { revenue: builder_payment, tx_count: 1 });
     }
     Ok(revenues)
 }
@@ -802,10 +810,15 @@ mod tests {
         ];
         let values = vec![U256::from(10000), U256::from(30000)];
 
-        let revenues = HashMap::from_iter(addresses.iter().cloned().zip(values.iter().cloned()));
+        let revenues = HashMap::from_iter(
+            addresses
+                .iter()
+                .cloned()
+                .zip(values.iter().cloned().map(|v| BuilderInclusionResult { revenue: v, tx_count: 1 })),
+        );
         let updated_revenues = prepare_revenues(
             &distribution_config,
-            revenues,
+            &revenues,
             U256::ZERO,
             proposer_fee_recipient,
             relay_fee_recipient,
@@ -844,10 +857,15 @@ mod tests {
         ];
         let values = vec![U256::from(7), U256::from(5)];
 
-        let revenues = HashMap::from_iter(addresses.iter().cloned().zip(values.iter().cloned()));
+        let revenues = HashMap::from_iter(
+            addresses
+                .iter()
+                .cloned()
+                .zip(values.iter().cloned().map(|v| BuilderInclusionResult { revenue: v, tx_count: 1 })),
+        );
         let updated_revenues = prepare_revenues(
             &distribution_config,
-            revenues,
+            &revenues,
             U256::ZERO,
             proposer_fee_recipient,
             relay_fee_recipient,
