@@ -42,7 +42,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
-    common::{RethConsensus, RethProvider},
+    common::{RethConsensus, RethPayloadValidator, RethProvider},
     inclusion::types::InclusionList,
     validation::error::{GetParentError, ValidationApiError},
 };
@@ -500,7 +500,7 @@ pub struct ValidationApiInner {
     /// Consensus implementation.
     consensus: Arc<RethConsensus>,
     /// Execution payload validator.
-    pub(crate) payload_validator: Arc<EthereumEngineValidator>,
+    pub(crate) payload_validator: Arc<RethPayloadValidator>,
     /// Block executor factory.
     pub(crate) evm_config: reth_ethereum::evm::EthEvmConfig,
     /// Set of disallowed addresses
