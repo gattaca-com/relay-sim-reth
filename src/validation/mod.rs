@@ -372,6 +372,10 @@ impl ValidationApi {
             return Err(ValidationApiError::ProposerPayment);
         }
 
+        if tx.chain_id() != Some(self.evm_config.chain_spec().chain().id()) {
+            return Err(ValidationApiError::ProposerPayment);
+        }
+
         if tx.to() != Some(message.proposer_fee_recipient) {
             return Err(ValidationApiError::ProposerPayment);
         }
