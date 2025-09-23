@@ -6,29 +6,23 @@ use alloy_consensus::{BlockHeader, EnvKzgSettings, Transaction, TxReceipt};
 use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2, BuilderBlockValidationRequestV3,
-    BuilderBlockValidationRequestV4,
+    BuilderBlockValidationRequestV4, BuilderBlockValidationRequestV5,
 };
 use alloy_rpc_types_engine::{
-    BlobsBundleV1, CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, PraguePayloadFields,
+    BlobsBundleV1, BlobsBundleV2, CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, PraguePayloadFields
 };
 use async_trait::async_trait;
 use dashmap::DashSet;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
 use reth_ethereum::{
-    Block, EthPrimitives, Receipt, TransactionSigned,
-    consensus::{ConsensusError, FullConsensus},
-    evm::{
-        primitives::{Evm, execute::Executor},
+    consensus::{validation::MAX_RLP_BLOCK_SIZE, ConsensusError, FullConsensus}, evm::{
+        primitives::{execute::Executor, Evm},
         revm::{cached::CachedReads, database::StateProviderDatabase},
-    },
-    node::{EthereumEngineValidator, core::rpc::result::internal_rpc_err},
-    primitives::{GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor, constants::GAS_LIMIT_BOUND_DIVISOR},
-    provider::BlockExecutionOutput,
-    rpc::eth::utils::recover_raw_transaction,
-    storage::{BlockReaderIdExt, HeaderProvider, StateProviderFactory},
+    }, node::{core::rpc::result::internal_rpc_err, EthereumEngineValidator}, primitives::{constants::GAS_LIMIT_BOUND_DIVISOR, GotExpected, RecoveredBlock, SealedBlock, SealedHeaderFor}, provider::{BlockExecutionOutput, ChainSpecProvider}, rpc::eth::utils::recover_raw_transaction, storage::{BlockReaderIdExt, HeaderProvider, StateProviderFactory}, Block, EthPrimitives, Receipt, TransactionSigned
 };
 use reth_metrics::{Metrics, metrics::Gauge};
 use reth_node_builder::{BlockBody, ConfigureEvm, PayloadValidator};
+use reth_primitives::EthereumHardforks;
 use reth_tasks::TaskExecutor;
 use revm::{Database, database::State};
 use revm_primitives::{Address, B256, U256};
@@ -415,6 +409,25 @@ impl ValidationApi {
         Ok(versioned_hashes)
     }
 
+    /// Validates the given [`BlobsBundleV1`] and returns versioned hashes for blobs.
+    pub fn validate_blobs_bundle_v2(
+        &self,
+        blobs_bundle: BlobsBundleV2,
+    ) -> Result<Vec<B256>, ValidationApiError> {
+        let versioned_hashes = blobs_bundle
+            .commitments
+            .iter()
+            .map(|c| kzg_to_versioned_hash(c.as_slice()))
+            .collect::<Vec<_>>();
+
+        blobs_bundle
+            .try_into_sidecar()
+            .map_err(|_| ValidationApiError::InvalidBlobsBundle)?
+            .validate(&versioned_hashes, EnvKzgSettings::default().get())?;
+
+        Ok(versioned_hashes)
+    }
+
     /// Core logic for validating the builder submission v4
     async fn _validate_builder_submission_v4(
         &self,
@@ -433,6 +446,48 @@ impl ValidationApi {
                 },
             ),
         })?;
+
+        self.validate_message_against_block(
+            block,
+            request.base.request.message,
+            request.base.registered_gas_limit,
+            request.apply_blacklist,
+            request.inclusion_list,
+        )
+        .await
+    }
+
+    /// Core logic for validating the builder submission v5
+    async fn _validate_builder_submission_v5(
+        &self,
+        request: ExtendedValidationRequestV5,
+    ) -> Result<(), ValidationApiError> {
+        let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
+            payload: ExecutionPayload::V3(request.base.request.execution_payload),
+            sidecar: ExecutionPayloadSidecar::v4(
+                CancunPayloadFields {
+                    parent_beacon_block_root: request.base.parent_beacon_block_root,
+                    versioned_hashes: self
+                        .validate_blobs_bundle_v2(request.base.request.blobs_bundle)?,
+                },
+                PraguePayloadFields {
+                    requests: RequestsOrHash::Requests(
+                        request.base.request.execution_requests.to_requests(),
+                    ),
+                },
+            ),
+        })?;
+
+        // Check block size as per EIP-7934 (only applies when Osaka hardfork is active)
+        let chain_spec = self.provider.chain_spec();
+        if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
+            block.rlp_length() > MAX_RLP_BLOCK_SIZE
+        {
+            return Err(ValidationApiError::Consensus(ConsensusError::BlockTooLarge {
+                rlp_length: block.rlp_length(),
+                max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            }));
+        }
 
         self.validate_message_against_block(
             block,
@@ -496,6 +551,20 @@ impl BlockSubmissionValidationApiServer for ValidationApi {
 
         rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
     }
+
+    /// Validates a block submitted to the relay
+    async fn validate_builder_submission_v5(&self, request: ExtendedValidationRequestV5) -> RpcResult<()> {
+        let this = self.clone();
+        let (tx, rx) = oneshot::channel();  
+
+        self.task_spawner.spawn_blocking(Box::pin(async move {
+            let result = Self::_validate_builder_submission_v5(&this, request).await.map_err(ErrorObject::from);
+            let _ = tx.send(result);
+        }));
+
+        rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
+    }
+
 }
 
 pub struct ValidationApiInner {
@@ -566,6 +635,18 @@ pub struct ExtendedValidationRequestV4 {
     pub apply_blacklist: bool,
 }
 
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtendedValidationRequestV5 {
+    #[serde(flatten)]
+    pub base: BuilderBlockValidationRequestV5,
+
+    pub inclusion_list: Option<InclusionList>,
+
+    #[serde(default)]
+    pub apply_blacklist: bool,
+}
+
 /// Block validation rpc interface.
 #[rpc(server, namespace = "relay")]
 pub trait BlockSubmissionValidationApi {
@@ -595,5 +676,12 @@ pub trait BlockSubmissionValidationApi {
     async fn validate_builder_submission_v4(
         &self,
         request: ExtendedValidationRequestV4,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to validate a block submission.
+    #[method(name = "validateBuilderSubmissionV5")]
+    async fn validate_builder_submission_v5(
+        &self,
+        request: ExtendedValidationRequestV5,
     ) -> jsonrpsee::core::RpcResult<()>;
 }
