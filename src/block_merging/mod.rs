@@ -234,7 +234,10 @@ impl BlockMergingApi {
 
         let cached_db = request_cache.as_db(StateProviderDatabase::new(&state_provider));
 
-        let mut state_db = State::builder().with_database_ref(&cached_db).build();
+        let mut state_db = State::builder()
+            .with_database_ref(&cached_db)
+            .with_bundle_update()
+            .build();
 
         let parent_header = validation.get_parent_header(parent_hash)?;
 
