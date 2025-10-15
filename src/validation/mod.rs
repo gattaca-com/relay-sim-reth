@@ -244,7 +244,8 @@ impl ValidationApi {
         }
 
         // set up a fresh EVM on top of a cache wrapping the post-block state
-        let mut evm = self.evm_config.evm_for_block(post_state, block.header());
+        let mut evm = self.evm_config.evm_for_block(post_state, block.header())
+            .map_err(|_| ValidationApiError::InclusionList)?;
 
         // simulate each missing inclusion‐list tx
         for req in &inclusion_list.txs {
