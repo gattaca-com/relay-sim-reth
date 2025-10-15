@@ -246,7 +246,8 @@ impl BlockMergingApi {
             evm_config.next_evm_env(&parent_header, &new_block_attrs).or(Err(BlockMergingApiError::NextEvmEnvFail))?;
 
         let evm = evm_config.evm_with_env(&mut state_db, evm_env.clone());
-        let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone());
+        let ctx = evm_config.context_for_next_block(&parent_header, new_block_attrs.clone())
+            .or(Err(BlockMergingApiError::BlockContext))?;
 
         let block_builder = evm_config.create_block_builder(evm, &parent_header, ctx);
 

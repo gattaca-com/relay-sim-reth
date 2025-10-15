@@ -23,6 +23,8 @@ pub(crate) enum BlockMergingApiError {
     Payload(#[from] NewPayloadError),
     #[error("failed to create EvmEnv for next block")]
     NextEvmEnvFail,
+    #[error("failed to create block context for next block")]
+    BlockContext,
     #[error("failed to decode execution requests")]
     ExecutionRequests,
     #[error("no signer found for builder: {_0}")]
@@ -65,6 +67,7 @@ impl From<BlockMergingApiError> for ErrorObject<'static> {
             BlockMergingApiError::GetParent(_)
             | BlockMergingApiError::BlobLimitReached
             | BlockMergingApiError::NextEvmEnvFail
+            | BlockMergingApiError::BlockContext
             | BlockMergingApiError::RevenueAllocationReverted
             | BlockMergingApiError::ExecutionRequests
             | BlockMergingApiError::ZeroRevenueForWinningBuilder
